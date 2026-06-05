@@ -13,6 +13,10 @@ class ToolSpec(TypedDict):
     parameters: dict[str, Any]
 
 
+class ToolConfig(ToolSpec):
+    function: str
+
+
 @dataclass(frozen=True)
 class ToolCall:
     tool: str
@@ -26,4 +30,3 @@ class FinalAnswer:
 
 AgentAction = ToolCall | FinalAnswer
 ToolFunction = Callable[..., Any]
-

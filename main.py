@@ -6,39 +6,11 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 from llm_agent.agent import Agent
 from llm_agent.llm_client import LLMClient
 from llm_agent.prompts import build_system_prompt
-from llm_agent.tool_registry import ToolRegistry
-from llm_agent.tools.math_tools import add
-from llm_agent.tools.weather_tools import get_weather
+from llm_agent.tools import build_tool_registry
 
 
 def build_agent() -> Agent:
-    registry = ToolRegistry()
-    registry.register(
-        name="add",
-        description="Add two integers.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "a": {"type": "integer", "description": "The first integer."},
-                "b": {"type": "integer", "description": "The second integer."},
-            },
-            "required": ["a", "b"],
-        },
-        func=add,
-    )
-    registry.register(
-        name="get_weather",
-        description="Get a mock weather report for a city.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "city": {"type": "string", "description": "The city name."},
-            },
-            "required": ["city"],
-        },
-        func=get_weather,
-    )
-
+    registry = build_tool_registry()
     llm = LLMClient()
     return Agent(
         llm=llm,
