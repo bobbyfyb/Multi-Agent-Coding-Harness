@@ -1,0 +1,10 @@
+[project]
+name = "llm-server"
+version = "0.1.0"
+description = "Local vLLM server environment for Qwen2.5-Coder."
+requires-python = ">=3.12"
+dependencies = [
+    "tokenizers==0.21.4",
+    "transformers==4.55.2",
+    "vllm==0.10.2",
+]
