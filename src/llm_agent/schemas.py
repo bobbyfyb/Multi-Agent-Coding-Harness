@@ -28,8 +28,14 @@ class Thought:
 @dataclass(frozen=True)
 class FinalAnswer:
     answer: str
+    
+@dataclass(frozen=True)
+class AgentPlan:
+    content: list[str]
 
 
-AgentAction = ToolCall | FinalAnswer | Thought
+
+AgentAction = ToolCall | FinalAnswer | Thought | AgentPlan
+
 
 ToolFunction = Callable[..., Any]
