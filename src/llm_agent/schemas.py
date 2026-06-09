@@ -22,11 +22,14 @@ class ToolCall:
     tool: str
     arguments: dict[str, Any]
 
-
+@dataclass(frozen=True)
+class Thought:
+    content: str
 @dataclass(frozen=True)
 class FinalAnswer:
     answer: str
 
 
-AgentAction = ToolCall | FinalAnswer
+AgentAction = ToolCall | FinalAnswer | Thought
+
 ToolFunction = Callable[..., Any]

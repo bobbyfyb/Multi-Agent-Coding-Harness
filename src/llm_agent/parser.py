@@ -1,12 +1,15 @@
 import json
 
-from llm_agent.schemas import AgentAction, FinalAnswer, ToolCall
+from llm_agent.schemas import AgentAction, FinalAnswer, Thought, ToolCall
 
 
 def parse_agent_action(text: str) -> AgentAction:
     data = json.loads(_strip_code_fence(text))
     action_type = data.get("type")
 
+    if action_type == "thought":
+        return Thought(content=data["content"])
+    
     if action_type == "tool_call":
         return ToolCall(
             tool=data["tool"],

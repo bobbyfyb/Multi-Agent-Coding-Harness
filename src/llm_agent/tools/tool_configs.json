@@ -15,7 +15,10 @@
           "description": "The second integer."
         }
       },
-      "required": ["a", "b"]
+      "required": [
+        "a",
+        "b"
+      ]
     }
   },
   {
@@ -30,12 +33,14 @@
           "description": "The city name."
         }
       },
-      "required": ["city"]
+      "required": [
+        "city"
+      ]
     }
   },
   {
     "name": "search_info",
-    "description": "Search top k passages for a query.",
+    "description": "一个网页搜索引擎。当你需要回答关于时事、事实以及在你的知识库中找不到的信息时，应使用此工具。",
     "function": "llm_agent.tools.search_tools:search_info",
     "parameters": {
       "type": "object",
@@ -49,7 +54,9 @@
           "description": "The number of passages to return."
         }
       },
-      "required": ["query"]
+      "required": [
+        "query"
+      ]
     }
   }
 ]
