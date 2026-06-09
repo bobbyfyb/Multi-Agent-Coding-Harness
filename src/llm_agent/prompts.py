@@ -15,13 +15,10 @@ def build_system_prompt(tool_specs: list[ToolSpec]) -> str:
 
 你每次只能输出以下三种 JSON 之一。
 
-思考过程：
 {{"type": "thought", "content": "你的思考过程，用于分析问题、拆解任务和规划下一步行动。"}}
 
-调用工具：
-{{"type": "tool_call", "tool": "tool_name", "arguments": {{"arg1": "value1", "arg2": "value2"}}}}
+{{"type": "tool_call", "tool": "你要调用的tool_name", "arguments": {{"arg1": "value1", "arg2": "value2"}}}}
 
-最终回答：
 {{"type": "final", "answer": "答案内容"}}
 
 规则：

@@ -9,7 +9,7 @@ from llm_agent.tool_registry import ToolRegistry
 
 
 @dataclass
-class Agent:
+class ReActAgent:
     llm: LLMClient
     tools: ToolRegistry
     history: list[str]
@@ -43,7 +43,7 @@ class Agent:
                     "type": "observation",
                     "content": f"你的上一次输出:\n{raw_output}\n无法解析为合法 agent JSON。错误是：{exc}\n"
                         "请重新输出。只能输出 JSON，格式必须是 thought, tool_call 或 final。"
-                }))
+                }, ensure_ascii=False))
                 action = None
             
             if action is None:
