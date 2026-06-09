@@ -7,7 +7,7 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from llm_agent.agent import ReActAgent
 from llm_agent.llm_client import LLMClient
-from llm_agent.prompts import build_system_prompt
+from llm_agent.prompts import build_reAct_system_prompt
 from llm_agent.tools import build_tool_registry
 
 load_dotenv()
@@ -19,7 +19,7 @@ def build_reAct_agent() -> ReActAgent:
         llm=llm,
         tools=registry,
         history=[],
-        system_prompt=build_system_prompt(registry.tool_specs()),
+        system_prompt=build_reAct_system_prompt(registry.tool_specs()),
     )
 
 

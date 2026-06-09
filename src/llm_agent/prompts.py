@@ -3,7 +3,7 @@ import json
 from llm_agent.schemas import ToolSpec
 
 
-def build_system_prompt(tool_specs: list[ToolSpec]) -> str:
+def build_reAct_system_prompt(tool_specs: list[ToolSpec]) -> str:
     tool_docs = json.dumps(tool_specs, ensure_ascii=False, indent=2)
     return f"""
 请注意，你是一个有能力调用外部工具的智能助手。你可以根据需要调用工具解决问题。
@@ -33,7 +33,7 @@ def build_system_prompt(tool_specs: list[ToolSpec]) -> str:
 - 当你收集到足够信息，能够回答用户的最终问题时，输出final来输出最终答案。
 """.strip()
 
-def build_user_prompt(user_input: str, history: str) -> str:
+def build_reAct_user_prompt(user_input: str, history: str) -> str:
     return f"""
 现在，请开始解决以下问题：
 Question: {user_input}

@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 from llm_agent.llm_client import LLMClient
 from llm_agent.parser import parse_agent_action
-from llm_agent.prompts import build_user_prompt
+from llm_agent.prompts import build_reAct_user_prompt
 from llm_agent.schemas import ChatMessage, FinalAnswer, Thought, ToolCall
 from llm_agent.tool_registry import ToolRegistry
 
@@ -23,7 +23,7 @@ class ReActAgent:
             
         for _ in range(self.max_steps):
             
-            user_prompt = build_user_prompt(user_input, ",\n".join(self.history))
+            user_prompt = build_reAct_user_prompt(user_input, ",\n".join(self.history))
             
             messages: list[ChatMessage] = [
                     {"role": "system", "content": self.system_prompt},
