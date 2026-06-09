@@ -32,10 +32,15 @@ class FinalAnswer:
 @dataclass(frozen=True)
 class AgentPlan:
     content: list[str]
+    
+@dataclass(frozen=True)
+class GenericAgentAction:
+    type: str
+    content: str
 
 
 
-AgentAction = ToolCall | FinalAnswer | Thought | AgentPlan
 
+AgentAction = ToolCall | FinalAnswer | Thought | AgentPlan | GenericAgentAction
 
 ToolFunction = Callable[..., Any]

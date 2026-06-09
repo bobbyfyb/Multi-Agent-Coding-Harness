@@ -1,6 +1,6 @@
 import json
 
-from llm_agent.schemas import AgentAction, AgentPlan, FinalAnswer, Thought, ToolCall
+from llm_agent.schemas import AgentAction, AgentPlan, FinalAnswer, GenericAgentAction, Thought, ToolCall
 
 
 def parse_agent_action(text: str) -> AgentAction:
@@ -21,6 +21,13 @@ def parse_agent_action(text: str) -> AgentAction:
     
     if action_type == "plan":
         return AgentPlan(content=data["content"])
+    
+    if action_type == "execution":
+        return GenericAgentAction(type="execution", content=data["content"])
+    
+    if action_type == "reflection":
+        return GenericAgentAction(type="reflection", content=data["content"])
+
 
     raise ValueError(f"Unknown agent action type: {action_type}")
 

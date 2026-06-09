@@ -77,3 +77,63 @@ def build_excutor_user_prompt(user_input: str, history: str, plan: str, current_
     
     请仅输出针对“当前步骤”的回答：
     """
+
+def build_reflection_initial_prompt(user_input: str) -> str:
+    return f""" 
+    你是一位资深的Python程序员。请根据以下要求，编写一个Python函数。
+    你的代码必须包含完整的函数签名、文档字符串，并遵循PEP 8编码规范。
+    
+    要求：{user_input}
+    
+    请严格按照以下格式进行回应：
+    
+    {{"type": "execution", "content": "你的代码"}}
+    
+    请直接输出代码，不要包含任何额外的解释。
+"""
+
+def build_reflection_reflect_prompt(user_input: str, code: str) -> str:
+    return f"""
+    你是一位极其严格的代码评审专家和资深算法工程师，对代码的性能有极致的要求。
+    你的任务是审查以下Python代码，并专注于找出其在<strong>算法效率</strong>上的主要瓶颈。
+
+    # 原始任务:
+    {user_input}
+
+    # 待审查的代码:
+    ```python
+    {code}
+    ```
+
+    请分析该代码的时间复杂度，并思考是否存在一种<strong>算法上更优</strong>的解决方案来显著提升性能。
+    如果存在，请清晰地指出当前算法的不足，并提出具体的、可行的改进算法建议（例如，使用筛法替代试除法）。
+    如果代码在算法层面已经达到最优，才能回答“无需改进”。
+    
+    请直接按照以下格式进行回应:
+    
+    {{"type": "reflection", "content": "评审员反馈"}}
+
+    请直接输出你的反馈，不要包含任何额外的解释。
+"""
+
+def build_reflection_refinement_prompt(user_input: str, code: str, feedback: str) -> str:
+    return f"""
+    你是一位资深的Python程序员。你正在根据一位代码评审专家的反馈来优化你的代码。
+
+    # 原始任务:
+    {user_input}
+
+    # 你上一轮尝试的代码:
+    {code}
+    评审员的反馈：
+    {feedback}
+
+    请根据评审员的反馈，生成一个优化后的新版本代码。
+    你的代码必须包含完整的函数签名、文档字符串，并遵循PEP 8编码规范。
+    
+    请严格按照以下格式进行回应：
+    
+    {{"type": "execution", "content": "你的优化后的代码"}}
+    
+    请直接输出优化后的代码，不要包含任何额外的解释。
+"""
