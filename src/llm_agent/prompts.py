@@ -54,14 +54,14 @@ def build_plan_system_prompt() -> str:
     - 不要解释 JSON。
     """
 
-def build_excutor_system_prompt() -> str:
+def build_executor_system_prompt() -> str:
     return f"""
     你是一位顶级的AI执行专家。你的任务是严格按照给定的计划，一步步地解决问题。
     你将收到原始问题、完整的计划、以及到目前为止已经完成的步骤和结果。
     请你专注于解决“当前步骤”，并仅输出该步骤的最终答案，不要输出任何额外的解释或对话。     
     """
 
-def build_excutor_user_prompt(user_input: str, history: str, plan: str, current_step: str) -> str:
+def build_executor_user_prompt(user_input: str, history: str, plan: str, current_step: str) -> str:
     return f"""
     # 原始问题：
     {user_input}

@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from llm_agent.llm_client import LLMClient
 from llm_agent.parser import parse_agent_action
-from llm_agent.prompts import build_excutor_system_prompt, build_excutor_user_prompt, build_plan_system_prompt, build_reAct_user_prompt, build_reflection_initial_prompt, build_reflection_refinement_prompt, build_reflection_reflect_prompt
+from llm_agent.prompts import build_executor_system_prompt, build_executor_user_prompt, build_plan_system_prompt, build_reAct_user_prompt, build_reflection_initial_prompt, build_reflection_refinement_prompt, build_reflection_reflect_prompt
 from llm_agent.schemas import AgentPlan, ChatMessage, FinalAnswer, GenericAgentAction, Thought, ToolCall
 from llm_agent.tool_registry import ToolRegistry
 
@@ -127,7 +127,7 @@ class Executor:
         for i, step in enumerate(plan):
             print(f"\n-> 正在执行步骤 {i + 1}/{len(plan)}: {step}")
             
-            user_prompt = build_excutor_user_prompt(user_input, 
+            user_prompt = build_executor_user_prompt(user_input, 
                                                     "\n".join(history) if history else "无", 
                                                     "\n".join(plan), step)
             
@@ -151,7 +151,7 @@ class PlanAndExecuteAgent:
     
     def __post_init__(self):
         self.planner = Planner(self.llm, build_plan_system_prompt())
-        self.executor = Executor(self.llm, build_excutor_system_prompt())
+        self.executor = Executor(self.llm, build_executor_system_prompt())
         
 
     def run(self, user_input: str) -> str:
