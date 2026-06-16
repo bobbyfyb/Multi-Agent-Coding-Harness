@@ -8,4 +8,7 @@ CUDA_VISIBLE_DEVICES=1 uv run --project llm_server vllm serve Qwen/Qwen2.5-Coder
   --tensor-parallel-size 1 \
   --dtype bfloat16 \
   --max-model-len 32768 \
-  --gpu-memory-utilization 0.90
+  --gpu-memory-utilization 0.90 \
+  --enable-auto-tool-choice \
+  --tool-call-parser hermes \
+  
