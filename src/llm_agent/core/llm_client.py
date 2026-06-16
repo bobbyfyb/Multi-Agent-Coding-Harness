@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 import os
-from typing import Any, cast
+from typing import Any, Optional, cast
 
 from openai import APITimeoutError, OpenAI
 from openai.types.chat import ChatCompletionMessageParam
@@ -25,6 +25,7 @@ class LLMClient:
     max_tokens: int = 512
     timeout: float = 120.0
     client: Any | None = None
+    provider: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.client is None:
@@ -36,6 +37,7 @@ class LLMClient:
                 api_key=self.api_key,
                 timeout=self.timeout,
             )
+            self.provider = self.provider or os.getenv("PROVIDER") or None
 
     def complete(self, messages: list[ChatMessage]) -> str:
         try:
