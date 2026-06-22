@@ -3,55 +3,44 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-from llm_agent.agent import Agent
+from llm_agent.agent import Agent, print_agent_event
+from llm_agent.context_builder import AgentContextBuilder, PromptSection
 from llm_agent.llm_client import LLMClient
-from llm_agent.prompts import build_system_prompt
-from llm_agent.tool_registry import ToolRegistry
-from llm_agent.tools.math_tools import add
-from llm_agent.tools.weather_tools import get_weather
+from llm_agent.tools import build_default_registry
 
 
 def build_agent() -> Agent:
-    registry = ToolRegistry()
-    registry.register(
-        name="add",
-        description="Add two integers.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "a": {"type": "integer", "description": "The first integer."},
-                "b": {"type": "integer", "description": "The second integer."},
-            },
-            "required": ["a", "b"],
-        },
-        func=add,
-    )
-    registry.register(
-        name="get_weather",
-        description="Get a mock weather report for a city.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "city": {"type": "string", "description": "The city name."},
-            },
-            "required": ["city"],
-        },
-        func=get_weather,
-    )
-
-    llm = LLMClient()
+    registry = build_default_registry(workdir=Path.cwd())
+    llm = LLMClient(provider="anthropic")
     return Agent(
         llm=llm,
         tools=registry,
-        system_prompt=build_system_prompt(registry.tool_specs()),
+        context_builder=AgentContextBuilder(
+            sections=[
+                PromptSection(
+                    name="workspace",
+                    content=f"Current Working DIR: {Path.cwd()}",
+                    priority=20,
+                )
+            ]
+        ),
     )
 
 
 def main() -> None:
     agent = build_agent()
-    answer = agent.run("请计算 123 + 456，然后用一句话告诉我结果。", show_reasoning_step=True)
-    answer = agent.run("请告诉我上海的天气。", show_reasoning_step=True)
-    print(answer)
+    messages = agent.new_messages()
+    
+    while True:
+        try:
+            query = input("\033[36mInput your question >> \033[0m")
+        except (EOFError, KeyboardInterrupt):
+            break
+        if query.strip().lower() in ("q", "exit", ""):
+            break
+        messages.append({"role": "user", "content": query})
+        agent.run(messages, on_event=print_agent_event)
+        
 
 
 if __name__ == "__main__":

@@ -1,78 +1,146 @@
 import json
 from dataclasses import dataclass
+from typing import Any, Callable, Literal
 
+from llm_agent.context_builder import ContextBuilder, StaticContextBuilder
 from llm_agent.llm_client import LLMClient
-from llm_agent.parser import parse_agent_action
-from llm_agent.schemas import ChatMessage, FinalAnswer, ToolCall
 from llm_agent.tool_registry import ToolRegistry
+
+
+AgentEventType = Literal["step", "tool_call", "tool_result", "final"]
+
+
+@dataclass(frozen=True)
+class AgentEvent:
+    type: AgentEventType
+    step: int
+    data: dict[str, Any]
+
+
+AgentCallback = Callable[[AgentEvent], None]
+
+ANSI_RESET = "\033[0m"
+ANSI_BOLD = "\033[1m"
+ANSI_DIM = "\033[2m"
+ANSI_BLUE = "\033[34m"
+ANSI_YELLOW = "\033[33m"
+ANSI_GREEN = "\033[32m"
+ANSI_RED = "\033[31m"
+ANSI_MAGENTA = "\033[35m"
 
 
 @dataclass
 class Agent:
     llm: LLMClient
     tools: ToolRegistry
-    system_prompt: str
+    context_builder: ContextBuilder | str
     max_steps: int = 5
 
-    def run(self, user_input: str, show_reasoning_step: bool = False) -> str:
-        messages: list[ChatMessage] = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": user_input},
-        ]
+    def __post_init__(self) -> None:
+        if isinstance(self.context_builder, str):
+            self.context_builder = StaticContextBuilder(self.context_builder)
 
-        reasoning = []
-            
-        for _ in range(self.max_steps):
+    def new_messages(self) -> list[dict[str, Any]]:
+        return self.context_builder.new_messages()
+
+    def run(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        on_event: AgentCallback | None = None,
+    ) -> None:
+        tool_specs = self.tools.tool_specs()
+
+        # ! Used for unlimited agent loop. 
+        step_index = 0
+        # ! Used for limited agent loop.
+        # for step_index in range(self.max_steps):
+        while True:
+            step = step_index + 1
+            _emit(on_event, "step", step, {"message": "calling llm"})
+
             try:
-                raw_output = self.llm.complete(messages)
+                response = self.llm.chat(
+                    messages,
+                    tools=tool_specs,
+                    tool_choice="auto",
+                )
             except Exception as exc:
                 raise RuntimeError("LLM request failed.") from exc
-            
-            try:
-                action = parse_agent_action(raw_output)
-            except Exception as exc:
-                print(f"Error: {exc}. The raw output is: {raw_output}")
-                messages.append({"role": "assistant", "content": raw_output})
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        f"你的上一次输出无法解析为合法 agent JSON。错误是：{exc}\n"
-                        "请重新输出。只能输出 JSON，格式必须是 tool_call 或 final。"
-                    ),
-                })
-                action = None
-            
-            if action is None:
-                print("Try to response again.")
-                continue
-            
-            
-            if isinstance(action, FinalAnswer):
-                
-                if show_reasoning_step:
-                    reasoning.append(raw_output)
-                    return "\n".join(reasoning)
-                                    
-                return action.answer
 
-            if isinstance(action, ToolCall):
-                tool_result = self.tools.call(action.tool, action.arguments)
-                messages.append({"role": "assistant", "content": raw_output})
-                messages.append(
+            if not response.tool_calls:
+                messages.append({"role": "assistant", "content": response.content})
+                _emit(on_event, "final", step, {"content": response.content})
+                return
+
+            messages.append(self.llm.assistant_message(response))
+
+            tool_results = []
+            for tool_call in response.tool_calls:
+                _emit(
+                    on_event,
+                    "tool_call",
+                    step,
                     {
-                        "role": "user",
-                        "content": (
-                            f"工具 {action.tool} 的调用结果如下：\n"
-                            f"{json.dumps(tool_result, ensure_ascii=False)}\n"
-                            "请继续。仍然只输出 JSON。"
-                        ),
-                    }
+                        "id": tool_call.id,
+                        "name": tool_call.name,
+                        "arguments": tool_call.arguments,
+                    },
                 )
-                
-                if show_reasoning_step:
-                    reasoning.append(f"工具 {action.tool} 的调用结果如下：\n 输入参数：{json.dumps(action.arguments, ensure_ascii=False)}\n 输出结果：{json.dumps(tool_result, ensure_ascii=False)}")
-                
-                continue
+                tool_result = self.tools.call(tool_call.name, tool_call.arguments)
+                tool_results.append((tool_call, tool_result))
+                _emit(
+                    on_event,
+                    "tool_result",
+                    step,
+                    {
+                        "id": tool_call.id,
+                        "name": tool_call.name,
+                        "result": tool_result,
+                    },
+                )
+
+            messages.extend(self.llm.tool_result_messages(tool_results))
 
         raise RuntimeError("Agent reached max_steps before producing a final answer.")
 
+
+def print_agent_event(event: AgentEvent) -> None:
+    if event.type == "step":
+        print(f"\n{ANSI_BLUE}[step {event.step}] calling llm{ANSI_RESET}")
+        return
+
+    if event.type == "tool_call":
+        arguments = json.dumps(event.data["arguments"], ensure_ascii=False)
+        print(
+            f"{ANSI_YELLOW}> [tool call] {event.data['name']}{ANSI_RESET} "
+            f"{ANSI_DIM}{arguments}{ANSI_RESET}"
+        )
+        return
+
+    if event.type == "tool_result":
+        result = event.data["result"]
+        result_color = ANSI_GREEN
+        if isinstance(result, dict) and result.get("ok") is False:
+            result_color = ANSI_RED
+
+        print(
+            f"{result_color}[tool result] {event.data['name']} ->{ANSI_RESET} "
+            f"{json.dumps(result, ensure_ascii=False)}"
+        )
+        return
+
+    if event.type == "final":
+        print(f"\n{ANSI_BOLD}{ANSI_MAGENTA}[final]{ANSI_RESET}\n{event.data['content']}")
+
+
+def _emit(
+    on_event: AgentCallback | None,
+    event_type: AgentEventType,
+    step: int,
+    data: dict[str, Any],
+) -> None:
+    if on_event is None:
+        return
+
+    on_event(AgentEvent(type=event_type, step=step, data=data))

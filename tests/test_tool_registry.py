@@ -1,4 +1,4 @@
-from llm_agent.tool_registry import ToolRegistry
+from llm_agent.tool_registry import ToolDefinition, ToolRegistry
 
 
 def test_tool_registry_calls_registered_tool() -> None:
@@ -21,3 +21,18 @@ def test_tool_registry_reports_unknown_tool() -> None:
     assert result["ok"] is False
     assert "Unknown tool" in result["error"]
 
+
+def test_tool_registry_registers_tool_definitions() -> None:
+    registry = ToolRegistry()
+    registry.register_many(
+        [
+            ToolDefinition(
+                name="double",
+                description="Double a number.",
+                parameters={},
+                func=lambda value: value * 2,
+            )
+        ]
+    )
+
+    assert registry.call("double", {"value": 4}) == {"ok": True, "result": 8}

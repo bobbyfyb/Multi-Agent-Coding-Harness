@@ -12,6 +12,14 @@ class Tool:
     func: ToolFunction
 
 
+@dataclass(frozen=True)
+class ToolDefinition:
+    name: str
+    description: str
+    parameters: dict[str, Any]
+    func: ToolFunction
+
+
 class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, Tool] = {}
@@ -33,6 +41,18 @@ class ToolRegistry:
             func=func,
         )
 
+    def register_definition(self, definition: ToolDefinition) -> None:
+        self.register(
+            name=definition.name,
+            description=definition.description,
+            parameters=definition.parameters,
+            func=definition.func,
+        )
+
+    def register_many(self, definitions: list[ToolDefinition]) -> None:
+        for definition in definitions:
+            self.register_definition(definition)
+
     def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         tool = self._tools.get(name)
         if tool is None:
@@ -52,4 +72,3 @@ class ToolRegistry:
             }
             for tool in self._tools.values()
         ]
-
