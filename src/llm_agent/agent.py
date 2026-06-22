@@ -34,7 +34,7 @@ class Agent:
     llm: LLMClient
     tools: ToolRegistry
     context_builder: ContextBuilder | str
-    max_steps: int = 5
+    max_steps: int | None = 5
 
     def __post_init__(self) -> None:
         if isinstance(self.context_builder, str):
@@ -51,11 +51,8 @@ class Agent:
     ) -> None:
         tool_specs = self.tools.tool_specs()
 
-        # ! Used for unlimited agent loop. 
         step_index = 0
-        # ! Used for limited agent loop.
-        # for step_index in range(self.max_steps):
-        while True:
+        while self.max_steps is None or step_index < self.max_steps:
             step = step_index + 1
             _emit(on_event, "step", step, {"message": "calling llm"})
 
@@ -101,6 +98,7 @@ class Agent:
                 )
 
             messages.extend(self.llm.tool_result_messages(tool_results))
+            step_index += 1
 
         raise RuntimeError("Agent reached max_steps before producing a final answer.")
 

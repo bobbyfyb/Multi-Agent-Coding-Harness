@@ -1,4 +1,3 @@
-from dataclasses import dataclass
 from typing import Any, Callable, Literal, TypedDict
 
 
@@ -13,17 +12,4 @@ class ToolSpec(TypedDict):
     parameters: dict[str, Any]
 
 
-@dataclass(frozen=True)
-class ToolCall:
-    tool: str
-    arguments: dict[str, Any]
-
-
-@dataclass(frozen=True)
-class FinalAnswer:
-    answer: str
-
-
-AgentAction = ToolCall | FinalAnswer
 ToolFunction = Callable[..., Any]
-

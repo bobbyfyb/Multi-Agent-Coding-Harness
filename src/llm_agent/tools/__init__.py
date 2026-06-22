@@ -4,8 +4,6 @@ from pathlib import Path
 
 from llm_agent.tool_registry import ToolRegistry
 from llm_agent.tools.basic_tools import register_tools as register_basic_tools
-from llm_agent.tools.math_tools import register_tools as register_math_tools
-from llm_agent.tools.weather_tools import register_tools as register_weather_tools
 
 
 def register_default_tools(
@@ -14,8 +12,6 @@ def register_default_tools(
     workdir: Path | str | None = None,
 ) -> None:
     register_basic_tools(registry, workdir=workdir)
-    register_math_tools(registry)
-    register_weather_tools(registry)
 
 
 def build_default_registry(workdir: Path | str | None = None) -> ToolRegistry:
@@ -28,6 +24,4 @@ __all__ = [
     "build_default_registry",
     "register_basic_tools",
     "register_default_tools",
-    "register_math_tools",
-    "register_weather_tools",
 ]

@@ -66,7 +66,7 @@ def test_basic_tools_blocks_dangerous_bash(tmp_path: Path) -> None:
     assert "Dangerous command blocked" in result["error"]
 
 
-def test_default_registry_loads_extensible_tool_modules(tmp_path: Path) -> None:
+def test_default_registry_loads_basic_tools(tmp_path: Path) -> None:
     registry = build_default_registry(workdir=tmp_path)
     tool_names = {tool["name"] for tool in registry.tool_specs()}
 
@@ -76,6 +76,4 @@ def test_default_registry_loads_extensible_tool_modules(tmp_path: Path) -> None:
         "write_file",
         "edit_file",
         "glob",
-        "add",
-        "get_weather",
     } <= tool_names
