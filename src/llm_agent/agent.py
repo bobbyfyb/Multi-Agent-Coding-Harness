@@ -1,13 +1,22 @@
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Literal
 
 from llm_agent.context_builder import ContextBuilder, StaticContextBuilder
+from llm_agent.hooks import HookContext, HookManager
 from llm_agent.llm_client import LLMClient
 from llm_agent.tool_registry import ToolRegistry
 
 
-AgentEventType = Literal["step", "tool_call", "tool_result", "final"]
+AgentEventType = Literal[
+    "step",
+    "tool_call",
+    "permission_granted",
+    "permission_denied",
+    "tool_result",
+    "final",
+]
 
 
 @dataclass(frozen=True)
@@ -35,10 +44,16 @@ class Agent:
     tools: ToolRegistry
     context_builder: ContextBuilder | str
     max_steps: int | None = 5
+    hooks: HookManager = field(default_factory=HookManager)
+    workdir: Path | str | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.context_builder, str):
             self.context_builder = StaticContextBuilder(self.context_builder)
+        if self.workdir is None:
+            self.workdir = Path.cwd()
+        else:
+            self.workdir = Path(self.workdir).resolve()
 
     def new_messages(self) -> list[dict[str, Any]]:
         return self.context_builder.new_messages()
@@ -54,6 +69,11 @@ class Agent:
         step_index = 0
         while self.max_steps is None or step_index < self.max_steps:
             step = step_index + 1
+            hook_context = HookContext(
+                messages=messages,
+                step=step,
+                workdir=self.workdir,
+            )
             _emit(on_event, "step", step, {"message": "calling llm"})
 
             try:
@@ -68,6 +88,7 @@ class Agent:
             if not response.tool_calls:
                 messages.append({"role": "assistant", "content": response.content})
                 _emit(on_event, "final", step, {"content": response.content})
+                self.hooks.trigger_hooks("Stop", messages, hook_context)
                 return
 
             messages.append(self.llm.assistant_message(response))
@@ -84,7 +105,60 @@ class Agent:
                         "arguments": tool_call.arguments,
                     },
                 )
+
+                pre_tool_result = self.hooks.trigger_hooks(
+                    "PreToolUse",
+                    tool_call,
+                    hook_context,
+                )
+                if pre_tool_result is not None and pre_tool_result.denied:
+                    tool_result = pre_tool_result.value
+                    tool_results.append((tool_call, tool_result))
+                    _emit(
+                        on_event,
+                        "permission_denied",
+                        step,
+                        {
+                            "id": tool_call.id,
+                            "name": tool_call.name,
+                            "reason": pre_tool_result.reason,
+                            "result": tool_result,
+                        },
+                    )
+                    _emit(
+                        on_event,
+                        "tool_result",
+                        step,
+                        {
+                            "id": tool_call.id,
+                            "name": tool_call.name,
+                            "result": tool_result,
+                        },
+                    )
+                    continue
+
+                if pre_tool_result is not None and pre_tool_result.reason:
+                    _emit(
+                        on_event,
+                        "permission_granted",
+                        step,
+                        {
+                            "id": tool_call.id,
+                            "name": tool_call.name,
+                            "reason": pre_tool_result.reason,
+                        },
+                    )
+
                 tool_result = self.tools.call(tool_call.name, tool_call.arguments)
+                post_tool_result = self.hooks.trigger_hooks(
+                    "PostToolUse",
+                    tool_call,
+                    tool_result,
+                    hook_context,
+                )
+                if post_tool_result is not None and post_tool_result.replaces_result:
+                    tool_result = post_tool_result.value
+
                 tool_results.append((tool_call, tool_result))
                 _emit(
                     on_event,
@@ -125,6 +199,20 @@ def print_agent_event(event: AgentEvent) -> None:
         print(
             f"{result_color}[tool result] {event.data['name']} ->{ANSI_RESET} "
             f"{json.dumps(result, ensure_ascii=False)}"
+        )
+        return
+
+    if event.type == "permission_granted":
+        print(
+            f"{ANSI_GREEN}[permission granted] {event.data['name']} ->{ANSI_RESET} "
+            f"{ANSI_DIM}{event.data['reason']}{ANSI_RESET}"
+        )
+        return
+
+    if event.type == "permission_denied":
+        print(
+            f"{ANSI_RED}[permission denied] {event.data['name']} ->{ANSI_RESET} "
+            f"{event.data['reason']}"
         )
         return
 

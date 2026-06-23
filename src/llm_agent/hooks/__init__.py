@@ -1,0 +1,138 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Literal
+
+
+HookEvent = Literal["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"]
+HookAction = Literal["allow", "deny", "replace"]
+HookCallback = Callable[..., "HookResult | None"]
+
+
+@dataclass
+class HookContext:
+    messages: list[dict[str, Any]]
+    step: int = 0
+    workdir: Path | str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        workdir = Path.cwd() if self.workdir is None else Path(self.workdir)
+        self.workdir = workdir.resolve()
+
+
+@dataclass(frozen=True)
+class HookResult:
+    action: HookAction
+    reason: str | None = None
+    value: Any = None
+    data: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def allow(
+        cls,
+        reason: str | None = None,
+        *,
+        data: dict[str, Any] | None = None,
+    ) -> "HookResult":
+        return cls(action="allow", reason=reason, data=data or {})
+
+    @classmethod
+    def deny(
+        cls,
+        reason: str,
+        *,
+        value: Any | None = None,
+        data: dict[str, Any] | None = None,
+    ) -> "HookResult":
+        if value is None:
+            value = {"ok": False, "error": f"Permission denied: {reason}"}
+        return cls(action="deny", reason=reason, value=value, data=data or {})
+
+    @classmethod
+    def replace_result(
+        cls,
+        value: Any,
+        *,
+        reason: str | None = None,
+        data: dict[str, Any] | None = None,
+    ) -> "HookResult":
+        return cls(action="replace", reason=reason, value=value, data=data or {})
+
+    @property
+    def denied(self) -> bool:
+        return self.action == "deny"
+
+    @property
+    def replaces_result(self) -> bool:
+        return self.action == "replace"
+
+
+def _default_hooks() -> dict[str, list[HookCallback]]:
+    return {
+        "UserPromptSubmit": [],
+        "PreToolUse": [],
+        "PostToolUse": [],
+        "Stop": [],
+    }
+
+
+@dataclass
+class HookManager:
+    hooks: dict[str, list[HookCallback]] = field(default_factory=_default_hooks)
+
+    def register_hook(self, event: str, callback: HookCallback) -> None:
+        self.hooks.setdefault(event, []).append(callback)
+
+    def trigger_hooks(self, event: str, *args: Any) -> HookResult | None:
+        effective_result: HookResult | None = None
+        for callback in self.hooks.get(event, []):
+            result = callback(*args)
+            if result is None:
+                continue
+            if not isinstance(result, HookResult):
+                raise TypeError(
+                    f"Hook {callback!r} returned {type(result).__name__}; "
+                    "expected HookResult or None."
+                )
+            if result.denied:
+                return result
+            if result.replaces_result or effective_result is None:
+                effective_result = result
+        return effective_result
+
+    def register(self, event: str, callback: HookCallback) -> None:
+        self.register_hook(event, callback)
+
+    def trigger(self, event: str, *args: Any) -> HookResult | None:
+        return self.trigger_hooks(event, *args)
+
+
+def build_default_hook_manager(
+    *,
+    workdir: Path | str | None = None,
+    approval_provider: Any | None = None,
+) -> HookManager:
+    from llm_agent.hooks.permission_hooks import PermissionHook
+
+    manager = HookManager()
+    permission_kwargs = {"workdir": workdir}
+    if approval_provider is not None:
+        permission_kwargs["approval_provider"] = approval_provider
+    manager.register_hook(
+        "PreToolUse",
+        PermissionHook(**permission_kwargs),
+    )
+    return manager
+
+
+__all__ = [
+    "HookAction",
+    "HookCallback",
+    "HookContext",
+    "HookEvent",
+    "HookManager",
+    "HookResult",
+    "build_default_hook_manager",
+]
