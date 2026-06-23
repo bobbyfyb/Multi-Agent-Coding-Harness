@@ -4,9 +4,10 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence, TypedDict
 
-from llm_agent.schemas import ChatMessage, ToolSpec
+from llm_agent.tool_registry import ToolSpec
+
 
 try:
     from dotenv import load_dotenv
@@ -17,6 +18,9 @@ except ImportError:  # pragma: no cover - python-dotenv is a project dependency.
 Provider = str
 ToolChoice = str | Mapping[str, Any] | None
 
+class ChatMessage(TypedDict):
+    role: Literal["system", "user", "assistant"]
+    content: str
 
 class LLMClientError(RuntimeError):
     """Raised when a model SDK call cannot be made or parsed."""

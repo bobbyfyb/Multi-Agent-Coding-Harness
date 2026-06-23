@@ -1,8 +1,8 @@
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable, TypedDict
 
-from llm_agent.schemas import ToolFunction, ToolSpec
 
+ToolFunction = Callable[..., Any]
 
 @dataclass(frozen=True)
 class Tool:
@@ -19,6 +19,10 @@ class ToolDefinition:
     parameters: dict[str, Any]
     func: ToolFunction
 
+class ToolSpec(TypedDict):
+    name: str
+    description: str
+    parameters: dict[str, Any]
 
 class ToolRegistry:
     def __init__(self) -> None:
