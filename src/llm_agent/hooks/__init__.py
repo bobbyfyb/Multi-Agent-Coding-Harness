@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 
-HookEvent = Literal["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"]
+HookEvent = Literal["UserPromptSubmit", "BeforeLLM", "PreToolUse", "PostToolUse", "Stop"]
 HookAction = Literal["allow", "deny", "replace"]
 HookCallback = Callable[..., "HookResult | None"]
 
@@ -72,6 +72,7 @@ class HookResult:
 def _default_hooks() -> dict[str, list[HookCallback]]:
     return {
         "UserPromptSubmit": [],
+        "BeforeLLM": [],
         "PreToolUse": [],
         "PostToolUse": [],
         "Stop": [],
@@ -115,8 +116,10 @@ def build_default_hook_manager(
     approval_provider: Any | None = None,
 ) -> HookManager:
     from llm_agent.hooks.permission_hooks import PermissionHook
+    from llm_agent.hooks.task_hooks import TaskPlanningHook
 
     manager = HookManager()
+    manager.register_hook("BeforeLLM", TaskPlanningHook(workdir=workdir))
     permission_kwargs = {"workdir": workdir}
     if approval_provider is not None:
         permission_kwargs["approval_provider"] = approval_provider

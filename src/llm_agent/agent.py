@@ -11,6 +11,8 @@ from llm_agent.tool_registry import ToolRegistry
 
 AgentEventType = Literal[
     "step",
+    "task_context",
+    "task_reminder",
     "tool_call",
     "permission_granted",
     "permission_denied",
@@ -74,6 +76,16 @@ class Agent:
                 step=step,
                 workdir=self.workdir,
             )
+            before_llm_result = self.hooks.trigger_hooks("BeforeLLM", hook_context)
+            for hook_message in _hook_messages(before_llm_result):
+                messages.append({"role": "user", "content": hook_message})
+                event_type: AgentEventType = (
+                    "task_context"
+                    if hook_message.startswith("<current_tasks>")
+                    else "task_reminder"
+                )
+                _emit(on_event, event_type, step, {"content": hook_message})
+
             _emit(on_event, "step", step, {"message": "calling llm"})
 
             try:
@@ -190,6 +202,14 @@ def print_agent_event(event: AgentEvent) -> None:
         )
         return
 
+    if event.type == "task_context":
+        print(f"{ANSI_DIM}[task context updated]{ANSI_RESET}")
+        return
+
+    if event.type == "task_reminder":
+        print(f"{ANSI_YELLOW}[task reminder]{ANSI_RESET} {event.data['content']}")
+        return
+
     if event.type == "tool_result":
         result = event.data["result"]
         result_color = ANSI_GREEN
@@ -230,3 +250,12 @@ def _emit(
         return
 
     on_event(AgentEvent(type=event_type, step=step, data=data))
+
+
+def _hook_messages(result: Any) -> list[str]:
+    if result is None:
+        return []
+    messages = result.data.get("messages", [])
+    if not isinstance(messages, list):
+        return []
+    return [message for message in messages if isinstance(message, str) and message]

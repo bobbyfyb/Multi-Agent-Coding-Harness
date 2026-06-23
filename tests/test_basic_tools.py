@@ -76,4 +76,10 @@ def test_default_registry_loads_basic_tools(tmp_path: Path) -> None:
         "write_file",
         "edit_file",
         "glob",
+        "task_create",
+        "task_update",
+        "task_list",
+        "task_get",
+        "task_claim",
+        "task_complete",
     } <= tool_names

@@ -4,6 +4,7 @@ from typing import Any
 from llm_agent.agent import Agent, AgentEvent
 from llm_agent.hooks import HookContext, HookManager, HookResult
 from llm_agent.hooks.permission_hooks import AutoApprovalProvider, PermissionHook
+from llm_agent.hooks.task_hooks import TaskPlanningHook
 from llm_agent.llm_client import LLMResponse, LLMToolCall
 from llm_agent.tool_registry import ToolRegistry
 
@@ -202,3 +203,42 @@ def test_agent_uses_post_tool_hook_to_replace_tool_result(tmp_path: Path) -> Non
         "ok": True,
         "result": "trimmed",
     }
+
+
+def test_task_planning_hook_reminds_for_complex_tasks(tmp_path: Path) -> None:
+    hook = TaskPlanningHook(workdir=tmp_path)
+    context = HookContext(
+        messages=[{"role": "user", "content": "Implement a trace recorder and tests."}],
+        workdir=tmp_path,
+    )
+
+    result = hook(context)
+
+    assert result is not None
+    messages = result.data["messages"]
+    assert len(messages) == 1
+    assert messages[0].startswith("<task_reminder>")
+    assert "task_create" in messages[0]
+
+
+def test_agent_injects_before_llm_hook_messages(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+    manager = HookManager()
+    manager.register_hook("BeforeLLM", TaskPlanningHook(workdir=tmp_path))
+    llm = FakeLLM([LLMResponse(content="done", tool_calls=[], raw={})])
+    agent = Agent(
+        llm=llm,
+        tools=registry,
+        context_builder="system",
+        hooks=manager,
+        workdir=tmp_path,
+    )
+    messages = agent.new_messages()
+    messages.append({"role": "user", "content": "Implement a task system."})
+    events: list[AgentEvent] = []
+
+    agent.run(messages, on_event=events.append)
+
+    assert llm.messages[0][-1]["role"] == "user"
+    assert llm.messages[0][-1]["content"].startswith("<task_reminder>")
+    assert [event.type for event in events[:2]] == ["task_reminder", "step"]
