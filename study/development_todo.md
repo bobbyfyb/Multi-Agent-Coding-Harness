@@ -132,6 +132,31 @@
 - [x] 覆盖 ContextBuilder 测试
 - [x] 整理项目复盘与秋招面试准备文档
 
+### 2.8 同步 Subagent MVP
+
+- [x] 基于现有 `Agent` 复用同一套 agent loop，不维护第二套子循环
+- [x] `Agent.run()` 返回结构化 `AgentRunResult`
+- [x] 为工具调用增加显式 `ToolExecutionContext`
+- [x] 为事件增加 `agent_id / run_id / parent_run_id / depth`
+- [x] 实现 `SubagentRunner`
+- [x] 子 Agent 使用独立 system prompt 和全新 messages
+- [x] 实现 `SubagentRequest` 和 `SubagentResult`
+- [x] 实现 `explore` 只读调查工具 profile
+- [x] 实现 `general` 可修改工作区工具 profile
+- [x] 子 Agent 不暴露 Task 工具和 `subagent_run`，禁止递归委派
+- [x] 子 Agent 复用权限 Hook 和 approval provider
+- [x] 实现 `subagent_run` 上层工具适配
+- [x] 父 Agent 将结构化子 Agent 结果作为普通 tool result 回灌
+- [x] 支持父子 Agent 关键步骤的带来源事件输出
+- [x] 覆盖同步委派、上下文隔离、工具隔离和深度限制测试
+
+当前边界：
+
+- 同步执行，父 Agent 等待子 Agent 完成后继续。
+- 暂不支持后台执行、并行子 Agent、取消和恢复。
+- 子 Agent 不直接 claim/complete 父 Task；父 Agent 负责验收并更新 Task。
+- 总运行预算目前由 `max_steps`、LLM timeout 和工具 timeout 共同约束。
+
 ## 3. 接下来优先补全的单 Agent Harness 能力
 
 ### 3.1 Trace / Observability
@@ -420,6 +445,7 @@ pytest / ruff / build / API test / UI test
 - [x] ContextBuilder 已接入
 - [x] 统一 Task System MVP 已接入
 - [x] TaskPlanningHook 已接入 `BeforeLLM`
+- [x] 同步 Subagent MVP 已接入
 - [x] 基础测试已覆盖
 
 ### Milestone 1：可观测单 Agent Harness
@@ -515,11 +541,12 @@ pytest / ruff / build / API test / UI test
 1. Tool use：继续完善工具定义和工具调用。
 2. Permission：扩展当前 PermissionHook。
 3. Hooks：完善 HookManager 生命周期和 trace。
-4. Context：实现上下文压缩和 section 管理。
-5. Memory：实现 session summary 和长期记忆。
-6. Skills：实现本地 skill 加载。
-7. MCP：将 MCP tools 接入 ToolRegistry。
-8. Multi-agent：最后再做 PM/Engineer/QA 编排。
+4. Subagent：继续补充预算、取消和 trace，之后再考虑并行执行。
+5. Context：实现上下文压缩和 section 管理。
+6. Memory：实现 session summary 和长期记忆。
+7. Skills：实现本地 skill 加载。
+8. MCP：将 MCP tools 接入 ToolRegistry。
+9. Multi-agent：最后再做 PM/Engineer/QA 编排。
 
 原则：
 
@@ -533,7 +560,7 @@ pytest / ruff / build / API test / UI test
 ## 8. 暂时不做或延后做的内容
 
 - [ ] 暂不做复杂 Web UI
-- [ ] 暂不做真实并行多 agent 协作
+- [ ] 暂不做异步或并行 Subagent / Agent Team 协作
 - [ ] 暂不做完整云端部署
 - [ ] 暂不做复杂向量数据库记忆
 - [ ] 暂不做完整 MCP server 生态

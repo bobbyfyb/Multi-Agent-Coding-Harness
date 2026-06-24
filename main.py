@@ -6,27 +6,47 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 from llm_agent.agent import Agent, print_agent_event
 from llm_agent.context_builder import AgentContextBuilder, PromptSection
 from llm_agent.hooks import HookContext, build_default_hook_manager
+from llm_agent.hooks.permission_hooks import CliApprovalProvider
 from llm_agent.llm_client import LLMClient
+from llm_agent.subagent import SUBAGENT_PARENT_INSTRUCTIONS, SubagentRunner
 from llm_agent.tools import build_default_registry
 
 
 def build_agent() -> Agent:
     workdir = Path.cwd()
-    registry = build_default_registry(workdir=workdir)
     llm = LLMClient(provider="anthropic")
+    approval_provider = CliApprovalProvider()
+    subagent_runner = SubagentRunner(
+        llm=llm,
+        workdir=workdir,
+        approval_provider=approval_provider,
+    )
+    registry = build_default_registry(
+        workdir=workdir,
+        subagent_runner=subagent_runner,
+    )
     return Agent(
         llm=llm,
         tools=registry,
-        hooks=build_default_hook_manager(workdir=workdir),
+        hooks=build_default_hook_manager(
+            workdir=workdir,
+            approval_provider=approval_provider,
+        ),
         workdir=workdir,
         max_steps=None,
+        agent_id="main",
         context_builder=AgentContextBuilder(
             sections=[
                 PromptSection(
                     name="workspace",
                     content=f"Current Working DIR: {workdir}",
                     priority=20,
-                )
+                ),
+                PromptSection(
+                    name="delegation",
+                    content=SUBAGENT_PARENT_INSTRUCTIONS,
+                    priority=30,
+                ),
             ]
         ),
     )

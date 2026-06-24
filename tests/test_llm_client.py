@@ -4,7 +4,7 @@ from typing import Any
 import pytest
 
 from llm_agent.llm_client import LLMClient, LLMClientError, LLMToolCall
-from llm_agent.schemas import ToolSpec
+from llm_agent.tool_registry import ToolSpec
 
 
 class FakeCreate:

@@ -1,7 +1,5 @@
 from typing import Any
 
-import pytest
-
 from llm_agent.agent import Agent, AgentEvent, print_agent_event
 from llm_agent.llm_client import LLMResponse, LLMToolCall
 from llm_agent.tool_registry import ToolRegistry
@@ -112,7 +110,12 @@ def test_agent_batches_native_tool_results_then_final_answer() -> None:
     messages = agent.new_messages()
     messages.append({"role": "user", "content": "calculate"})
 
-    assert agent.run(messages) is None
+    result = agent.run(messages)
+
+    assert result.status == "completed"
+    assert result.content == "results are 3 and 7"
+    assert result.steps == 2
+    assert result.tool_calls == 2
     assert len(llm.messages) == 2
     assert llm.tool_choices == ["auto", "auto"]
     assert llm.tools[0] == registry.tool_specs()
@@ -233,7 +236,10 @@ def test_agent_returns_direct_final_answer_without_tools() -> None:
     messages = agent.new_messages()
     messages.append({"role": "user", "content": "answer directly"})
 
-    assert agent.run(messages) is None
+    result = agent.run(messages)
+
+    assert result.status == "completed"
+    assert result.content == "done"
     assert len(llm.messages) == 1
     assert messages == [
         {"role": "system", "content": "system"},
@@ -262,10 +268,12 @@ def test_agent_reuses_caller_managed_history() -> None:
     messages = agent.new_messages()
 
     messages.append({"role": "user", "content": "我叫小明"})
-    assert agent.run(messages) is None
+    first_result = agent.run(messages)
+    assert first_result.status == "completed"
 
     messages.append({"role": "user", "content": "我叫什么？"})
-    assert agent.run(messages) is None
+    second_result = agent.run(messages)
+    assert second_result.status == "completed"
 
     assert llm.messages[1] == [
         {"role": "system", "content": "system"},
@@ -275,7 +283,7 @@ def test_agent_reuses_caller_managed_history() -> None:
     ]
 
 
-def test_agent_raises_when_max_steps_are_exhausted() -> None:
+def test_agent_returns_structured_result_when_max_steps_are_exhausted() -> None:
     registry = ToolRegistry()
     registry.register(
         name="missing",
@@ -294,5 +302,8 @@ def test_agent_raises_when_max_steps_are_exhausted() -> None:
     messages = agent.new_messages()
     messages.append({"role": "user", "content": "loop forever"})
 
-    with pytest.raises(RuntimeError, match="max_steps"):
-        agent.run(messages)
+    result = agent.run(messages)
+
+    assert result.status == "max_steps"
+    assert result.steps == 2
+    assert result.tool_calls == 2

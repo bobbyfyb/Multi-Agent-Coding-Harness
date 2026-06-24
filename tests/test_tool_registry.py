@@ -36,3 +36,31 @@ def test_tool_registry_registers_tool_definitions() -> None:
     )
 
     assert registry.call("double", {"value": 4}) == {"ok": True, "result": 8}
+
+
+def test_tool_registry_passes_context_to_context_aware_tool() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        name="inspect_context",
+        description="Return execution context.",
+        parameters={},
+        func=lambda *, context: context,
+        requires_context=True,
+    )
+
+    assert registry.call("inspect_context", {}, context="runtime") == {
+        "ok": True,
+        "result": "runtime",
+    }
+
+
+def test_tool_registry_subset_preserves_selected_tools() -> None:
+    registry = ToolRegistry()
+    registry.register("one", "First.", {}, lambda: 1)
+    registry.register("two", "Second.", {}, lambda: 2)
+
+    subset = registry.subset({"two"})
+
+    assert subset.names() == ["two"]
+    assert subset.call("two", {}) == {"ok": True, "result": 2}
+    assert subset.call("one", {})["ok"] is False
