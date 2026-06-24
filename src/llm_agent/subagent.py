@@ -19,9 +19,11 @@ from llm_agent.hooks.permission_hooks import (
     PermissionHook,
 )
 from llm_agent.llm_client import LLMClient
+from llm_agent.skill_system import SkillRegistry, build_skill_catalog_section
 from llm_agent.tool_registry import ToolRegistry
 from llm_agent.tools.basic_tools import register_tools as register_basic_tools
 from llm_agent.tools.search_tools import register_tools as register_search_tools
+from llm_agent.tools.skill_tools import register_tools as register_skill_tools
 
 
 SubagentMode = Literal["explore", "general"]
@@ -51,8 +53,16 @@ Delegation:
 - Keep simple work in the current agent instead of delegating it.
 """.strip()
 
+SUBAGENT_SKILL_TOOLS = {"skill_load", "skill_read_resource"}
+
 SUBAGENT_TOOL_PROFILES: dict[SubagentMode, set[str]] = {
-    "explore": {"bash", "read_file", "glob", "search"},
+    "explore": {
+        "bash",
+        "read_file",
+        "glob",
+        "search",
+        *SUBAGENT_SKILL_TOOLS,
+    },
     "general": {
         "bash",
         "read_file",
@@ -60,6 +70,7 @@ SUBAGENT_TOOL_PROFILES: dict[SubagentMode, set[str]] = {
         "edit_file",
         "glob",
         "search",
+        *SUBAGENT_SKILL_TOOLS,
     },
 }
 
@@ -98,6 +109,7 @@ class SubagentRunner:
     workdir: Path | str
     max_steps: int = 12
     max_depth: int = 1
+    skill_registry: SkillRegistry | None = None
     approval_provider: ApprovalProvider | None = field(
         default_factory=CliApprovalProvider
     )
@@ -183,6 +195,11 @@ class SubagentRunner:
         registry = ToolRegistry()
         register_basic_tools(registry, workdir=self.workdir)
         register_search_tools(registry, workdir=self.workdir)
+        if self.skill_registry is not None:
+            register_skill_tools(
+                registry,
+                skill_registry=self.skill_registry,
+            )
         return registry.subset(SUBAGENT_TOOL_PROFILES[mode])
 
     def _build_hooks(self) -> HookManager:
@@ -197,24 +214,34 @@ class SubagentRunner:
         return manager
 
     def _build_context(self, mode: SubagentMode) -> AgentContextBuilder:
+        sections = [
+            PromptSection(
+                name="workspace",
+                content=f"Working directory: {self.workdir}",
+                priority=20,
+            ),
+            PromptSection(
+                name="subagent_mode",
+                content=(
+                    f"Mode: {mode}. Available tool profile: "
+                    f"{', '.join(sorted(self._available_tool_names(mode)))}."
+                ),
+                priority=30,
+            ),
+        ]
+        if self.skill_registry is not None:
+            sections.append(build_skill_catalog_section(self.skill_registry))
+
         return AgentContextBuilder(
             base_instructions=SUBAGENT_BASE_INSTRUCTIONS,
-            sections=[
-                PromptSection(
-                    name="workspace",
-                    content=f"Working directory: {self.workdir}",
-                    priority=20,
-                ),
-                PromptSection(
-                    name="subagent_mode",
-                    content=(
-                        f"Mode: {mode}. Available tool profile: "
-                        f"{', '.join(sorted(SUBAGENT_TOOL_PROFILES[mode]))}."
-                    ),
-                    priority=30,
-                ),
-            ],
+            sections=sections,
         )
+
+    def _available_tool_names(self, mode: SubagentMode) -> set[str]:
+        names = set(SUBAGENT_TOOL_PROFILES[mode])
+        if self.skill_registry is None:
+            names -= SUBAGENT_SKILL_TOOLS
+        return names
 
     @staticmethod
     def _delegation_prompt(request: SubagentRequest) -> str:
@@ -297,6 +324,7 @@ class SubagentRunner:
 
 __all__ = [
     "SUBAGENT_PARENT_INSTRUCTIONS",
+    "SUBAGENT_SKILL_TOOLS",
     "SUBAGENT_TOOL_PROFILES",
     "SubagentMode",
     "SubagentRequest",

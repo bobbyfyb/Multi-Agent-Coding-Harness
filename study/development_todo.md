@@ -157,6 +157,31 @@
 - 子 Agent 不直接 claim/complete 父 Task；父 Agent 负责验收并更新 Task。
 - 总运行预算目前由 `max_steps`、LLM timeout 和工具 timeout 共同约束。
 
+### 2.9 Skill System MVP
+
+- [x] 实现只读 `SkillRegistry`
+- [x] 使用 `.llm_agent/skills/<name>/SKILL.md` 目录结构
+- [x] 支持 YAML frontmatter：`name / description / when_to_use`
+- [x] 支持无 frontmatter 时从目录名和首个标题生成基础元数据
+- [x] 启动时扫描 Skill 并检测非法 YAML、非法名称和重复名称
+- [x] 将有字符预算限制的 Skill Catalog 注入 system prompt
+- [x] 实现 `skill_load`，按需将完整正文作为 tool result 注入 messages
+- [x] 实现 `skill_read_resource`
+- [x] 防止 Skill 资源路径穿越
+- [x] 限制 Skill 正文、资源和 Catalog 大小
+- [x] Skill 内容不能绕过 system/user 指令、workspace 和权限策略
+- [x] 主 Agent 和 Subagent 共用 Skill 索引
+- [x] Subagent 在独立上下文中重新按需加载 Skill
+- [x] 添加 `code-review` 示例 Skill
+- [x] 覆盖解析、索引、预算、资源安全、Agent 加载和 Subagent 加载测试
+
+当前边界：
+
+- MVP 只加载项目级本地 Skill，不加载用户级、插件或远程 Skill。
+- Skill 选择由模型根据 Catalog 的语义信息完成，不使用关键词规则路由。
+- 暂不支持 `context: fork`、模型覆盖、Skill Hook 和 `allowed-tools` 自动授权。
+- Skill 修改后需要调用 `SkillRegistry.refresh()` 或重新启动进程。
+
 ## 3. 接下来优先补全的单 Agent Harness 能力
 
 ### 3.1 Trace / Observability
@@ -226,23 +251,28 @@ messages 太长
 
 目标：让 agent 可以按任务加载专项能力说明。
 
-- [ ] 设计 `Skill`
-- [ ] 设计本地 `skills/` 目录结构
-- [ ] 支持读取 `skills/<name>/SKILL.md`
-- [ ] 支持 skill metadata
-- [ ] 支持关键词匹配选择 skill
-- [ ] 支持手动指定 skill
-- [ ] 将 skill 内容注入 `AgentContextBuilder`
-- [ ] 为 coding task 准备默认 skill
+- [x] 设计 `SkillMetadata / SkillDocument / SkillRegistry`
+- [x] 设计本地 `.llm_agent/skills/` 目录结构
+- [x] 支持读取 `skills/<name>/SKILL.md`
+- [x] 支持 Skill metadata
+- [x] 由模型根据精简 Catalog 进行语义选择
+- [x] 支持通过 `skill_load(name)` 手动指定 Skill
+- [x] 将 Skill Catalog 注入 `AgentContextBuilder`
+- [x] 将完整 Skill 内容通过 tool result 按需注入 messages
+- [x] 提供 `code-review` 默认示例 Skill
 - [ ] 为 test/debug task 准备默认 skill
 - [ ] 为 frontend/backend task 准备默认 skill
+- [ ] 支持用户级和额外目录 Skill 来源
+- [ ] 支持 Orchestrator 程序化指定或预加载 Skill
+- [ ] 与 Context Compression 协作保留或摘要已加载 Skill
 
-初版不要复杂化：
+当前实现：
 
 ```text
-本地 Markdown skill
-  -> 简单 keyword router
-  -> 注入 prompt section
+本地 Markdown Skill
+  -> Catalog 注入 system prompt
+  -> 模型按语义调用 skill_load
+  -> 完整正文进入当前 messages
 ```
 
 ### 3.5 MCP 接入
@@ -477,13 +507,15 @@ pytest / ruff / build / API test / UI test
 
 - [ ] Context compression
 - [ ] Session summary
-- [ ] Skill loader
-- [ ] Skill router
+- [x] Skill loader
+- [x] Catalog 驱动的模型语义选择
+- [ ] 多来源 Skill loader
+- [ ] Orchestrator 显式 Skill 路由
 
 验收标准：
 
 - 长对话不会无限增长。
-- 指定任务可以加载对应 skill。
+- [x] 指定任务可以加载对应 Skill。
 
 ### Milestone 4：Artifact 工作流
 

@@ -58,7 +58,9 @@ coverage.xml
 .venv.*
 
 # LLM Agent data
-.llm_agent/
+.llm_agent/*
+!.llm_agent/skills/
+!.llm_agent/skills/**
 
 # IDE
 .vscode/

@@ -4,6 +4,7 @@ from typing import Any
 from llm_agent.agent import Agent, AgentEvent, ToolExecutionContext
 from llm_agent.hooks.permission_hooks import AutoApprovalProvider
 from llm_agent.llm_client import LLMResponse, LLMToolCall
+from llm_agent.skill_system import SkillRegistry
 from llm_agent.subagent import SubagentRequest, SubagentRunner
 from llm_agent.tool_registry import ToolRegistry
 from llm_agent.tools.subagent_tools import register_tools as register_subagent_tools
@@ -204,3 +205,63 @@ def test_subagent_runner_rejects_nested_delegation_at_depth_limit(
     assert result.status == "failed"
     assert "depth limit" in str(result.error)
     assert llm.messages == []
+
+
+def test_subagent_can_load_skills_in_its_own_context(tmp_path: Path) -> None:
+    skill_dir = tmp_path / ".llm_agent" / "skills" / "debugging"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        """---
+description: Diagnose failures with controlled experiments.
+---
+# Debugging
+
+Reproduce the failure before changing code.
+""",
+        encoding="utf-8",
+    )
+    skill_registry = SkillRegistry.for_workdir(tmp_path)
+    skill_call = LLMToolCall(
+        id="call_skill",
+        name="skill_load",
+        arguments={"name": "debugging"},
+        raw={"id": "call_skill", "name": "skill_load"},
+    )
+    llm = FakeLLM(
+        [
+            LLMResponse(content="", tool_calls=[skill_call], raw={}),
+            LLMResponse(content="debug plan ready", tool_calls=[], raw={}),
+        ]
+    )
+    runner = SubagentRunner(
+        llm=llm,
+        workdir=tmp_path,
+        skill_registry=skill_registry,
+        approval_provider=AutoApprovalProvider(approved=True),
+    )
+    parent_context = ToolExecutionContext(
+        run_id="parent-run",
+        agent_id="main",
+        parent_run_id=None,
+        depth=0,
+        step=1,
+        workdir=tmp_path,
+    )
+
+    result = runner.run(
+        SubagentRequest(
+            task="Load the debugging skill and prepare a diagnosis workflow.",
+            mode="explore",
+        ),
+        parent_context=parent_context,
+    )
+
+    assert result.status == "completed"
+    child_system_prompt = llm.messages[0][0]["content"]
+    assert "debugging: Diagnose failures" in child_system_prompt
+    assert "Reproduce the failure before changing code." not in child_system_prompt
+    child_tool_names = {tool["name"] for tool in llm.tools[0]}
+    assert {"skill_load", "skill_read_resource"} <= child_tool_names
+    assert "subagent_run" not in child_tool_names
+    loaded_result = llm.messages[1][-1]["content"][0]["content"]
+    assert "Reproduce the failure" in loaded_result["result"]["instructions"]

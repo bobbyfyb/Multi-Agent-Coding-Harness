@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from llm_agent.skill_system import SkillRegistry
 from llm_agent.tool_registry import ToolRegistry
 from llm_agent.tools import build_default_registry
 from llm_agent.tools.basic_tools import register_tools
@@ -67,7 +68,11 @@ def test_basic_tools_blocks_dangerous_bash(tmp_path: Path) -> None:
 
 
 def test_default_registry_loads_basic_tools(tmp_path: Path) -> None:
-    registry = build_default_registry(workdir=tmp_path)
+    skill_registry = SkillRegistry.for_workdir(tmp_path)
+    registry = build_default_registry(
+        workdir=tmp_path,
+        skill_registry=skill_registry,
+    )
     tool_names = {tool["name"] for tool in registry.tool_specs()}
 
     assert {
@@ -82,4 +87,6 @@ def test_default_registry_loads_basic_tools(tmp_path: Path) -> None:
         "task_get",
         "task_claim",
         "task_complete",
+        "skill_load",
+        "skill_read_resource",
     } <= tool_names
