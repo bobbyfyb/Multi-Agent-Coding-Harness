@@ -35,6 +35,7 @@ def build_agent() -> Agent:
         hooks=build_default_hook_manager(
             workdir=workdir,
             approval_provider=approval_provider,
+            llm=llm,
         ),
         workdir=workdir,
         max_steps=None,

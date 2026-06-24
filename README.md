@@ -79,6 +79,7 @@ agent = Agent(
     hooks=build_default_hook_manager(
         workdir=workdir,
         approval_provider=approval_provider,
+        llm=llm,
     ),
     context_builder=AgentContextBuilder(
         sections=[
@@ -104,6 +105,34 @@ print(result.status)
 print(result.content)
 print(result.steps, result.tool_calls, result.usage)
 ```
+
+## Task Intent Classification
+
+默认 `TaskPlanningHook` 使用轻量 `TaskIntentClassifier` 判断用户请求是否需要
+持久化任务计划。它直接调用一次现有 `LLMClient`：
+
+- 不创建 Subagent
+- 不运行 Agent Loop
+- 不提供工具
+- `max_tokens=8`
+- `temperature=0`
+- 按完整用户 prompt 缓存结果
+- 调用失败或没有返回明确 `YES/NO` 时退回规则判断
+
+分类目标是“是否需要多步骤计划和任务跟踪”，而不是简单判断输入是否和代码
+有关。解释性问题或小型单步修改可以不创建 Task。
+
+通过默认工厂启用：
+
+```python
+hooks = build_default_hook_manager(
+    workdir=workdir,
+    approval_provider=approval_provider,
+    llm=llm,
+)
+```
+
+如果不传 `llm`，`TaskPlanningHook` 会继续使用本地规则判断，不会额外调用模型。
 
 ## Skill System
 

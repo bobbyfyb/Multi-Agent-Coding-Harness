@@ -182,6 +182,26 @@
 - 暂不支持 `context: fork`、模型覆盖、Skill Hook 和 `allowed-tools` 自动授权。
 - Skill 修改后需要调用 `SkillRegistry.refresh()` 或重新启动进程。
 
+### 2.10 Task Intent Classification
+
+- [x] 实现轻量 `TaskIntentClassifier`
+- [x] 直接复用 `LLMClient`，不创建 Subagent 或第二套 Agent Loop
+- [x] 分类调用不提供工具，限制为 `max_tokens=8 / temperature=0`
+- [x] 判断目标从“是否为 coding task”调整为“是否需要持久化多步骤计划”
+- [x] 按完整用户 prompt 缓存分类结果
+- [x] LLM 调用失败或输出不明确时使用本地规则降级
+- [x] `TaskPlanningHook` 只负责消费分类结果并生成提醒
+- [x] 跳过 `<current_tasks>` 和 `<task_reminder>` 等内部 user 消息
+- [x] 提醒在同一 prompt 的后续 step 中去重，新 prompt 可再次提醒
+- [x] 默认 Hook 工厂支持注入现有 `LLMClient`
+- [x] 覆盖 YES/NO 解析、缓存、降级和 Hook 集成测试
+
+当前边界：
+
+- 分类目前使用主 Agent 的同一模型，暂未支持单独配置低成本分类模型。
+- 分类调用暂未进入 `AgentEvent` 和 Trace，后续由 TraceRecorder 统一记录。
+- 本地降级规则仍是启发式判断，只用于模型不可用或响应不规范的情况。
+
 ## 3. 接下来优先补全的单 Agent Harness 能力
 
 ### 3.1 Trace / Observability

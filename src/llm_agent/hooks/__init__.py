@@ -114,12 +114,21 @@ def build_default_hook_manager(
     *,
     workdir: Path | str | None = None,
     approval_provider: Any | None = None,
+    llm: Any | None = None,
 ) -> HookManager:
     from llm_agent.hooks.permission_hooks import PermissionHook
     from llm_agent.hooks.task_hooks import TaskPlanningHook
+    from llm_agent.task_intent import TaskIntentClassifier
 
     manager = HookManager()
-    manager.register_hook("BeforeLLM", TaskPlanningHook(workdir=workdir))
+    intent_classifier = TaskIntentClassifier(llm) if llm is not None else None
+    manager.register_hook(
+        "BeforeLLM",
+        TaskPlanningHook(
+            workdir=workdir,
+            intent_classifier=intent_classifier,
+        ),
+    )
     permission_kwargs = {"workdir": workdir}
     if approval_provider is not None:
         permission_kwargs["approval_provider"] = approval_provider

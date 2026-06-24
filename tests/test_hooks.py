@@ -2,10 +2,16 @@ from pathlib import Path
 from typing import Any
 
 from llm_agent.agent import Agent, AgentEvent
-from llm_agent.hooks import HookContext, HookManager, HookResult
+from llm_agent.hooks import (
+    HookContext,
+    HookManager,
+    HookResult,
+    build_default_hook_manager,
+)
 from llm_agent.hooks.permission_hooks import AutoApprovalProvider, PermissionHook
 from llm_agent.hooks.task_hooks import TaskPlanningHook
 from llm_agent.llm_client import LLMResponse, LLMToolCall
+from llm_agent.task_intent import TaskIntentClassifier
 from llm_agent.tool_registry import ToolRegistry
 
 
@@ -48,6 +54,16 @@ class FakeLLM:
                 ],
             }
         ]
+
+
+class StubIntentClassifier:
+    def __init__(self, decision: bool) -> None:
+        self.decision = decision
+        self.prompts: list[str] = []
+
+    def requires_plan(self, text: str) -> bool:
+        self.prompts.append(text)
+        return self.decision
 
 
 def test_permission_hook_denies_paths_outside_workspace(tmp_path: Path) -> None:
@@ -219,6 +235,92 @@ def test_task_planning_hook_reminds_for_complex_tasks(tmp_path: Path) -> None:
     assert len(messages) == 1
     assert messages[0].startswith("<task_reminder>")
     assert "task_create" in messages[0]
+
+
+def test_task_planning_hook_uses_classifier_and_skips_internal_messages(
+    tmp_path: Path,
+) -> None:
+    classifier = StubIntentClassifier(decision=True)
+    hook = TaskPlanningHook(
+        workdir=tmp_path,
+        intent_classifier=classifier,
+    )
+    context = HookContext(
+        messages=[
+            {"role": "user", "content": "Refactor auth and add tests."},
+            {
+                "role": "user",
+                "content": "<task_reminder>\ninternal reminder\n</task_reminder>",
+            },
+        ],
+        workdir=tmp_path,
+    )
+
+    result = hook(context)
+
+    assert result is not None
+    assert classifier.prompts == ["Refactor auth and add tests."]
+    assert result.data["messages"][0].startswith("<task_reminder>")
+
+
+def test_task_planning_hook_does_not_remind_when_classifier_returns_false(
+    tmp_path: Path,
+) -> None:
+    classifier = StubIntentClassifier(decision=False)
+    hook = TaskPlanningHook(
+        workdir=tmp_path,
+        intent_classifier=classifier,
+    )
+    context = HookContext(
+        messages=[{"role": "user", "content": "Explain Python dataclasses."}],
+        workdir=tmp_path,
+    )
+
+    result = hook(context)
+
+    assert result is None
+    assert classifier.prompts == ["Explain Python dataclasses."]
+
+
+def test_task_planning_hook_deduplicates_per_prompt_not_entire_session(
+    tmp_path: Path,
+) -> None:
+    classifier = StubIntentClassifier(decision=True)
+    hook = TaskPlanningHook(
+        workdir=tmp_path,
+        intent_classifier=classifier,
+    )
+    first_context = HookContext(
+        messages=[{"role": "user", "content": "Implement tracing."}],
+        workdir=tmp_path,
+    )
+
+    first = hook(first_context)
+    repeated = hook(first_context)
+    second = hook(
+        HookContext(
+            messages=[
+                *first_context.messages,
+                {"role": "user", "content": "Implement context compression."},
+            ],
+            workdir=tmp_path,
+        )
+    )
+
+    assert first is not None
+    assert repeated is None
+    assert second is not None
+
+
+def test_default_hook_manager_builds_llm_intent_classifier(tmp_path: Path) -> None:
+    llm = FakeLLM([])
+
+    manager = build_default_hook_manager(workdir=tmp_path, llm=llm)
+
+    planning_hook = manager.hooks["BeforeLLM"][0]
+    assert isinstance(planning_hook, TaskPlanningHook)
+    assert isinstance(planning_hook.intent_classifier, TaskIntentClassifier)
+    assert planning_hook.intent_classifier.llm is llm
 
 
 def test_agent_injects_before_llm_hook_messages(tmp_path: Path) -> None:
