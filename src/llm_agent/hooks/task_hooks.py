@@ -122,6 +122,7 @@ def _latest_plain_user_message(messages: list[dict[str, Any]]) -> str | None:
 
 
 def _looks_like_coding_task(text: str) -> bool:
+    # TODO:use subagent to determine wether it looks like a coding task instead of rule based.
     lowered = text.lower()
     if len(text) >= 80:
         return True

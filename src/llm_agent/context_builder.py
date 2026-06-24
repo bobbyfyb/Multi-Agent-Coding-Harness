@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from llm_agent.schemas import ToolSpec
+from llm_agent.tool_registry import ToolSpec
+
 
 
 IDENTITY_INSTRUCTIONS = """
