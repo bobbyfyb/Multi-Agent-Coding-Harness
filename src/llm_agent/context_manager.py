@@ -199,12 +199,54 @@ class ContextManager:
         serialized = json.dumps(messages, ensure_ascii=False, default=str)
         return max(1, ceil(len(serialized.encode("utf-8")) / 3))
 
+    def build_request_messages(
+        self,
+        messages: list[Message],
+        *,
+        runtime_messages: list[str] | None = None,
+    ) -> list[Message]:
+        request_messages = deepcopy(messages)
+        runtime_context = [
+            {"role": "user", "content": content}
+            for content in runtime_messages or []
+            if content.strip()
+        ]
+        if not runtime_context:
+            return request_messages
+
+        insert_at = _latest_external_user_index(request_messages)
+        if insert_at is None:
+            request_messages.extend(runtime_context)
+        else:
+            request_messages[insert_at:insert_at] = runtime_context
+        return request_messages
+
+    def estimate_request_tokens(
+        self,
+        messages: list[Message],
+        *,
+        runtime_messages: list[str] | None = None,
+        tools: list[ToolSpec] | None = None,
+    ) -> int:
+        payload = {
+            "messages": self.build_request_messages(
+                messages,
+                runtime_messages=runtime_messages,
+            ),
+            "tools": tools or [],
+        }
+        serialized = json.dumps(payload, ensure_ascii=False, default=str)
+        return max(1, ceil(len(serialized.encode("utf-8")) / 3))
+
     def prepare(
         self,
         messages: list[Message],
         *,
         run_id: str,
+        reserved_tokens: int = 0,
     ) -> ContextUpdate | None:
+        if reserved_tokens < 0:
+            raise ValueError("reserved_tokens cannot be negative.")
         before_tokens = self.estimate_tokens(messages)
         working = deepcopy(messages)
         persisted = self._persist_large_tool_results(working, run_id=run_id)
@@ -218,7 +260,7 @@ class ContextManager:
 
         after_tokens = self.estimate_tokens(working)
         if (
-            after_tokens > self.compact_threshold_tokens
+            after_tokens + reserved_tokens > self.compact_threshold_tokens
             and self._consecutive_compact_failures < self.max_compact_failures
         ):
             if transcript_path is None:
@@ -699,6 +741,27 @@ def _display_path(path: Path, workdir: Path) -> str:
     if resolved.is_relative_to(workdir):
         return resolved.relative_to(workdir).as_posix()
     return str(resolved)
+
+
+def _latest_external_user_index(messages: list[Message]) -> int | None:
+    internal_prefixes = (
+        "<current_tasks>",
+        "<task_reminder>",
+        "<relevant_memories>",
+        "<conversation_summary",
+        "<context_compacted",
+    )
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if (
+            isinstance(content, str)
+            and not content.lstrip().startswith(internal_prefixes)
+        ):
+            return index
+    return None
 
 
 def _atomic_write(path: Path, content: str) -> None:

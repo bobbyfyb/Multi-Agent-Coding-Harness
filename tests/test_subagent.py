@@ -4,6 +4,7 @@ from typing import Any
 from llm_agent.agent import Agent, AgentEvent, ToolExecutionContext
 from llm_agent.hooks.permission_hooks import AutoApprovalProvider
 from llm_agent.llm_client import LLMResponse, LLMToolCall
+from llm_agent.memory_system import MemoryManager
 from llm_agent.skill_system import SkillRegistry
 from llm_agent.subagent import SubagentRequest, SubagentRunner
 from llm_agent.tool_registry import ToolRegistry
@@ -265,3 +266,46 @@ Reproduce the failure before changing code.
     assert "subagent_run" not in child_tool_names
     loaded_result = llm.messages[1][-1]["content"][0]["content"]
     assert "Reproduce the failure" in loaded_result["result"]["instructions"]
+
+
+def test_subagent_receives_relevant_memory_without_memory_tools(
+    tmp_path: Path,
+) -> None:
+    memory_manager = MemoryManager.for_workdir(tmp_path)
+    memory = memory_manager.remember(
+        name="Test command",
+        memory_type="reference",
+        description="Project test command.",
+        body="Run uv run pytest.",
+        pinned=True,
+    )
+    llm = FakeLLM([LLMResponse(content="tests identified", tool_calls=[], raw={})])
+    runner = SubagentRunner(
+        llm=llm,
+        workdir=tmp_path,
+        memory_manager=memory_manager,
+        approval_provider=AutoApprovalProvider(approved=True),
+    )
+    parent_context = ToolExecutionContext(
+        run_id="parent-run",
+        agent_id="main",
+        parent_run_id=None,
+        depth=0,
+        step=1,
+        workdir=tmp_path,
+    )
+
+    result = runner.run(
+        SubagentRequest(task="Identify how to run the project tests.", mode="explore"),
+        parent_context=parent_context,
+    )
+
+    assert result.status == "completed"
+    assert memory.id in llm.messages[0][0]["content"]
+    child_tool_names = {tool["name"] for tool in llm.tools[0]}
+    assert not {
+        "memory_remember",
+        "memory_search",
+        "memory_get",
+        "memory_forget",
+    } & child_tool_names

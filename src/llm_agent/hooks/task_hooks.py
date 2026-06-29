@@ -12,6 +12,7 @@ from llm_agent.task_system import OPEN_TASK_STATUSES, TaskManager
 INTERNAL_USER_MESSAGE_PREFIXES = (
     "<current_tasks>",
     "<task_reminder>",
+    "<relevant_memories>",
     "<conversation_summary",
     "<context_compacted",
 )
@@ -24,7 +25,6 @@ class TaskPlanningHook:
     inject_task_summary: bool = True
     remind_for_complex_tasks: bool = True
     intent_classifier: TaskIntentClassifier | None = None
-    _last_task_summary: str | None = field(default=None, init=False)
     _last_reminder_key: tuple[str | None, str] | None = field(
         default=None,
         init=False,
@@ -32,7 +32,6 @@ class TaskPlanningHook:
 
     def __call__(self, context: HookContext) -> HookResult | None:
         if context.metadata.get("context_compacted"):
-            self._last_task_summary = None
             self._last_reminder_key = None
 
         manager = self._manager(context)
@@ -40,9 +39,8 @@ class TaskPlanningHook:
 
         if self.inject_task_summary:
             summary = manager.summary(include_completed=False)
-            if summary != "No tasks." and summary != self._last_task_summary:
+            if summary != "No tasks.":
                 messages.append(f"<current_tasks>\n{summary}\n</current_tasks>")
-                self._last_task_summary = summary
 
         reminder = self._build_reminder(manager, context)
         if reminder is not None:

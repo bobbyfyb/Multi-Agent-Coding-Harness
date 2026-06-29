@@ -1,7 +1,8 @@
 # LLM Agent Harness
 
 一个支持 OpenAI / Anthropic 官方 SDK、tool calling、权限 Hook、持久化
-Task System、同步 Subagent 和按需 Skill 加载的 Python Agent Harness。
+Task System、长期 Memory、同步 Subagent 和按需 Skill 加载的 Python Agent
+Harness。
 
 ## 运行
 
@@ -50,6 +51,10 @@ from llm_agent.context_manager import ContextManager, PromptSection
 from llm_agent.hooks import build_default_hook_manager
 from llm_agent.hooks.permission_hooks import CliApprovalProvider
 from llm_agent.llm_client import LLMClient
+from llm_agent.memory_system import (
+    MemoryManager,
+    build_memory_policy_section,
+)
 from llm_agent.skill_system import SkillRegistry, build_skill_catalog_section
 from llm_agent.subagent import (
     SUBAGENT_PARENT_INSTRUCTIONS,
@@ -61,17 +66,20 @@ workdir = Path.cwd()
 llm = LLMClient(provider="anthropic")
 approval_provider = CliApprovalProvider()
 skill_registry = SkillRegistry.for_workdir(workdir)
+memory_manager = MemoryManager.for_workdir(workdir, llm=llm)
 runner = SubagentRunner(
     llm=llm,
     workdir=workdir,
     max_steps=12,
     skill_registry=skill_registry,
+    memory_manager=memory_manager,
     approval_provider=approval_provider,
 )
 registry = build_default_registry(
     workdir=workdir,
     subagent_runner=runner,
     skill_registry=skill_registry,
+    memory_manager=memory_manager,
 )
 
 agent = Agent(
@@ -81,6 +89,7 @@ agent = Agent(
         workdir=workdir,
         approval_provider=approval_provider,
         llm=llm,
+        memory_manager=memory_manager,
     ),
     context_manager=ContextManager(
         llm=llm,
@@ -88,6 +97,7 @@ agent = Agent(
         sections=[
             PromptSection("workspace", f"Working directory: {workdir}", 20),
             PromptSection("delegation", SUBAGENT_PARENT_INSTRUCTIONS, 30),
+            build_memory_policy_section(),
             build_skill_catalog_section(skill_registry),
         ]
     ),
@@ -121,6 +131,7 @@ print(result.steps, result.tool_calls, result.usage)
 - 保留 system prompt、摘要和最近消息组
 - 将压缩前历史保存到 `.llm_agent/transcripts/`
 - context-length 错误时执行一次应急压缩和重试
+- 将工具 schema 和临时 Task/Memory 上下文计入完整请求预算
 
 默认使用保守的 UTF-8 字节估算，自动压缩阈值为配置窗口的 75%：
 
@@ -135,9 +146,9 @@ context_manager = ContextManager(
 )
 ```
 
-模型上下文窗口由调用方显式配置，不根据模型名称硬编码。压缩完成后，
-`TaskPlanningHook` 会重新注入持久化任务状态；Skill Catalog 位于保留的
-system prompt 中。
+模型上下文窗口由调用方显式配置，不根据模型名称硬编码。Task 和 Memory
+上下文只加入当前 LLM request，不会写入 canonical history；压缩后会从各自的
+持久化存储重新生成。Skill Catalog 位于保留的 system prompt 中。
 
 也可以在 CLI 或应用边界手动调用：
 
@@ -149,6 +160,50 @@ update = context_manager.compact(
 )
 messages[:] = update.messages
 ```
+
+## Memory System
+
+长期 Memory 默认存储在：
+
+```text
+.llm_agent/memory/
+├── MEMORY.md
+└── mem_<id>.md
+```
+
+每条 Memory 使用 Markdown 正文和 YAML frontmatter，支持四种类型：
+
+- `user`：用户偏好
+- `feedback`：长期有效的做事反馈
+- `project`：稳定项目事实
+- `reference`：命令、文档或外部信息入口
+
+Memory 使用两级加载：
+
+1. `pinned` Memory 在小预算内始终召回。
+2. 其余 Memory 根据最新用户请求，由轻量 LLM side-query 选择；调用失败时
+   使用 name/description 关键词匹配降级。
+
+最多加载 5 条，单条默认限制为 4096 字符，总召回预算为 12000 字符。召回
+内容以 `<relevant_memories>` 临时上下文加入请求，不会反复积累进历史，也
+不会随 conversation compact 永久丢失。
+
+主 Agent 提供：
+
+```text
+memory_remember
+memory_search
+memory_get
+memory_forget
+```
+
+`memory_forget` 需要用户确认。Stop Hook 只在用户表达“记住”“以后都”“我偏好”
+等明确长期信号时尝试自动提取，并拒绝保存疑似密钥、临时日志、Task 状态和
+未经验证的猜测。Subagent 只能读取与委派任务相关的 Memory，不具备 Memory
+写入或删除工具。
+
+当前 Memory 是项目级文件存储。暂未实现用户级全局 Memory、向量索引、自动
+语义合并和可恢复 Session Memory。
 
 ## Task Intent Classification
 

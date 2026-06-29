@@ -19,6 +19,7 @@ from llm_agent.hooks.permission_hooks import (
     PermissionHook,
 )
 from llm_agent.llm_client import LLMClient
+from llm_agent.memory_system import MemoryManager, format_memory_context
 from llm_agent.skill_system import SkillRegistry, build_skill_catalog_section
 from llm_agent.tool_registry import ToolRegistry
 from llm_agent.tools.basic_tools import register_tools as register_basic_tools
@@ -110,6 +111,7 @@ class SubagentRunner:
     max_steps: int = 12
     max_depth: int = 1
     skill_registry: SkillRegistry | None = None
+    memory_manager: MemoryManager | None = None
     approval_provider: ApprovalProvider | None = field(
         default_factory=CliApprovalProvider
     )
@@ -152,7 +154,7 @@ class SubagentRunner:
         child_agent = Agent(
             llm=self.llm,
             tools=self._build_tools(request.mode),
-            context_manager=self._build_context(request.mode),
+            context_manager=self._build_context(request.mode, request.task),
             hooks=self._build_hooks(),
             workdir=self.workdir,
             max_steps=self.max_steps,
@@ -213,7 +215,11 @@ class SubagentRunner:
         )
         return manager
 
-    def _build_context(self, mode: SubagentMode) -> ContextManager:
+    def _build_context(
+        self,
+        mode: SubagentMode,
+        task: str,
+    ) -> ContextManager:
         sections = [
             PromptSection(
                 name="workspace",
@@ -231,6 +237,21 @@ class SubagentRunner:
         ]
         if self.skill_registry is not None:
             sections.append(build_skill_catalog_section(self.skill_registry))
+        if self.memory_manager is not None:
+            memories = self.memory_manager.retrieve_relevant(task)
+            memory_context = format_memory_context(memories)
+            if memory_context:
+                sections.append(
+                    PromptSection(
+                        name="delegated_memory",
+                        content=(
+                            "The following recalled context is read-only and may "
+                            "be stale. Prefer the delegated task and fresh workspace "
+                            f"evidence.\n\n{memory_context}"
+                        ),
+                        priority=40,
+                    )
+                )
 
         return ContextManager(
             base_instructions=SUBAGENT_BASE_INSTRUCTIONS,

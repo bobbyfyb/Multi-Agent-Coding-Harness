@@ -111,6 +111,45 @@ def test_permission_hook_uses_approval_provider_for_file_mutations(
     assert "denied by user" in str(denied.reason)
 
 
+def test_permission_hook_confirms_memory_deletion(tmp_path: Path) -> None:
+    tool_call = LLMToolCall(
+        id="call_memory",
+        name="memory_forget",
+        arguments={"memory_id": "mem_a1b2c3d4"},
+    )
+    result = PermissionHook(
+        workdir=tmp_path,
+        approval_provider=AutoApprovalProvider(approved=False),
+    )(tool_call, HookContext(messages=[], workdir=tmp_path))
+
+    assert result is not None
+    assert result.denied
+    assert "permanently deletes memory" in str(result.reason)
+
+
+def test_hook_manager_merges_runtime_messages() -> None:
+    manager = HookManager()
+    manager.register_hook(
+        "BeforeLLM",
+        lambda context: HookResult.allow(data={"messages": ["task"]}),
+    )
+    manager.register_hook(
+        "BeforeLLM",
+        lambda context: HookResult.allow(
+            data={"messages": ["memory"], "memory_ids": ["mem_a1b2c3d4"]}
+        ),
+    )
+
+    result = manager.trigger_hooks(
+        "BeforeLLM",
+        HookContext(messages=[]),
+    )
+
+    assert result is not None
+    assert result.data["messages"] == ["task", "memory"]
+    assert result.data["memory_ids"] == ["mem_a1b2c3d4"]
+
+
 def test_agent_uses_pre_tool_hook_to_deny_tool_execution(tmp_path: Path) -> None:
     executed = False
 
@@ -253,6 +292,10 @@ def test_task_planning_hook_uses_classifier_and_skips_internal_messages(
                 "role": "user",
                 "content": "<task_reminder>\ninternal reminder\n</task_reminder>",
             },
+            {
+                "role": "user",
+                "content": "<relevant_memories>\ninternal memory\n</relevant_memories>",
+            },
         ],
         workdir=tmp_path,
     )
@@ -345,8 +388,9 @@ def test_task_planning_hook_reinjects_task_state_after_compaction(
     )
 
     assert first is not None
-    assert repeated is None
+    assert repeated is not None
     assert after_compact is not None
+    assert repeated.data["messages"][0].startswith("<current_tasks>")
     assert after_compact.data["messages"][0].startswith("<current_tasks>")
 
 
@@ -368,6 +412,15 @@ def test_agent_injects_before_llm_hook_messages(tmp_path: Path) -> None:
 
     agent.run(messages, on_event=events.append)
 
-    assert llm.messages[0][-1]["role"] == "user"
-    assert llm.messages[0][-1]["content"].startswith("<task_reminder>")
+    reminder = next(
+        message
+        for message in llm.messages[0]
+        if str(message.get("content", "")).startswith("<task_reminder>")
+    )
+    assert reminder["role"] == "user"
+    assert llm.messages[0][-1]["content"] == "Implement a task system."
     assert [event.type for event in events[:2]] == ["task_reminder", "step"]
+    assert all(
+        not str(message.get("content", "")).startswith("<task_reminder>")
+        for message in messages
+    )

@@ -87,6 +87,95 @@ def test_context_manager_can_add_dynamic_sections() -> None:
     )
 
 
+def test_runtime_context_is_request_scoped_and_counted_with_tools() -> None:
+    manager = ContextManager(base_instructions="system")
+    messages = manager.new_messages()
+    messages.append({"role": "user", "content": "current request"})
+    runtime = ["<relevant_memories>\npreference\n</relevant_memories>"]
+    tools = [
+        {
+            "name": "memory_search",
+            "description": "Search memory.",
+            "parameters": {"type": "object"},
+        }
+    ]
+
+    request_messages = manager.build_request_messages(
+        messages,
+        runtime_messages=runtime,
+    )
+
+    assert request_messages[-2]["content"].startswith("<relevant_memories>")
+    assert request_messages[-1] == {
+        "role": "user",
+        "content": "current request",
+    }
+    assert messages[-1] == {"role": "user", "content": "current request"}
+    assert manager.estimate_request_tokens(
+        messages,
+        runtime_messages=runtime,
+        tools=tools,
+    ) > manager.estimate_tokens(messages)
+
+
+def test_runtime_context_does_not_split_tool_call_result_pairs() -> None:
+    manager = ContextManager(base_instructions="system")
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "Inspect the file."},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "type": "function"}],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": "file contents",
+        },
+    ]
+
+    request_messages = manager.build_request_messages(
+        messages,
+        runtime_messages=["<relevant_memories>\ncontext\n</relevant_memories>"],
+    )
+
+    assistant_index = next(
+        index
+        for index, message in enumerate(request_messages)
+        if message.get("tool_calls")
+    )
+    assert request_messages[assistant_index + 1]["role"] == "tool"
+    assert request_messages[-1]["role"] == "tool"
+
+
+def test_prepare_reserves_budget_for_runtime_context(tmp_path: Path) -> None:
+    llm = FakeSummaryLLM([_response("Earlier request summarized.")])
+    manager = ContextManager(
+        llm=llm,
+        workdir=tmp_path,
+        max_context_tokens=1_000,
+        auto_compact_ratio=0.5,
+        keep_recent_groups=1,
+    )
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "older request"},
+        {"role": "assistant", "content": "older response"},
+        {"role": "user", "content": "latest request"},
+    ]
+
+    update = manager.prepare(
+        messages,
+        run_id="runtime-budget",
+        reserved_tokens=500,
+    )
+
+    assert update is not None
+    assert update.summary_created is True
+    assert update.messages[-1] == {"role": "user", "content": "latest request"}
+
+
 def test_default_instructions_and_tool_summary_compatibility() -> None:
     assert "working in the user's workspace" in DEFAULT_BASE_INSTRUCTIONS
     assert "Do not fabricate tool results." in DEFAULT_BASE_INSTRUCTIONS

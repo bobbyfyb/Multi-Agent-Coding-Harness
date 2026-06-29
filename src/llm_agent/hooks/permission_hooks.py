@@ -98,6 +98,13 @@ class PermissionHook:
             reason = f"{tool_call.name} modifies workspace file: {path}"
             return self._ask_for_approval(tool_call, reason)
 
+        if tool_call.name == "memory_forget":
+            memory_id = str(arguments.get("memory_id", ""))
+            return self._ask_for_approval(
+                tool_call,
+                f"memory_forget permanently deletes memory: {memory_id}",
+            )
+
         return None
 
     def _workdir(self, context: HookContext) -> Path:

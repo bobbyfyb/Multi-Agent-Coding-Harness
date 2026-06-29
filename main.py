@@ -9,6 +9,10 @@ from llm_agent.context_manager import ContextManager, PromptSection
 from llm_agent.hooks import HookContext, build_default_hook_manager
 from llm_agent.hooks.permission_hooks import CliApprovalProvider
 from llm_agent.llm_client import LLMClient
+from llm_agent.memory_system import (
+    MemoryManager,
+    build_memory_policy_section,
+)
 from llm_agent.skill_system import SkillRegistry, build_skill_catalog_section
 from llm_agent.subagent import SUBAGENT_PARENT_INSTRUCTIONS, SubagentRunner
 from llm_agent.tools import build_default_registry
@@ -19,16 +23,19 @@ def build_agent() -> Agent:
     llm = LLMClient(provider="anthropic")
     approval_provider = CliApprovalProvider()
     skill_registry = SkillRegistry.for_workdir(workdir)
+    memory_manager = MemoryManager.for_workdir(workdir, llm=llm)
     subagent_runner = SubagentRunner(
         llm=llm,
         workdir=workdir,
         skill_registry=skill_registry,
+        memory_manager=memory_manager,
         approval_provider=approval_provider,
     )
     registry = build_default_registry(
         workdir=workdir,
         subagent_runner=subagent_runner,
         skill_registry=skill_registry,
+        memory_manager=memory_manager,
     )
     return Agent(
         llm=llm,
@@ -37,6 +44,7 @@ def build_agent() -> Agent:
             workdir=workdir,
             approval_provider=approval_provider,
             llm=llm,
+            memory_manager=memory_manager,
         ),
         workdir=workdir,
         max_steps=None,
@@ -58,6 +66,7 @@ def build_agent() -> Agent:
                     content=SUBAGENT_PARENT_INSTRUCTIONS,
                     priority=30,
                 ),
+                build_memory_policy_section(),
                 build_skill_catalog_section(skill_registry),
             ]
         ),

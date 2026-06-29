@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import TYPE_CHECKING, Any, Callable, Literal
+
+
+if TYPE_CHECKING:
+    from llm_agent.memory_system import MemoryManager
 
 
 HookEvent = Literal["UserPromptSubmit", "BeforeLLM", "PreToolUse", "PostToolUse", "Stop"]
@@ -99,8 +103,13 @@ class HookManager:
                 )
             if result.denied:
                 return result
-            if result.replaces_result or effective_result is None:
+            if effective_result is None or result.replaces_result:
                 effective_result = result
+            elif effective_result.action == "allow" and result.action == "allow":
+                effective_result = _merge_allow_results(
+                    effective_result,
+                    result,
+                )
         return effective_result
 
     def register(self, event: str, callback: HookCallback) -> None:
@@ -115,7 +124,12 @@ def build_default_hook_manager(
     workdir: Path | str | None = None,
     approval_provider: Any | None = None,
     llm: Any | None = None,
+    memory_manager: "MemoryManager | None" = None,
 ) -> HookManager:
+    from llm_agent.hooks.memory_hooks import (
+        MemoryContextHook,
+        MemoryExtractionHook,
+    )
     from llm_agent.hooks.permission_hooks import PermissionHook
     from llm_agent.hooks.task_hooks import TaskPlanningHook
     from llm_agent.task_intent import TaskIntentClassifier
@@ -129,6 +143,15 @@ def build_default_hook_manager(
             intent_classifier=intent_classifier,
         ),
     )
+    if memory_manager is not None:
+        manager.register_hook(
+            "BeforeLLM",
+            MemoryContextHook(memory_manager),
+        )
+        manager.register_hook(
+            "Stop",
+            MemoryExtractionHook(memory_manager),
+        )
     permission_kwargs = {"workdir": workdir}
     if approval_provider is not None:
         permission_kwargs["approval_provider"] = approval_provider
@@ -137,6 +160,26 @@ def build_default_hook_manager(
         PermissionHook(**permission_kwargs),
     )
     return manager
+
+
+def _merge_allow_results(
+    first: HookResult,
+    second: HookResult,
+) -> HookResult:
+    data = dict(first.data)
+    for key, value in second.data.items():
+        if (
+            key in data
+            and isinstance(data[key], list)
+            and isinstance(value, list)
+        ):
+            data[key] = [*data[key], *value]
+        else:
+            data[key] = value
+    return HookResult.allow(
+        reason=second.reason or first.reason,
+        data=data,
+    )
 
 
 __all__ = [

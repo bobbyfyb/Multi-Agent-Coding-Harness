@@ -14,6 +14,9 @@ AgentEventType = Literal[
     "step",
     "task_context",
     "task_reminder",
+    "memory_context",
+    "memory_extracted",
+    "memory_extract_failed",
     "tool_call",
     "permission_granted",
     "permission_denied",
@@ -120,6 +123,9 @@ class Agent:
         last_content = ""
         reactive_retries = 0
         pending_context_rebuilt = False
+        turn_user_text = _latest_external_user_message(messages) or ""
+        emitted_runtime_context: dict[str, str] = {}
+        called_tools: set[str] = set()
 
         step_index = 0
         while self.max_steps is None or step_index < self.max_steps:
@@ -152,24 +158,67 @@ class Agent:
                     "parent_run_id": self.parent_run_id,
                     "depth": self.depth,
                     "context_compacted": context_rebuilt,
+                    "turn_user_text": turn_user_text,
+                    "called_tools": called_tools,
                 },
             )
             before_llm_result = self.hooks.trigger_hooks("BeforeLLM", hook_context)
-            for hook_message in _hook_messages(before_llm_result):
-                messages.append({"role": "user", "content": hook_message})
-                event_type: AgentEventType = (
-                    "task_context"
-                    if hook_message.startswith("<current_tasks>")
-                    else "task_reminder"
-                )
+            runtime_messages = _hook_messages(before_llm_result)
+            for hook_message in runtime_messages:
+                event_type = _runtime_context_event_type(hook_message)
+                if event_type is None:
+                    continue
+                context_key = _runtime_context_key(hook_message)
+                if emitted_runtime_context.get(context_key) == hook_message:
+                    continue
+                emitted_runtime_context[context_key] = hook_message
+                data: dict[str, Any] = {"content": hook_message}
+                if (
+                    event_type == "memory_context"
+                    and before_llm_result is not None
+                ):
+                    data["memory_ids"] = before_llm_result.data.get(
+                        "memory_ids",
+                        [],
+                    )
                 self._emit(
                     on_event,
                     event_type,
                     step,
-                    {"content": hook_message},
+                    data,
                     resolved_run_id,
                 )
 
+            request_tokens = self.context_manager.estimate_request_tokens(
+                messages,
+                runtime_messages=runtime_messages,
+                tools=tool_specs,
+            )
+            if request_tokens > self.context_manager.compact_threshold_tokens:
+                history_tokens = self.context_manager.estimate_tokens(messages)
+                context_update = self.context_manager.prepare(
+                    messages,
+                    run_id=resolved_run_id,
+                    reserved_tokens=max(0, request_tokens - history_tokens),
+                )
+                if context_update is not None:
+                    messages[:] = context_update.messages
+                    context_rebuilt = (
+                        context_rebuilt or context_update.context_rebuilt
+                    )
+                    hook_context.messages = messages
+                    hook_context.metadata["context_compacted"] = context_rebuilt
+                    self._emit_context_update(
+                        on_event,
+                        context_update,
+                        step=step,
+                        run_id=resolved_run_id,
+                    )
+
+            request_messages = self.context_manager.build_request_messages(
+                messages,
+                runtime_messages=runtime_messages,
+            )
             self._emit(
                 on_event,
                 "step",
@@ -180,7 +229,7 @@ class Agent:
 
             try:
                 response = self.llm.chat(
-                    messages,
+                    request_messages,
                     tools=tool_specs,
                     tool_choice="auto",
                 )
@@ -218,7 +267,18 @@ class Agent:
                     {"content": response.content},
                     resolved_run_id,
                 )
-                self.hooks.trigger_hooks("Stop", messages, hook_context)
+                hook_context.metadata["final_content"] = response.content
+                stop_result = self.hooks.trigger_hooks(
+                    "Stop",
+                    messages,
+                    hook_context,
+                )
+                self._emit_memory_hook_result(
+                    on_event,
+                    stop_result,
+                    step=step,
+                    run_id=resolved_run_id,
+                )
                 return AgentRunResult(
                     status="completed",
                     content=response.content,
@@ -234,6 +294,7 @@ class Agent:
             tool_results = []
             for tool_call in response.tool_calls:
                 tool_call_count += 1
+                called_tools.add(tool_call.name)
                 self._emit(
                     on_event,
                     "tool_call",
@@ -412,6 +473,38 @@ class Agent:
                 run_id,
             )
 
+    def _emit_memory_hook_result(
+        self,
+        on_event: AgentCallback | None,
+        result: Any,
+        *,
+        step: int,
+        run_id: str,
+    ) -> None:
+        if result is None:
+            return
+        extracted = result.data.get("extracted_memories", [])
+        if isinstance(extracted, list) and extracted:
+            self._emit(
+                on_event,
+                "memory_extracted",
+                step,
+                {
+                    "count": len(extracted),
+                    "memories": extracted,
+                },
+                run_id,
+            )
+        error = result.data.get("memory_error")
+        if error:
+            self._emit(
+                on_event,
+                "memory_extract_failed",
+                step,
+                {"error": str(error)},
+                run_id,
+            )
+
 
 def print_agent_event(event: AgentEvent) -> None:
     prefix = _event_prefix(event)
@@ -436,6 +529,28 @@ def print_agent_event(event: AgentEvent) -> None:
         print(
             f"{prefix}{ANSI_YELLOW}[task reminder]{ANSI_RESET} "
             f"{event.data['content']}"
+        )
+        return
+
+    if event.type == "memory_context":
+        memory_ids = event.data.get("memory_ids", [])
+        print(
+            f"{prefix}{ANSI_DIM}[memory recalled]{ANSI_RESET} "
+            f"{', '.join(str(memory_id) for memory_id in memory_ids)}"
+        )
+        return
+
+    if event.type == "memory_extracted":
+        print(
+            f"{prefix}{ANSI_YELLOW}[memory saved]{ANSI_RESET} "
+            f"{event.data['count']} new or updated"
+        )
+        return
+
+    if event.type == "memory_extract_failed":
+        print(
+            f"{prefix}{ANSI_RED}[memory extraction failed]{ANSI_RESET} "
+            f"{event.data['error']}"
         )
         return
 
@@ -559,6 +674,43 @@ def _hook_messages(result: Any) -> list[str]:
     if not isinstance(messages, list):
         return []
     return [message for message in messages if isinstance(message, str) and message]
+
+
+def _runtime_context_event_type(content: str) -> AgentEventType | None:
+    if content.startswith("<current_tasks>"):
+        return "task_context"
+    if content.startswith("<task_reminder>"):
+        return "task_reminder"
+    if content.startswith("<relevant_memories>"):
+        return "memory_context"
+    return None
+
+
+def _runtime_context_key(content: str) -> str:
+    match = content.lstrip().removeprefix("<").split(">", 1)[0]
+    return match.split(" ", 1)[0] or content
+
+
+def _latest_external_user_message(
+    messages: list[dict[str, Any]],
+) -> str | None:
+    internal_prefixes = (
+        "<current_tasks>",
+        "<task_reminder>",
+        "<relevant_memories>",
+        "<conversation_summary",
+        "<context_compacted",
+    )
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if (
+            isinstance(content, str)
+            and not content.lstrip().startswith(internal_prefixes)
+        ):
+            return content
+    return None
 
 
 def _merge_usage(target: dict[str, Any], usage: dict[str, Any]) -> None:

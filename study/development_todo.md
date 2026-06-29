@@ -209,6 +209,38 @@
 - 分类调用暂未进入 `AgentEvent` 和 Trace，后续由 TraceRecorder 统一记录。
 - 本地降级规则仍是启发式判断，只用于模型不可用或响应不规范的情况。
 
+### 2.11 Long-term Memory System
+
+- [x] 实现 `Memory / MemoryStore / MemoryManager`
+- [x] 使用 `.llm_agent/memory/` 下的 Markdown + YAML frontmatter 存储
+- [x] 使用稳定 Memory ID 和原子文件写入
+- [x] 自动重建可读的 `MEMORY.md` 索引
+- [x] 支持 `user / feedback / project / reference` 四种记忆
+- [x] 支持 pinned Memory 和按请求选择的 relevant Memory
+- [x] 使用轻量 LLM side-query 选择相关 Memory
+- [x] 选择失败时降级到 name/description 关键词匹配
+- [x] 按用户请求和索引版本缓存选择结果
+- [x] 限制召回条数、单条大小和总字符预算
+- [x] 实现 `memory_remember / memory_search / memory_get / memory_forget`
+- [x] `memory_forget` 接入权限确认
+- [x] 实现保守的 Stop Hook 自动提取
+- [x] 拒绝保存疑似密钥、Task 状态、临时日志和猜测
+- [x] Memory 作为 request-scoped context 注入，不污染 canonical history
+- [x] 将 runtime context 和工具 schema 纳入压缩预留预算
+- [x] 压缩后从持久化存储重新召回 Memory
+- [x] Subagent 只读接收相关 Memory，不获得 Memory 工具
+- [x] 增加召回、提取成功和提取失败 AgentEvent
+- [x] 覆盖持久化、更新、检索、降级、提取、工具和 Agent 集成测试
+
+当前边界：
+
+- Memory 当前按项目存储，不提供用户级全局 Memory。
+- Markdown 文件是事实来源，暂不使用 embedding 或向量数据库。
+- 自动提取只在检测到明确长期信号时运行，避免每轮额外 LLM 调用。
+- 暂未实现低频语义合并（Dream）、跨进程写锁和 Memory 版本历史。
+- 当前 conversation summary 负责会话内 compact 连续性；可恢复 Session
+  Memory 等 `AgentSession` 落地后再实现。
+
 ## 3. 接下来优先补全的单 Agent Harness 能力
 
 ### 3.1 Trace / Observability
@@ -267,15 +299,18 @@
 - [x] 将 summary 作为内部 user context 注入
 - [x] 保存完整 JSONL Transcript
 - [x] 支持 prompt-too-long reactive retry
+- [x] Task/Memory Hook 上下文只进入 LLM request，不写入 canonical history
+- [x] 将工具 schema 和 runtime context 纳入完整请求预算
 
 当前流程：
 
 ```text
 工具结果落盘
   -> 旧结果占位
-  -> token 预算判断
+  -> 构造 Task / Memory runtime context
+  -> 计算 messages + runtime context + tools 完整预算
   -> LLM 总结旧历史
-  -> system + summary + 最近消息组
+  -> system + summary + 最近消息组 + 临时 runtime context
   -> context-length 失败时应急恢复一次
 ```
 
