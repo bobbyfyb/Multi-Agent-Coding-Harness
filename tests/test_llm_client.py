@@ -3,28 +3,35 @@ from typing import Any
 
 import pytest
 
-from llm_agent.llm_client import LLMClient, LLMClientError, LLMToolCall
+from llm_agent.llm_client import (
+    LLMClient,
+    LLMClientError,
+    LLMContextLengthError,
+    LLMToolCall,
+)
 from llm_agent.tool_registry import ToolSpec
 
 
 class FakeCreate:
-    def __init__(self, response: dict[str, Any]) -> None:
+    def __init__(self, response: dict[str, Any] | Exception) -> None:
         self.response = response
         self.kwargs: dict[str, Any] = {}
 
     def create(self, **kwargs: Any) -> dict[str, Any]:
         self.kwargs = kwargs
+        if isinstance(self.response, Exception):
+            raise self.response
         return self.response
 
 
 class FakeOpenAIClient:
-    def __init__(self, response: dict[str, Any]) -> None:
+    def __init__(self, response: dict[str, Any] | Exception) -> None:
         self.create = FakeCreate(response)
         self.chat = SimpleNamespace(completions=self.create)
 
 
 class FakeAnthropicClient:
-    def __init__(self, response: dict[str, Any]) -> None:
+    def __init__(self, response: dict[str, Any] | Exception) -> None:
         self.create = FakeCreate(response)
         self.messages = SimpleNamespace(create=self.create.create)
 
@@ -239,6 +246,26 @@ def test_requires_model_before_sdk_request() -> None:
     )
 
     with pytest.raises(LLMClientError, match="model is required"):
+        client.chat([{"role": "user", "content": "hello"}])
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+def test_sdk_context_length_errors_use_specific_exception(provider: str) -> None:
+    error = RuntimeError("context_length_exceeded: maximum context length")
+    if provider == "openai":
+        client = LLMClient(
+            provider=provider,
+            model="model",
+            openai_client=FakeOpenAIClient(error),
+        )
+    else:
+        client = LLMClient(
+            provider=provider,
+            model="model",
+            anthropic_client=FakeAnthropicClient(error),
+        )
+
+    with pytest.raises(LLMContextLengthError):
         client.chat([{"role": "user", "content": "hello"}])
 
 

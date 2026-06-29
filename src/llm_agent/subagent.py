@@ -11,7 +11,7 @@ from llm_agent.agent import (
     AgentRunResult,
     ToolExecutionContext,
 )
-from llm_agent.context_builder import AgentContextBuilder, PromptSection
+from llm_agent.context_manager import ContextManager, PromptSection
 from llm_agent.hooks import HookManager
 from llm_agent.hooks.permission_hooks import (
     ApprovalProvider,
@@ -152,7 +152,7 @@ class SubagentRunner:
         child_agent = Agent(
             llm=self.llm,
             tools=self._build_tools(request.mode),
-            context_builder=self._build_context(request.mode),
+            context_manager=self._build_context(request.mode),
             hooks=self._build_hooks(),
             workdir=self.workdir,
             max_steps=self.max_steps,
@@ -213,7 +213,7 @@ class SubagentRunner:
         )
         return manager
 
-    def _build_context(self, mode: SubagentMode) -> AgentContextBuilder:
+    def _build_context(self, mode: SubagentMode) -> ContextManager:
         sections = [
             PromptSection(
                 name="workspace",
@@ -232,9 +232,11 @@ class SubagentRunner:
         if self.skill_registry is not None:
             sections.append(build_skill_catalog_section(self.skill_registry))
 
-        return AgentContextBuilder(
+        return ContextManager(
             base_instructions=SUBAGENT_BASE_INSTRUCTIONS,
             sections=sections,
+            llm=self.llm,
+            workdir=self.workdir,
         )
 
     def _available_tool_names(self, mode: SubagentMode) -> set[str]:

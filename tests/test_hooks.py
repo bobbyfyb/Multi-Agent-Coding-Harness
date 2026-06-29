@@ -12,6 +12,7 @@ from llm_agent.hooks.permission_hooks import AutoApprovalProvider, PermissionHoo
 from llm_agent.hooks.task_hooks import TaskPlanningHook
 from llm_agent.llm_client import LLMResponse, LLMToolCall
 from llm_agent.task_intent import TaskIntentClassifier
+from llm_agent.task_system import TaskManager
 from llm_agent.tool_registry import ToolRegistry
 
 
@@ -148,7 +149,7 @@ def test_agent_uses_pre_tool_hook_to_deny_tool_execution(tmp_path: Path) -> None
     agent = Agent(
         llm=llm,
         tools=registry,
-        context_builder="system",
+        context_manager="system",
         hooks=manager,
         workdir=tmp_path,
     )
@@ -205,7 +206,7 @@ def test_agent_uses_post_tool_hook_to_replace_tool_result(tmp_path: Path) -> Non
     agent = Agent(
         llm=llm,
         tools=registry,
-        context_builder="system",
+        context_manager="system",
         hooks=manager,
         workdir=tmp_path,
     )
@@ -323,6 +324,32 @@ def test_default_hook_manager_builds_llm_intent_classifier(tmp_path: Path) -> No
     assert planning_hook.intent_classifier.llm is llm
 
 
+def test_task_planning_hook_reinjects_task_state_after_compaction(
+    tmp_path: Path,
+) -> None:
+    TaskManager.for_workdir(tmp_path).create_task("Preserve this task")
+    hook = TaskPlanningHook(
+        workdir=tmp_path,
+        remind_for_complex_tasks=False,
+    )
+    messages = [{"role": "user", "content": "Continue."}]
+
+    first = hook(HookContext(messages=messages, workdir=tmp_path))
+    repeated = hook(HookContext(messages=messages, workdir=tmp_path))
+    after_compact = hook(
+        HookContext(
+            messages=messages,
+            workdir=tmp_path,
+            metadata={"context_compacted": True},
+        )
+    )
+
+    assert first is not None
+    assert repeated is None
+    assert after_compact is not None
+    assert after_compact.data["messages"][0].startswith("<current_tasks>")
+
+
 def test_agent_injects_before_llm_hook_messages(tmp_path: Path) -> None:
     registry = ToolRegistry()
     manager = HookManager()
@@ -331,7 +358,7 @@ def test_agent_injects_before_llm_hook_messages(tmp_path: Path) -> None:
     agent = Agent(
         llm=llm,
         tools=registry,
-        context_builder="system",
+        context_manager="system",
         hooks=manager,
         workdir=tmp_path,
     )

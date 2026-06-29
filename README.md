@@ -11,6 +11,7 @@ Task System、同步 Subagent 和按需 Skill 加载的 Python Agent Harness。
 ANTHROPIC_API_KEY=...
 ANTHROPIC_MODEL=...
 # ANTHROPIC_BASE_URL=...
+LLM_CONTEXT_WINDOW=100000
 ```
 
 启动交互式 CLI：
@@ -45,7 +46,7 @@ Worker。Worker 使用全新的消息上下文，完成后只将结构化报告�
 from pathlib import Path
 
 from llm_agent.agent import Agent
-from llm_agent.context_builder import AgentContextBuilder, PromptSection
+from llm_agent.context_manager import ContextManager, PromptSection
 from llm_agent.hooks import build_default_hook_manager
 from llm_agent.hooks.permission_hooks import CliApprovalProvider
 from llm_agent.llm_client import LLMClient
@@ -81,7 +82,9 @@ agent = Agent(
         approval_provider=approval_provider,
         llm=llm,
     ),
-    context_builder=AgentContextBuilder(
+    context_manager=ContextManager(
+        llm=llm,
+        workdir=workdir,
         sections=[
             PromptSection("workspace", f"Working directory: {workdir}", 20),
             PromptSection("delegation", SUBAGENT_PARENT_INSTRUCTIONS, 30),
@@ -104,6 +107,47 @@ result = agent.run(messages)
 print(result.status)
 print(result.content)
 print(result.steps, result.tool_calls, result.usage)
+```
+
+## Context Management
+
+`ContextManager` 统一负责初始 system prompt 和运行时历史管理：
+
+- 使用 `PromptSection` 组装初始上下文
+- 兼容 OpenAI 与 Anthropic 的工具消息格式
+- 大工具结果落盘到 `.llm_agent/context/tool-results/`
+- 将较旧的工具结果替换为可重新执行的占位符
+- 超过上下文预算时调用 LLM 摘要旧历史
+- 保留 system prompt、摘要和最近消息组
+- 将压缩前历史保存到 `.llm_agent/transcripts/`
+- context-length 错误时执行一次应急压缩和重试
+
+默认使用保守的 UTF-8 字节估算，自动压缩阈值为配置窗口的 75%：
+
+```python
+context_manager = ContextManager(
+    llm=llm,
+    workdir=workdir,
+    max_context_tokens=100_000,
+    auto_compact_ratio=0.75,
+    keep_recent_groups=6,
+    keep_recent_tool_results=3,
+)
+```
+
+模型上下文窗口由调用方显式配置，不根据模型名称硬编码。压缩完成后，
+`TaskPlanningHook` 会重新注入持久化任务状态；Skill Catalog 位于保留的
+system prompt 中。
+
+也可以在 CLI 或应用边界手动调用：
+
+```python
+update = context_manager.compact(
+    messages,
+    run_id="manual-run",
+    reason="manual",
+)
+messages[:] = update.messages
 ```
 
 ## Task Intent Classification

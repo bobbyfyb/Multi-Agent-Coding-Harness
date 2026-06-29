@@ -11,7 +11,7 @@
 适合在简历中描述为：
 
 - 基于 Python 实现轻量级 LLM Agent runtime，支持 OpenAI / Anthropic 两类 SDK 的统一调用和 tool calling 输出适配。
-- 设计 ToolRegistry、HookManager、PermissionHook、ContextBuilder 等模块，解耦模型调用、工具执行、权限确认、上下文构建和日志展示。
+- 设计 ToolRegistry、HookManager、PermissionHook、ContextManager 等模块，解耦模型调用、工具执行、权限确认、上下文生命周期和日志展示。
 - 实现 bash、文件读写编辑、glob 搜索、Web search 等工具，并通过工作区路径校验、危险命令拦截、用户确认机制降低工具执行风险。
 
 ## 2. 当前已实现功能
@@ -157,23 +157,25 @@ replace  替换工具执行结果
 - 权限控制属于 agent 执行前后的扩展逻辑，不应该写死在 agent loop。
 - 未来可以继续接入审计日志、输出截断、敏感信息脱敏、上下文注入、记忆保存等能力。
 
-### 2.5 ContextBuilder 上下文组织
+### 2.5 ContextManager 上下文生命周期
 
 核心文件：
 
-- `src/llm_agent/context_builder.py`
+- `src/llm_agent/context_manager.py`
 
 当前实现：
 
-- `StaticContextBuilder`：用于简单固定 system prompt。
-- `AgentContextBuilder`：支持基础指令和多个上下文 section。
+- `ContextManager`：统一管理初始 system prompt 和运行时 messages。
 - `PromptSection` 支持 `name`、`content`、`priority`、`token_budget`。
+- 支持 OpenAI / Anthropic 工具消息原子分组，避免压缩拆散调用与结果。
+- 支持大工具结果落盘、旧工具结果占位、自动摘要和 reactive compact。
+- 压缩前历史保存为 JSONL Transcript。
 
 设计目的：
 
-- 为后续上下文工程和记忆机制预留入口。
 - system prompt 不直接散落在 agent loop 中。
-- 后续可以把 workspace 信息、长期记忆、检索结果、任务计划等都组织成 section。
+- 上下文构建、预算、压缩和恢复由同一组件管理。
+- 为后续长期记忆和更精确的 token estimator 预留入口。
 
 ### 2.6 事件输出系统
 
@@ -232,7 +234,7 @@ Agent
   |      +--> PermissionHook
   |      +--> future hooks
   |
-  +--> ContextBuilder
+  +--> ContextManager
   |
   +--> AgentEvent / print_agent_event
 ```
@@ -387,7 +389,7 @@ Event 负责展示状态
 可以在面试中重点强调：
 
 1. 不是简单调用 API，而是做了 provider-agnostic 的 tool calling 抽象。
-2. 不是把逻辑堆在一个 while loop 里，而是拆成 LLMClient、Agent、ToolRegistry、HookManager、ContextBuilder。
+2. 不是把逻辑堆在一个 while loop 里，而是拆成 LLMClient、Agent、ToolRegistry、HookManager、ContextManager。
 3. 支持 Anthropic 官方推荐的多工具结果批量回灌方式。
 4. 工具执行前有权限检查和用户确认。
 5. event 和 hook 分离，既能输出中间步骤，又能扩展 agent 行为。
@@ -402,7 +404,7 @@ Event 负责展示状态
 - 工具参数只用 JSON schema 描述，还没有用 Pydantic 做运行时强校验。
 - 权限规则目前是写在代码里的，后续可以配置化。
 - bash 工具仍然基于 `shell=True`，需要更严格的 sandbox 或命令白名单。
-- memory 机制尚未实现，只预留了 ContextBuilder 和 UserPromptSubmit hook。
+- 长期 memory 机制尚未实现，当前已具备 ContextManager 摘要和 UserPromptSubmit hook。
 - 还没有 trace 文件、审计日志、token 统计和成本统计。
 
 后续开发方向：
@@ -412,7 +414,7 @@ Event 负责展示状态
 - 引入 Pydantic Tool Schema：统一参数校验、默认值、文档生成。
 - 权限策略配置化：例如 `permissions.yaml`。
 - 引入短期/长期记忆：对话摘要、用户偏好、项目知识库。
-- 引入上下文压缩：历史消息过长时自动总结。
+- 继续优化上下文压缩：接入精确 tokenizer 和压缩质量评估。
 - 增加审计日志：记录每次工具调用、参数、结果、审批状态。
 - 增加 sandbox：进一步限制 bash 和文件写入能力。
 - 支持 MCP：把外部工具生态接进 ToolRegistry。
@@ -491,11 +493,11 @@ Event 负责展示状态
 
 > Agent 有 `max_steps` 参数。每完成一轮 LLM 调用和工具结果回灌，step 会递增。如果超过限制还没有 final answer，就抛出异常。CLI 中也可以显式设置 `max_steps=None` 允许无限循环，但默认设计应该保留上限。
 
-### Q13：为什么 ContextBuilder 要独立出来？
+### Q13：为什么使用统一 ContextManager？
 
 参考回答：
 
-> 因为 system prompt 后续会越来越复杂，不只是一个字符串。它可能包含身份指令、工具使用规则、workspace 信息、用户记忆、检索上下文、任务计划等。如果写死在 agent 里会很难维护。ContextBuilder 用 section 和 priority 组织上下文，为后续 memory 和 context engineering 做准备。
+> 因为上下文不只是初始 system prompt，还包含持续增长的对话、工具结果、任务状态和 Skill。ContextManager 用 section 组织初始 Prompt，并统一负责预算、工具结果落盘、历史摘要和超限恢复。这样 Agent Loop 只负责执行流程，Task 和 Skill 仍保留各自的领域职责。
 
 ### Q14：你觉得这个项目最难的点是什么？
 
@@ -507,7 +509,7 @@ Event 负责展示状态
 
 参考回答：
 
-> 我会优先做三件事。第一是 streaming，让最终回答和中间 reasoning 更实时。第二是 Pydantic 化工具参数，增强参数校验和自动生成 schema。第三是把权限规则配置化，并增加审计日志。之后再做 memory、上下文压缩和异步工具并发。
+> 我会优先做三件事。第一是 TraceRecorder，让上下文压缩和工具执行可以完整复盘。第二是 Pydantic 化工具参数，增强参数校验和自动生成 schema。第三是把权限规则配置化，并增加审计日志。之后再做长期 memory、精确 token 估算和异步工具并发。
 
 ### Q16：如何处理 prompt injection？
 
@@ -532,7 +534,7 @@ Event 负责展示状态
 建议 2 到 3 分钟版本：
 
 1. 先讲项目目标：做一个可扩展的 LLM coding agent runtime。
-2. 讲整体架构：LLMClient、Agent、ToolRegistry、HookManager、ContextBuilder。
+2. 讲整体架构：LLMClient、Agent、ToolRegistry、HookManager、ContextManager。
 3. 讲一个核心流程：模型返回 tool call，agent 执行工具，结果回灌，直到 final answer。
 4. 讲两个亮点：provider-agnostic tool calling；权限 hook 和 event 分离。
 5. 讲后续优化：streaming、Pydantic schema、memory、sandbox。
@@ -549,7 +551,7 @@ Event 负责展示状态
 
 项目描述：
 
-> 使用 Python 实现一个可扩展的 LLM Agent runtime，支持 OpenAI SDK 与 Anthropic SDK 的统一调用、原生 tool calling、多轮工具执行、权限确认、上下文构建和事件追踪。项目抽象了 LLMClient、ToolRegistry、HookManager、ContextBuilder 等模块，用于降低 provider 差异和 agent loop 复杂度。
+> 使用 Python 实现一个可扩展的 LLM Agent runtime，支持 OpenAI SDK 与 Anthropic SDK 的统一调用、原生 tool calling、多轮工具执行、权限确认、上下文压缩和事件追踪。项目抽象了 LLMClient、ToolRegistry、HookManager、ContextManager 等模块，用于降低 provider 差异和 agent loop 复杂度。
 
 简历 bullet：
 
@@ -574,7 +576,7 @@ Event 负责展示状态
 - 支持 async agent loop 和并发工具调用。
 - 使用 Pydantic 定义工具 schema。
 - 增加 tool call 审计日志。
-- 增加 conversation summary 和上下文压缩。
+- 为 ContextManager 接入精确 tokenizer 和压缩摘要质量评估。
 
 长期：
 

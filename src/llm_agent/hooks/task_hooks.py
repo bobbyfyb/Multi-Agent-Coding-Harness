@@ -12,6 +12,8 @@ from llm_agent.task_system import OPEN_TASK_STATUSES, TaskManager
 INTERNAL_USER_MESSAGE_PREFIXES = (
     "<current_tasks>",
     "<task_reminder>",
+    "<conversation_summary",
+    "<context_compacted",
 )
 
 
@@ -29,6 +31,10 @@ class TaskPlanningHook:
     )
 
     def __call__(self, context: HookContext) -> HookResult | None:
+        if context.metadata.get("context_compacted"):
+            self._last_task_summary = None
+            self._last_reminder_key = None
+
         manager = self._manager(context)
         messages: list[str] = []
 

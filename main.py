@@ -1,10 +1,11 @@
+import os
 from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from llm_agent.agent import Agent, print_agent_event
-from llm_agent.context_builder import AgentContextBuilder, PromptSection
+from llm_agent.context_manager import ContextManager, PromptSection
 from llm_agent.hooks import HookContext, build_default_hook_manager
 from llm_agent.hooks.permission_hooks import CliApprovalProvider
 from llm_agent.llm_client import LLMClient
@@ -40,7 +41,12 @@ def build_agent() -> Agent:
         workdir=workdir,
         max_steps=None,
         agent_id="main",
-        context_builder=AgentContextBuilder(
+        context_manager=ContextManager(
+            llm=llm,
+            workdir=workdir,
+            max_context_tokens=int(
+                os.getenv("LLM_CONTEXT_WINDOW", "100000")
+            ),
             sections=[
                 PromptSection(
                     name="workspace",

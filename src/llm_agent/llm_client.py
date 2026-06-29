@@ -26,6 +26,10 @@ class LLMClientError(RuntimeError):
     """Raised when a model SDK call cannot be made or parsed."""
 
 
+class LLMContextLengthError(LLMClientError):
+    """Raised when a provider rejects a request because its context is too long."""
+
+
 @dataclass(frozen=True)
 class LLMToolCall:
     id: str
@@ -207,6 +211,10 @@ class LLMClient:
         try:
             response = self._openai_client().chat.completions.create(**params)
         except Exception as exc:
+            if _is_context_length_error(exc):
+                raise LLMContextLengthError(
+                    f"OpenAI context length exceeded: {exc}"
+                ) from exc
             raise LLMClientError(f"OpenAI SDK request failed: {exc}") from exc
 
         return _parse_openai_response(_response_to_dict(response))
@@ -249,6 +257,10 @@ class LLMClient:
         try:
             response = self._anthropic_client().messages.create(**params)
         except Exception as exc:
+            if _is_context_length_error(exc):
+                raise LLMContextLengthError(
+                    f"Anthropic context length exceeded: {exc}"
+                ) from exc
             raise LLMClientError(f"Anthropic SDK request failed: {exc}") from exc
 
         return _parse_anthropic_response(_response_to_dict(response))
@@ -310,6 +322,35 @@ def _normalize_provider(provider: str) -> str:
     if normalized in {"anthropic", "anthropic-compatible", "claude"}:
         return "anthropic"
     raise ValueError(f"Unsupported LLM provider: {provider}")
+
+
+def _is_context_length_error(exc: Exception) -> bool:
+    markers = (
+        "context_length_exceeded",
+        "context length exceeded",
+        "maximum context length",
+        "prompt_too_long",
+        "prompt is too long",
+        "too many tokens",
+        "request too large",
+    )
+    current: BaseException | None = exc
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        text = str(current).lower()
+        if any(marker in text for marker in markers):
+            return True
+
+        status_code = getattr(current, "status_code", None)
+        code = getattr(current, "code", None)
+        if status_code == 413 or str(code).lower() in {
+            "context_length_exceeded",
+            "prompt_too_long",
+        }:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _openai_local_api_key(base_url: str | None) -> str | None:

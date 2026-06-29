@@ -95,7 +95,7 @@ def test_parent_agent_runs_synchronous_subagent_with_fresh_context(
     parent = Agent(
         llm=llm,
         tools=registry,
-        context_builder="parent system",
+        context_manager="parent system",
         workdir=tmp_path,
         agent_id="main",
     )
@@ -165,7 +165,7 @@ def test_subagent_general_mode_exposes_mutating_tools(tmp_path: Path) -> None:
             ]
         ),
         tools=registry,
-        context_builder="parent",
+        context_manager="parent",
         workdir=tmp_path,
     )
     messages = parent.new_messages()

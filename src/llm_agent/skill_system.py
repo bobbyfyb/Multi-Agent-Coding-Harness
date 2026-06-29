@@ -7,7 +7,7 @@ from typing import Any
 
 import yaml
 
-from llm_agent.context_builder import PromptSection
+from llm_agent.context_manager import PromptSection
 
 
 SKILL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")

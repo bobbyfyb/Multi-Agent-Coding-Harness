@@ -1,28 +1,40 @@
+from pathlib import Path
 from typing import Any
 
 from llm_agent.agent import Agent, AgentEvent, print_agent_event
-from llm_agent.llm_client import LLMResponse, LLMToolCall
+from llm_agent.context_manager import ContextManager
+from llm_agent.hooks import HookContext, HookManager
+from llm_agent.llm_client import (
+    LLMContextLengthError,
+    LLMResponse,
+    LLMToolCall,
+)
 from llm_agent.tool_registry import ToolRegistry
 
 
 class FakeLLM:
-    def __init__(self, outputs: list[LLMResponse]) -> None:
+    def __init__(self, outputs: list[LLMResponse | Exception]) -> None:
         self.outputs = outputs
         self.messages: list[list[dict[str, Any]]] = []
-        self.tools: list[list[dict[str, Any]]] = []
-        self.tool_choices: list[str] = []
+        self.tools: list[list[dict[str, Any]] | None] = []
+        self.tool_choices: list[str | None] = []
 
     def chat(
         self,
         messages: list[dict[str, Any]],
         *,
-        tools: list[dict[str, Any]],
-        tool_choice: str,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
     ) -> LLMResponse:
         self.messages.append([dict(message) for message in messages])
         self.tools.append(tools)
         self.tool_choices.append(tool_choice)
-        return self.outputs.pop(0)
+        output = self.outputs.pop(0)
+        if isinstance(output, Exception):
+            raise output
+        return output
 
     def assistant_message(self, response: LLMResponse) -> dict[str, Any]:
         return {
@@ -106,7 +118,7 @@ def test_agent_batches_native_tool_results_then_final_answer() -> None:
             ),
         ]
     )
-    agent = Agent(llm=llm, tools=registry, context_builder="system")
+    agent = Agent(llm=llm, tools=registry, context_manager="system")
     messages = agent.new_messages()
     messages.append({"role": "user", "content": "calculate"})
 
@@ -167,7 +179,7 @@ def test_agent_emits_key_step_events() -> None:
             LLMResponse(content="done", tool_calls=[], raw={}),
         ]
     )
-    agent = Agent(llm=llm, tools=registry, context_builder="system")
+    agent = Agent(llm=llm, tools=registry, context_manager="system")
     messages = agent.new_messages()
     messages.append({"role": "user", "content": "calculate"})
     events: list[AgentEvent] = []
@@ -232,7 +244,7 @@ def test_agent_returns_direct_final_answer_without_tools() -> None:
             )
         ]
     )
-    agent = Agent(llm=llm, tools=registry, context_builder="system")
+    agent = Agent(llm=llm, tools=registry, context_manager="system")
     messages = agent.new_messages()
     messages.append({"role": "user", "content": "answer directly"})
 
@@ -264,7 +276,7 @@ def test_agent_reuses_caller_managed_history() -> None:
             ),
         ]
     )
-    agent = Agent(llm=llm, tools=registry, context_builder="system")
+    agent = Agent(llm=llm, tools=registry, context_manager="system")
     messages = agent.new_messages()
 
     messages.append({"role": "user", "content": "我叫小明"})
@@ -298,7 +310,7 @@ def test_agent_returns_structured_result_when_max_steps_are_exhausted() -> None:
             LLMResponse(content="", tool_calls=[tool_call], raw={}),
         ]
     )
-    agent = Agent(llm=llm, tools=registry, context_builder="system", max_steps=2)
+    agent = Agent(llm=llm, tools=registry, context_manager="system", max_steps=2)
     messages = agent.new_messages()
     messages.append({"role": "user", "content": "loop forever"})
 
@@ -307,3 +319,51 @@ def test_agent_returns_structured_result_when_max_steps_are_exhausted() -> None:
     assert result.status == "max_steps"
     assert result.steps == 2
     assert result.tool_calls == 2
+
+
+def test_agent_reactively_compacts_and_retries_context_length_error(
+    tmp_path: Path,
+) -> None:
+    llm = FakeLLM(
+        [
+            LLMContextLengthError("prompt_too_long"),
+            LLMResponse(content="Preserved current goal.", tool_calls=[], raw={}),
+            LLMResponse(content="done after compact", tool_calls=[], raw={}),
+        ]
+    )
+    manager = ContextManager(
+        llm=llm,
+        workdir=tmp_path,
+        max_context_tokens=10_000,
+    )
+    hooks = HookManager()
+    compacted_flags: list[bool] = []
+
+    def record_context_state(context: HookContext) -> None:
+        compacted_flags.append(bool(context.metadata.get("context_compacted")))
+        return None
+
+    hooks.register_hook("BeforeLLM", record_context_state)
+    agent = Agent(
+        llm=llm,
+        tools=ToolRegistry(),
+        context_manager=manager,
+        hooks=hooks,
+        workdir=tmp_path,
+    )
+    messages = agent.new_messages()
+    messages.append({"role": "user", "content": "Continue the coding task."})
+    events: list[AgentEvent] = []
+
+    result = agent.run(messages, on_event=events.append, run_id="run-reactive")
+
+    assert result.status == "completed"
+    assert result.content == "done after compact"
+    assert any(event.type == "context_compacted" for event in events)
+    assert any(
+        message.get("role") == "user"
+        and str(message.get("content", "")).startswith("<conversation_summary")
+        for message in messages
+    )
+    assert len(llm.messages) == 3
+    assert compacted_flags == [False, True]

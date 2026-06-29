@@ -91,14 +91,21 @@
 - [x] 支持测试用 auto approval provider
 - [x] 区分 hook 控制逻辑和 event 展示逻辑
 
-### 2.5 Context Builder
+### 2.5 Context Manager
 
-- [x] 实现 `StaticContextBuilder`
-- [x] 实现 `AgentContextBuilder`
+- [x] 使用统一 `ContextManager` 管理初始 Prompt 与运行时消息历史
 - [x] 实现 `PromptSection`
 - [x] 支持 system prompt 分 section 组织
 - [x] 支持 section priority
-- [x] 为后续 memory/context engineering 预留入口
+- [x] 支持 Provider 兼容的 tool call/result 原子消息组
+- [x] 支持大工具结果落盘与预览
+- [x] 支持旧工具结果占位压缩
+- [x] 支持基于上下文预算的自动 LLM 摘要
+- [x] 保留 system prompt、conversation summary 和最近消息组
+- [x] 支持压缩前 JSONL Transcript
+- [x] 支持 `LLMContextLengthError` 与一次 reactive compact retry
+- [x] 压缩后重新注入持久化 Task 状态
+- [x] 支持主 Agent 与 Subagent 使用独立 ContextManager
 
 ### 2.6 统一 Task System
 
@@ -129,7 +136,7 @@
 - [x] 覆盖 BasicTools 测试
 - [x] 覆盖 Hook / PermissionHook 测试
 - [x] 覆盖 TaskSystem / task tools 测试
-- [x] 覆盖 ContextBuilder 测试
+- [x] 覆盖 ContextManager 构建、压缩和恢复测试
 - [x] 整理项目复盘与秋招面试准备文档
 
 ### 2.8 同步 Subagent MVP
@@ -249,22 +256,27 @@
 
 目标：解决多轮开发时上下文越来越长的问题。
 
-- [ ] 定义 `ConversationCompressor`
-- [ ] 统计 messages 长度
-- [ ] 超过阈值时压缩历史
-- [ ] 保留 system prompt
-- [ ] 保留最近 N 轮对话
-- [ ] 保留未完成任务状态
-- [ ] 保留重要 tool result 摘要
-- [ ] 生成 session summary
-- [ ] 将 summary 作为 context section 注入
+- [x] 将压缩能力统一到 `ContextManager`
+- [x] 估算 messages token 占用
+- [x] 超过阈值时压缩历史
+- [x] 保留 system prompt
+- [x] 按 Provider 安全消息组保留最近 N 轮
+- [x] 压缩后重新注入未完成任务状态
+- [x] 大工具结果落盘，旧工具结果保留占位和恢复路径
+- [x] 生成 conversation summary
+- [x] 将 summary 作为内部 user context 注入
+- [x] 保存完整 JSONL Transcript
+- [x] 支持 prompt-too-long reactive retry
 
-建议先做简单版本：
+当前流程：
 
 ```text
-messages 太长
-  -> 调用 LLM 总结旧历史
-  -> 替换为 summary section + 最近若干轮消息
+工具结果落盘
+  -> 旧结果占位
+  -> token 预算判断
+  -> LLM 总结旧历史
+  -> system + summary + 最近消息组
+  -> context-length 失败时应急恢复一次
 ```
 
 ### 3.4 Skill 系统
@@ -277,7 +289,7 @@ messages 太长
 - [x] 支持 Skill metadata
 - [x] 由模型根据精简 Catalog 进行语义选择
 - [x] 支持通过 `skill_load(name)` 手动指定 Skill
-- [x] 将 Skill Catalog 注入 `AgentContextBuilder`
+- [x] 将 Skill Catalog 注入 `ContextManager`
 - [x] 将完整 Skill 内容通过 tool result 按需注入 messages
 - [x] 提供 `code-review` 默认示例 Skill
 - [ ] 为 test/debug task 准备默认 skill
@@ -492,7 +504,7 @@ pytest / ruff / build / API test / UI test
 - [x] 单 Agent 可调用 LLM
 - [x] 单 Agent 可调用工具
 - [x] 权限 hook 已接入
-- [x] ContextBuilder 已接入
+- [x] ContextManager 与自动压缩已接入
 - [x] 统一 Task System MVP 已接入
 - [x] TaskPlanningHook 已接入 `BeforeLLM`
 - [x] 同步 Subagent MVP 已接入
@@ -525,8 +537,8 @@ pytest / ruff / build / API test / UI test
 
 ### Milestone 3：上下文与 Skill
 
-- [ ] Context compression
-- [ ] Session summary
+- [x] Context compression
+- [x] Conversation summary
 - [x] Skill loader
 - [x] Catalog 驱动的模型语义选择
 - [ ] 多来源 Skill loader
@@ -594,7 +606,7 @@ pytest / ruff / build / API test / UI test
 2. Permission：扩展当前 PermissionHook。
 3. Hooks：完善 HookManager 生命周期和 trace。
 4. Subagent：继续补充预算、取消和 trace，之后再考虑并行执行。
-5. Context：实现上下文压缩和 section 管理。
+5. Context：优化 token 估算、摘要质量和后压缩恢复。
 6. Memory：实现 session summary 和长期记忆。
 7. Skills：实现本地 skill 加载。
 8. MCP：将 MCP tools 接入 ToolRegistry。
@@ -632,7 +644,7 @@ pytest / ruff / build / API test / UI test
 - [ ] 有 artifact 样例
 - [ ] 有测试覆盖
 - [ ] 有权限与安全设计
-- [ ] 有上下文压缩或 memory 能力
+- [x] 有上下文压缩或 memory 能力
 - [ ] 有一个多 agent 闭环 demo
 - [ ] 能解释和 Codex / Claude Code 的差异
 

@@ -4,7 +4,7 @@ from typing import Any
 import pytest
 
 from llm_agent.agent import Agent
-from llm_agent.context_builder import AgentContextBuilder
+from llm_agent.context_manager import ContextManager
 from llm_agent.llm_client import LLMResponse, LLMToolCall
 from llm_agent.skill_system import (
     SkillNotFoundError,
@@ -232,7 +232,7 @@ Inspect every changed branch.
     agent = Agent(
         llm=llm,
         tools=tools,
-        context_builder=AgentContextBuilder(
+        context_manager=ContextManager(
             base_instructions="system",
             sections=[build_skill_catalog_section(registry)],
         ),

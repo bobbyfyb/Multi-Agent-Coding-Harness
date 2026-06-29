@@ -4,9 +4,9 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 from uuid import uuid4
 
-from llm_agent.context_builder import ContextBuilder, StaticContextBuilder
+from llm_agent.context_manager import ContextManager, ContextUpdate
 from llm_agent.hooks import HookContext, HookManager
-from llm_agent.llm_client import LLMClient
+from llm_agent.llm_client import LLMClient, LLMContextLengthError
 from llm_agent.tool_registry import ToolRegistry
 
 
@@ -23,6 +23,9 @@ AgentEventType = Literal[
     "subagent_started",
     "subagent_completed",
     "subagent_failed",
+    "context_compacted",
+    "context_compact_failed",
+    "tool_result_persisted",
 ]
 AgentRunStatus = Literal["completed", "max_steps"]
 
@@ -78,7 +81,7 @@ ANSI_MAGENTA = "\033[35m"
 class Agent:
     llm: LLMClient
     tools: ToolRegistry
-    context_builder: ContextBuilder | str
+    context_manager: ContextManager | str
     max_steps: int | None = 5
     hooks: HookManager = field(default_factory=HookManager)
     workdir: Path | str | None = None
@@ -87,15 +90,21 @@ class Agent:
     depth: int = 0
 
     def __post_init__(self) -> None:
-        if isinstance(self.context_builder, str):
-            self.context_builder = StaticContextBuilder(self.context_builder)
         if self.workdir is None:
             self.workdir = Path.cwd()
         else:
             self.workdir = Path(self.workdir).resolve()
+        if isinstance(self.context_manager, str):
+            self.context_manager = ContextManager(
+                base_instructions=self.context_manager,
+                llm=self.llm,
+                workdir=self.workdir,
+            )
+        else:
+            self.context_manager.bind(llm=self.llm, workdir=self.workdir)
 
     def new_messages(self) -> list[dict[str, Any]]:
-        return self.context_builder.new_messages()
+        return self.context_manager.new_messages()
 
     def run(
         self,
@@ -109,10 +118,30 @@ class Agent:
         tool_call_count = 0
         usage: dict[str, Any] = {}
         last_content = ""
+        reactive_retries = 0
+        pending_context_rebuilt = False
 
         step_index = 0
         while self.max_steps is None or step_index < self.max_steps:
             step = step_index + 1
+            context_rebuilt = pending_context_rebuilt
+            pending_context_rebuilt = False
+            context_update = self.context_manager.prepare(
+                messages,
+                run_id=resolved_run_id,
+            )
+            if context_update is not None:
+                messages[:] = context_update.messages
+                context_rebuilt = (
+                    context_rebuilt or context_update.context_rebuilt
+                )
+                self._emit_context_update(
+                    on_event,
+                    context_update,
+                    step=step,
+                    run_id=resolved_run_id,
+                )
+
             hook_context = HookContext(
                 messages=messages,
                 step=step,
@@ -122,6 +151,7 @@ class Agent:
                     "agent_id": self.agent_id,
                     "parent_run_id": self.parent_run_id,
                     "depth": self.depth,
+                    "context_compacted": context_rebuilt,
                 },
             )
             before_llm_result = self.hooks.trigger_hooks("BeforeLLM", hook_context)
@@ -154,9 +184,29 @@ class Agent:
                     tools=tool_specs,
                     tool_choice="auto",
                 )
+            except LLMContextLengthError as exc:
+                if reactive_retries >= self.context_manager.max_reactive_retries:
+                    raise RuntimeError(
+                        "LLM context remained too long after reactive compaction."
+                    ) from exc
+                context_update = self.context_manager.recover(
+                    messages,
+                    run_id=resolved_run_id,
+                )
+                messages[:] = context_update.messages
+                self._emit_context_update(
+                    on_event,
+                    context_update,
+                    step=step,
+                    run_id=resolved_run_id,
+                )
+                pending_context_rebuilt = context_update.context_rebuilt
+                reactive_retries += 1
+                continue
             except Exception as exc:
                 raise RuntimeError("LLM request failed.") from exc
 
+            reactive_retries = 0
             last_content = response.content
             _merge_usage(usage, response.usage)
             if not response.tool_calls:
@@ -317,6 +367,51 @@ class Agent:
             depth=self.depth,
         )
 
+    def _emit_context_update(
+        self,
+        on_event: AgentCallback | None,
+        update: ContextUpdate,
+        *,
+        step: int,
+        run_id: str,
+    ) -> None:
+        data = {
+            "reason": update.reason,
+            "before_tokens": update.before_tokens,
+            "after_tokens": update.after_tokens,
+            "transcript_path": (
+                str(update.transcript_path) if update.transcript_path else None
+            ),
+            "persisted_results": update.persisted_results,
+            "compacted_results": update.compacted_results,
+            "summary_created": update.summary_created,
+            "hard_trimmed": update.hard_trimmed,
+        }
+        if update.persisted_results:
+            self._emit(
+                on_event,
+                "tool_result_persisted",
+                step,
+                data,
+                run_id,
+            )
+        if update.summary_created or update.hard_trimmed or update.compacted_results:
+            self._emit(
+                on_event,
+                "context_compacted",
+                step,
+                data,
+                run_id,
+            )
+        if update.error:
+            self._emit(
+                on_event,
+                "context_compact_failed",
+                step,
+                {**data, "error": update.error},
+                run_id,
+            )
+
 
 def print_agent_event(event: AgentEvent) -> None:
     prefix = _event_prefix(event)
@@ -404,6 +499,28 @@ def print_agent_event(event: AgentEvent) -> None:
     if event.type == "subagent_failed":
         print(
             f"{prefix}{ANSI_RED}[subagent failed]{ANSI_RESET} "
+            f"{event.data['error']}"
+        )
+        return
+
+    if event.type == "tool_result_persisted":
+        print(
+            f"{prefix}{ANSI_DIM}[tool results persisted]{ANSI_RESET} "
+            f"{event.data['persisted_results']}"
+        )
+        return
+
+    if event.type == "context_compacted":
+        print(
+            f"{prefix}{ANSI_YELLOW}[context compacted]{ANSI_RESET} "
+            f"{event.data['reason']} "
+            f"{event.data['before_tokens']} -> {event.data['after_tokens']} tokens"
+        )
+        return
+
+    if event.type == "context_compact_failed":
+        print(
+            f"{prefix}{ANSI_RED}[context compact failed]{ANSI_RESET} "
             f"{event.data['error']}"
         )
 
