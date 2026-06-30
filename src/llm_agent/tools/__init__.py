@@ -11,6 +11,7 @@ from llm_agent.tools.skill_tools import register_tools as register_skill_tools
 from llm_agent.tools.task_tools import register_tools as register_task_tools
 
 if TYPE_CHECKING:
+    from llm_agent.background_jobs import BackgroundJobManager
     from llm_agent.memory_system import MemoryManager
     from llm_agent.skill_system import SkillRegistry
     from llm_agent.subagent import SubagentRunner
@@ -26,6 +27,16 @@ def register_subagent_tools(
     register_tools(registry, runner=runner)
 
 
+def register_background_tools(
+    registry: ToolRegistry,
+    *,
+    manager: "BackgroundJobManager",
+) -> None:
+    from llm_agent.tools.background_tools import register_tools
+
+    register_tools(registry, manager=manager)
+
+
 def register_default_tools(
     registry: ToolRegistry,
     *,
@@ -33,8 +44,15 @@ def register_default_tools(
     subagent_runner: "SubagentRunner | None" = None,
     skill_registry: "SkillRegistry | None" = None,
     memory_manager: "MemoryManager | None" = None,
+    background_manager: "BackgroundJobManager | None" = None,
 ) -> None:
-    register_basic_tools(registry, workdir=workdir)
+    register_basic_tools(
+        registry,
+        workdir=workdir,
+        background_manager=background_manager,
+    )
+    if background_manager is not None:
+        register_background_tools(registry, manager=background_manager)
     register_search_tools(registry, workdir=workdir)
     register_task_tools(registry, workdir=workdir)
     if skill_registry is not None:
@@ -54,6 +72,7 @@ def build_default_registry(
     subagent_runner: "SubagentRunner | None" = None,
     skill_registry: "SkillRegistry | None" = None,
     memory_manager: "MemoryManager | None" = None,
+    background_manager: "BackgroundJobManager | None" = None,
 ) -> ToolRegistry:
     registry = ToolRegistry()
     register_default_tools(
@@ -62,6 +81,7 @@ def build_default_registry(
         subagent_runner=subagent_runner,
         skill_registry=skill_registry,
         memory_manager=memory_manager,
+        background_manager=background_manager,
     )
     return registry
 
@@ -69,6 +89,7 @@ def build_default_registry(
 __all__ = [
     "build_default_registry",
     "register_basic_tools",
+    "register_background_tools",
     "register_memory_tools",
     "register_search_tools",
     "register_skill_tools",

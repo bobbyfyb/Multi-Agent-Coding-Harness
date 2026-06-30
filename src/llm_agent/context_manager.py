@@ -756,6 +756,7 @@ def _latest_external_user_index(messages: list[Message]) -> int | None:
         "<relevant_memories>",
         "<conversation_summary",
         "<context_compacted",
+        "<background_notifications>",
     )
     for index in range(len(messages) - 1, -1, -1):
         message = messages[index]

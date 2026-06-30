@@ -2,7 +2,7 @@
 
 一个支持 OpenAI / Anthropic 官方 SDK、tool calling、权限 Hook、持久化
 Task System、长期 Memory、同步 Subagent、按需 Skill 加载和结构化 Trace 的
-Python Agent Harness，并提供有界错误恢复。
+Python Agent Harness，并提供有界错误恢复和托管后台进程。
 
 ## 运行
 
@@ -47,6 +47,10 @@ Worker。Worker 使用全新的消息上下文，完成后只将结构化报告�
 from pathlib import Path
 
 from llm_agent.agent import Agent
+from llm_agent.background_jobs import (
+    BACKGROUND_JOB_INSTRUCTIONS,
+    BackgroundJobManager,
+)
 from llm_agent.context_manager import ContextManager, PromptSection
 from llm_agent.hooks import build_default_hook_manager
 from llm_agent.hooks.permission_hooks import CliApprovalProvider
@@ -67,6 +71,7 @@ llm = LLMClient(provider="anthropic")
 approval_provider = CliApprovalProvider()
 skill_registry = SkillRegistry.for_workdir(workdir)
 memory_manager = MemoryManager.for_workdir(workdir, llm=llm)
+background_jobs = BackgroundJobManager.for_workdir(workdir)
 runner = SubagentRunner(
     llm=llm,
     workdir=workdir,
@@ -80,6 +85,7 @@ registry = build_default_registry(
     subagent_runner=runner,
     skill_registry=skill_registry,
     memory_manager=memory_manager,
+    background_manager=background_jobs,
 )
 
 agent = Agent(
@@ -97,6 +103,7 @@ agent = Agent(
         sections=[
             PromptSection("workspace", f"Working directory: {workdir}", 20),
             PromptSection("delegation", SUBAGENT_PARENT_INSTRUCTIONS, 30),
+            PromptSection("background_jobs", BACKGROUND_JOB_INSTRUCTIONS, 35),
             build_memory_policy_section(),
             build_skill_catalog_section(skill_registry),
         ]
@@ -104,6 +111,7 @@ agent = Agent(
     workdir=workdir,
     agent_id="main",
     max_steps=None,
+    background_jobs=background_jobs,
 )
 ```
 
@@ -118,6 +126,55 @@ print(result.status)
 print(result.content)
 print(result.steps, result.tool_calls, result.usage)
 ```
+
+## Background Jobs
+
+主 Agent 的 `bash` 默认同步执行。模型只有显式传入
+`run_in_background=true` 时才会启动托管后台进程：
+
+```json
+{
+  "command": "uv run pytest",
+  "run_in_background": true,
+  "task_id": "task_0001"
+}
+```
+
+调用会立即返回 `job_id`，原始 Tool Call 在此结束。进程退出后，系统会在
+Agent 的下一次安全步骤中加入独立的 `<background_notifications>` 消息，不会
+再次复用原始 `tool_call_id`。
+
+后台管理工具：
+
+```text
+background_list
+background_get
+background_output
+background_wait
+background_cancel
+```
+
+Job 元数据和日志存储在：
+
+```text
+.llm_agent/background/bg_<id>/
+├── job.json
+├── stdout.log
+└── stderr.log
+```
+
+后台进程使用独立进程组，支持超时、`SIGTERM`/`SIGKILL` 取消、并发上限和
+Trace 关联。CLI 默认最多并发 4 个 Job、单个 Job 最长运行 1800 秒：
+
+```dotenv
+BACKGROUND_MAX_CONCURRENT=4
+BACKGROUND_MAX_RUNTIME_SECONDS=1800
+```
+
+程序正常退出时会终止仍在运行的 Job；重启后残留的 `running` 元数据会被标记
+为 `interrupted`。程序化使用时，应用退出前应调用
+`background_jobs.shutdown()`。Subagent 当前仍使用同步 Bash，不会创建后台
+Job。
 
 ## Trace / Observability
 

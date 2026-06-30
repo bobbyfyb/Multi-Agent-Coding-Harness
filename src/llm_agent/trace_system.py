@@ -208,20 +208,21 @@ class TraceRecorder:
             return record
 
     def render_markdown(self) -> Path | None:
-        if not self.config.write_markdown or not self.jsonl_path.exists():
-            return None
-        try:
-            from llm_agent.trace_render import render_trace_markdown
+        with self._lock:
+            if not self.config.write_markdown or not self.jsonl_path.exists():
+                return None
+            try:
+                from llm_agent.trace_render import render_trace_markdown
 
-            return render_trace_markdown(
-                self.jsonl_path,
-                self.markdown_path,
-            )
-        except Exception as exc:
-            self.last_error = str(exc)
-            if self.config.strict:
-                raise
-            return None
+                return render_trace_markdown(
+                    self.jsonl_path,
+                    self.markdown_path,
+                )
+            except Exception as exc:
+                self.last_error = str(exc)
+                if self.config.strict:
+                    raise
+                return None
 
     def _sanitize_data(
         self,
@@ -364,7 +365,7 @@ def record_agent_event(event: Any) -> TraceRecord | None:
         status = "error"
     elif event_type == "permission_denied":
         status = "denied"
-    elif event_type == "max_steps":
+    elif event_type in {"max_steps", "background_cancelled"}:
         status = "warning"
     event_data = dict(getattr(event, "data", {}) or {})
     if event_type == "final" and event_data.get("status") == "incomplete":
@@ -450,6 +451,8 @@ def _agent_event_category(event_type: str) -> str:
         return "task"
     if event_type.startswith("subagent_"):
         return "subagent"
+    if event_type.startswith("background_"):
+        return "background"
     if event_type == "recovery":
         return "recovery"
     return "agent"

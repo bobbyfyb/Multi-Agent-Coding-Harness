@@ -5,6 +5,10 @@ from time import perf_counter
 from typing import Any, Callable, Literal
 from uuid import uuid4
 
+from llm_agent.background_jobs import (
+    BackgroundJobManager,
+    format_background_notifications,
+)
 from llm_agent.context_manager import ContextManager, ContextUpdate
 from llm_agent.hooks import HookContext, HookManager
 from llm_agent.llm_client import (
@@ -56,6 +60,9 @@ AgentEventType = Literal[
     "context_compact_failed",
     "tool_result_persisted",
     "recovery",
+    "background_completed",
+    "background_failed",
+    "background_cancelled",
 ]
 AgentRunStatus = Literal["completed", "incomplete", "max_steps"]
 
@@ -120,6 +127,7 @@ class Agent:
     parent_run_id: str | None = None
     depth: int = 0
     recovery_policy: RecoveryPolicy | None = None
+    background_jobs: BackgroundJobManager | None = None
 
     def __post_init__(self) -> None:
         if self.workdir is None:
@@ -247,6 +255,12 @@ class Agent:
         while self.max_steps is None or step_index < self.max_steps:
             step = step_index + 1
             update_trace_context(step=step)
+            self._collect_background_notifications(
+                messages,
+                on_event=on_event,
+                step=step,
+                run_id=resolved_run_id,
+            )
             context_rebuilt = pending_context_rebuilt
             pending_context_rebuilt = False
             context_update = self.context_manager.prepare(
@@ -784,6 +798,47 @@ class Agent:
                 run_id,
             )
 
+    def _collect_background_notifications(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        on_event: AgentCallback | None,
+        step: int,
+        run_id: str,
+    ) -> None:
+        if self.background_jobs is None:
+            return
+        notifications = self.background_jobs.drain_notifications(
+            owner_agent_id=self.agent_id,
+        )
+        if not notifications:
+            return
+
+        messages.append(
+            {
+                "role": "user",
+                "content": format_background_notifications(notifications),
+            }
+        )
+        self.background_jobs.acknowledge_notifications(
+            [notification.job_id for notification in notifications]
+        )
+        for notification in notifications:
+            event_type: AgentEventType
+            if notification.status == "completed":
+                event_type = "background_completed"
+            elif notification.status in {"cancelled", "interrupted"}:
+                event_type = "background_cancelled"
+            else:
+                event_type = "background_failed"
+            self._emit(
+                on_event,
+                event_type,
+                step,
+                notification.to_dict(),
+                run_id,
+            )
+
 
 def print_agent_event(event: AgentEvent) -> None:
     prefix = _event_prefix(event)
@@ -926,6 +981,28 @@ def print_agent_event(event: AgentEvent) -> None:
             f"{prefix}{ANSI_RED}[context compact failed]{ANSI_RESET} "
             f"{event.data['error']}"
         )
+        return
+
+    if event.type == "background_completed":
+        print(
+            f"{prefix}{ANSI_GREEN}[background completed]{ANSI_RESET} "
+            f"{event.data['job_id']} exit={event.data['return_code']}"
+        )
+        return
+
+    if event.type == "background_failed":
+        print(
+            f"{prefix}{ANSI_RED}[background failed]{ANSI_RESET} "
+            f"{event.data['job_id']} status={event.data['status']} "
+            f"{event.data.get('error') or ''}".rstrip()
+        )
+        return
+
+    if event.type == "background_cancelled":
+        print(
+            f"{prefix}{ANSI_YELLOW}[background stopped]{ANSI_RESET} "
+            f"{event.data['job_id']} status={event.data['status']}"
+        )
 
 
 def _print_recovery_event(prefix: str, data: dict[str, Any]) -> None:
@@ -1030,6 +1107,7 @@ def _latest_external_user_message(
         "<conversation_summary",
         "<context_compacted",
         "<recovery_continuation>",
+        "<background_notifications>",
     )
     for message in reversed(messages):
         if message.get("role") != "user":

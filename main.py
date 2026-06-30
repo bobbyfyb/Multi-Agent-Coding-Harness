@@ -6,6 +6,10 @@ from uuid import uuid4
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from llm_agent.agent import Agent, print_agent_event
+from llm_agent.background_jobs import (
+    BACKGROUND_JOB_INSTRUCTIONS,
+    BackgroundJobManager,
+)
 from llm_agent.context_manager import ContextManager, PromptSection
 from llm_agent.hooks import HookContext, build_default_hook_manager
 from llm_agent.hooks.permission_hooks import CliApprovalProvider
@@ -46,6 +50,13 @@ def build_agent() -> Agent:
     approval_provider = CliApprovalProvider()
     skill_registry = SkillRegistry.for_workdir(workdir)
     memory_manager = MemoryManager.for_workdir(workdir, llm=llm)
+    background_jobs = BackgroundJobManager.for_workdir(
+        workdir,
+        max_concurrent=int(os.getenv("BACKGROUND_MAX_CONCURRENT", "4")),
+        max_runtime_seconds=float(
+            os.getenv("BACKGROUND_MAX_RUNTIME_SECONDS", "1800")
+        ),
+    )
     subagent_runner = SubagentRunner(
         llm=llm,
         workdir=workdir,
@@ -58,6 +69,7 @@ def build_agent() -> Agent:
         subagent_runner=subagent_runner,
         skill_registry=skill_registry,
         memory_manager=memory_manager,
+        background_manager=background_jobs,
     )
     return Agent(
         llm=llm,
@@ -71,6 +83,7 @@ def build_agent() -> Agent:
         workdir=workdir,
         max_steps=None,
         agent_id="main",
+        background_jobs=background_jobs,
         context_manager=ContextManager(
             llm=llm,
             workdir=workdir,
@@ -88,6 +101,11 @@ def build_agent() -> Agent:
                     content=SUBAGENT_PARENT_INSTRUCTIONS,
                     priority=30,
                 ),
+                PromptSection(
+                    name="background_jobs",
+                    content=BACKGROUND_JOB_INSTRUCTIONS,
+                    priority=35,
+                ),
                 build_memory_policy_section(),
                 build_skill_catalog_section(skill_registry),
             ]
@@ -99,50 +117,54 @@ def main() -> None:
     agent = build_agent()
     messages = agent.new_messages()
 
-    while True:
-        try:
-            query = input("\033[36mInput your question >> \033[0m")
-        except (EOFError, KeyboardInterrupt):
-            break
-        if query.strip().lower() in ("q", "exit", ""):
-            break
-        run_id = f"run-{uuid4().hex[:12]}"
-        trace = TraceRecorder.for_run(Path.cwd(), run_id=run_id)
-        try:
-            with trace_scope(
-                trace,
-                run_id=run_id,
-                agent_id=agent.agent_id,
-                parent_run_id=agent.parent_run_id,
-                depth=agent.depth,
-            ):
-                record_trace(
-                    category="run",
-                    name="run.input",
-                    phase="received",
-                    data={"content": summarize_text(query)},
-                )
-                agent.hooks.trigger_hooks(
-                    "UserPromptSubmit",
-                    query,
-                    HookContext(
-                        messages=messages,
-                        workdir=Path.cwd(),
-                        metadata={"run_id": run_id},
-                    ),
-                )
-                messages.append({"role": "user", "content": query})
-                agent.run(
-                    messages,
-                    on_event=print_agent_event,
+    try:
+        while True:
+            try:
+                query = input("\033[36mInput your question >> \033[0m")
+            except (EOFError, KeyboardInterrupt):
+                break
+            if query.strip().lower() in ("q", "exit", ""):
+                break
+            run_id = f"run-{uuid4().hex[:12]}"
+            trace = TraceRecorder.for_run(Path.cwd(), run_id=run_id)
+            try:
+                with trace_scope(
+                    trace,
                     run_id=run_id,
-                    trace=trace,
-                )
-        except Exception as exc:
-            print(f"\033[31m[run failed]\033[0m {exc}")
-        finally:
-            trace.render_markdown()
-            print(f"\033[2m[trace] {trace.jsonl_path}\033[0m")
+                    agent_id=agent.agent_id,
+                    parent_run_id=agent.parent_run_id,
+                    depth=agent.depth,
+                ):
+                    record_trace(
+                        category="run",
+                        name="run.input",
+                        phase="received",
+                        data={"content": summarize_text(query)},
+                    )
+                    agent.hooks.trigger_hooks(
+                        "UserPromptSubmit",
+                        query,
+                        HookContext(
+                            messages=messages,
+                            workdir=Path.cwd(),
+                            metadata={"run_id": run_id},
+                        ),
+                    )
+                    messages.append({"role": "user", "content": query})
+                    agent.run(
+                        messages,
+                        on_event=print_agent_event,
+                        run_id=run_id,
+                        trace=trace,
+                    )
+            except Exception as exc:
+                print(f"\033[31m[run failed]\033[0m {exc}")
+            finally:
+                trace.render_markdown()
+                print(f"\033[2m[trace] {trace.jsonl_path}\033[0m")
+    finally:
+        if agent.background_jobs is not None:
+            agent.background_jobs.shutdown()
 
 
 if __name__ == "__main__":

@@ -2,8 +2,12 @@ import glob as glob_lib
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, TYPE_CHECKING
 
 from llm_agent.tool_registry import ToolDefinition, ToolRegistry
+
+if TYPE_CHECKING:
+    from llm_agent.background_jobs import BackgroundJobManager
 
 
 @dataclass(frozen=True)
@@ -11,6 +15,7 @@ class BasicTools:
     workdir: Path
     bash_timeout: float = 120.0
     output_limit: int = 50_000
+    background_manager: "BackgroundJobManager | None" = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "workdir", self.workdir.resolve())
@@ -21,7 +26,14 @@ class BasicTools:
             raise ValueError(f"Path escapes workspace: {path}")
         return candidate
 
-    def bash(self, command: str) -> str:
+    def bash(
+        self,
+        command: str,
+        run_in_background: bool = False,
+        task_id: str | None = None,
+        *,
+        context: Any = None,
+    ) -> str | dict[str, Any]:
         dangerous_fragments = [
             "rm -rf /",
             "sudo",
@@ -32,6 +44,26 @@ class BasicTools:
         ]
         if any(fragment in command for fragment in dangerous_fragments):
             raise ValueError("Dangerous command blocked")
+
+        if run_in_background:
+            if self.background_manager is None:
+                raise RuntimeError(
+                    "Background execution is not available for this agent."
+                )
+            job = self.background_manager.start_shell(
+                command,
+                owner_run_id=getattr(context, "run_id", None),
+                owner_agent_id=getattr(context, "agent_id", None),
+                task_id=task_id,
+            )
+            return {
+                "job_id": job.id,
+                "status": job.status,
+                "pid": job.pid,
+                "task_id": job.task_id,
+                "stdout_path": job.stdout_path,
+                "stderr_path": job.stderr_path,
+            }
 
         try:
             result = subprocess.run(
@@ -91,8 +123,40 @@ class BasicTools:
         return "\n".join(sorted(matches)) if matches else "(no matches)"
 
 
-def basic_tool_definitions(workdir: Path | str | None = None) -> list[ToolDefinition]:
-    tools = BasicTools(workdir=Path.cwd() if workdir is None else Path(workdir))
+def basic_tool_definitions(
+    workdir: Path | str | None = None,
+    *,
+    background_manager: "BackgroundJobManager | None" = None,
+) -> list[ToolDefinition]:
+    tools = BasicTools(
+        workdir=Path.cwd() if workdir is None else Path(workdir),
+        background_manager=background_manager,
+    )
+    bash_properties: dict[str, Any] = {
+        "command": {
+            "type": "string",
+            "description": "The shell command to run.",
+        }
+    }
+    if background_manager is not None:
+        bash_properties.update(
+            {
+                "run_in_background": {
+                    "type": "boolean",
+                    "description": (
+                        "Run as a managed background job and return a job id "
+                        "immediately. Defaults to false."
+                    ),
+                },
+                "task_id": {
+                    "type": "string",
+                    "description": (
+                        "Optional planning task id to associate with a "
+                        "background job."
+                    ),
+                },
+            }
+        )
 
     return [
         ToolDefinition(
@@ -100,15 +164,11 @@ def basic_tool_definitions(workdir: Path | str | None = None) -> list[ToolDefini
             description="Run a shell command in the workspace.",
             parameters={
                 "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "The shell command to run.",
-                    }
-                },
+                "properties": bash_properties,
                 "required": ["command"],
             },
             func=tools.bash,
+            requires_context=background_manager is not None,
         ),
         ToolDefinition(
             name="read_file",
@@ -193,5 +253,11 @@ def register_tools(
     registry: ToolRegistry,
     *,
     workdir: Path | str | None = None,
+    background_manager: "BackgroundJobManager | None" = None,
 ) -> None:
-    registry.register_many(basic_tool_definitions(workdir=workdir))
+    registry.register_many(
+        basic_tool_definitions(
+            workdir=workdir,
+            background_manager=background_manager,
+        )
+    )

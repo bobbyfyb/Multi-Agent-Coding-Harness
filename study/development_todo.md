@@ -265,6 +265,38 @@
 - Error Recovery 只负责当前进程内执行，不等同于跨会话 Session 恢复。
 - 工具需要先引入 idempotent 元数据，才会考虑只读工具自动重试。
 
+### 2.13 Managed Background Jobs
+
+- [x] 实现 `BackgroundJob / BackgroundJobStore / BackgroundJobManager`
+- [x] 使用 `subprocess.Popen` 启动独立进程，不阻塞当前 Agent Loop
+- [x] `bash` 支持显式 `run_in_background=true`
+- [x] 默认保持同步执行，不使用关键词启发式自动切换
+- [x] 立即返回稳定 `job_id`，保证原 Tool Call 只回灌一次结果
+- [x] 实现 `background_list / background_get / background_output`
+- [x] 实现有界 `background_wait`
+- [x] 实现 `background_cancel` 和进程组 `SIGTERM / SIGKILL`
+- [x] 支持最大并发数和单 Job 运行超时
+- [x] stdout/stderr 直接写入文件，避免 Pipe 堵塞和上下文膨胀
+- [x] Job 元数据和日志持久化到 `.llm_agent/background/`
+- [x] 重启时将未完成 Job 标记为 `interrupted`
+- [x] 完成通知在 Agent 安全边界作为独立内部消息回灌
+- [x] 通知不复用原始 `tool_call_id`，并持久化确认状态
+- [x] 支持可选 `task_id` 关联，但不自动完成 Task
+- [x] 后台生命周期接入 `AgentEvent`、彩色终端输出和 Trace
+- [x] 显式捕获 `TraceRecorder / TraceContext`，避免依赖线程间
+  `ContextVar` 传播
+- [x] CLI 退出时终止仍由当前进程管理的后台 Job
+- [x] 覆盖完成、失败、超时、取消、并发限制、恢复和通知测试
+
+当前边界：
+
+- 只有主 Agent 的 Bash 可以后台执行，文件工具和 Subagent 仍保持同步。
+- Job 是运行时执行句柄，Task 是持久化工作计划，两者不会自动合并状态。
+- 后台进程失败不会进入 LLM Error Recovery 自动重试，避免重复副作用。
+- CLI 空闲等待输入时不异步刷新终端；通知在下一次 Agent run 或管理工具调用时
+  展示。
+- 崩溃后保留日志和元数据，但 MVP 不尝试重新连接旧 PID。
+
 ## 3. 接下来优先补全的单 Agent Harness 能力
 
 ### 3.1 Trace / Observability
@@ -566,6 +598,7 @@ pytest / ruff / build / API test / UI test
 - [x] TaskPlanningHook 已接入 `BeforeLLM`
 - [x] 同步 Subagent MVP 已接入
 - [x] Error Recovery 已接入
+- [x] Managed Background Jobs 已接入
 - [x] 基础测试已覆盖
 
 ### Milestone 1：可观测单 Agent Harness
@@ -665,11 +698,12 @@ pytest / ruff / build / API test / UI test
 3. Hooks：继续扩展生命周期；Hook trace 已接入。
 4. Subagent：继续补充预算和取消；父子 trace 已接入，之后再考虑并行执行。
 5. Error Recovery：继续补充流式中断和可取消 backoff。
-6. Context：优化 token 估算、摘要质量和后压缩恢复。
-7. Memory：实现 session summary 和长期记忆。
-8. Skills：实现本地 skill 加载。
-9. MCP：将 MCP tools 接入 ToolRegistry。
-10. Multi-agent：最后再做 PM/Engineer/QA 编排。
+6. Background Tasks：已实现托管后台 Bash，后续再考虑只读后台 Subagent。
+7. Context：优化 token 估算、摘要质量和后压缩恢复。
+8. Memory：实现 session summary 和长期记忆。
+9. Skills：实现本地 skill 加载。
+10. MCP：将 MCP tools 接入 ToolRegistry。
+11. Multi-agent：最后再做 PM/Engineer/QA 编排。
 
 原则：
 
