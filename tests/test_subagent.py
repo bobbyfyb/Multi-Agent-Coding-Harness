@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +10,7 @@ from llm_agent.skill_system import SkillRegistry
 from llm_agent.subagent import SubagentRequest, SubagentRunner
 from llm_agent.tool_registry import ToolRegistry
 from llm_agent.tools.subagent_tools import register_tools as register_subagent_tools
+from llm_agent.trace_system import TraceRecorder
 
 
 class FakeLLM:
@@ -103,8 +105,14 @@ def test_parent_agent_runs_synchronous_subagent_with_fresh_context(
     messages = parent.new_messages()
     messages.append({"role": "user", "content": "Delegate reading notes.txt."})
     events: list[AgentEvent] = []
+    trace = TraceRecorder.for_run(tmp_path, run_id="parent-run")
 
-    result = parent.run(messages, on_event=events.append, run_id="parent-run")
+    result = parent.run(
+        messages,
+        on_event=events.append,
+        run_id="parent-run",
+        trace=trace,
+    )
 
     assert result.status == "completed"
     assert result.content == "The worker confirmed the detail."
@@ -136,6 +144,17 @@ def test_parent_agent_runs_synchronous_subagent_with_fresh_context(
         parent_tool_result["result"]["summary"]
         == "notes.txt contains: important detail"
     )
+
+    trace_records = [
+        json.loads(line)
+        for line in trace.jsonl_path.read_text(encoding="utf-8").splitlines()
+    ]
+    child_records = [
+        record for record in trace_records if record["depth"] == 1
+    ]
+    assert child_records
+    assert all(record["root_run_id"] == "parent-run" for record in child_records)
+    assert all(record["parent_run_id"] == "parent-run" for record in child_records)
 
 
 def test_subagent_general_mode_exposes_mutating_tools(tmp_path: Path) -> None:

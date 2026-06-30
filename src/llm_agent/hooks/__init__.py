@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from time import perf_counter
 from typing import TYPE_CHECKING, Any, Callable, Literal
+from uuid import uuid4
+
+from llm_agent.trace_system import elapsed_ms, record_trace
 
 
 if TYPE_CHECKING:
@@ -93,14 +97,60 @@ class HookManager:
     def trigger_hooks(self, event: str, *args: Any) -> HookResult | None:
         effective_result: HookResult | None = None
         for callback in self.hooks.get(event, []):
-            result = callback(*args)
+            callback_name = getattr(
+                callback,
+                "__qualname__",
+                type(callback).__qualname__,
+            )
+            hook_call_id = f"hook-{uuid4().hex[:16]}"
+            started_at = perf_counter()
+            record_trace(
+                category="hook",
+                name=f"hook.{event}",
+                phase="started",
+                correlation_id=hook_call_id,
+                data={"callback": callback_name},
+            )
+            try:
+                result = callback(*args)
+                if result is not None and not isinstance(result, HookResult):
+                    raise TypeError(
+                        f"Hook {callback!r} returned {type(result).__name__}; "
+                        "expected HookResult or None."
+                    )
+            except Exception as exc:
+                record_trace(
+                    category="hook",
+                    name=f"hook.{event}",
+                    phase="failed",
+                    status="error",
+                    correlation_id=hook_call_id,
+                    duration_ms=elapsed_ms(started_at),
+                    data={"callback": callback_name, "error": exc},
+                )
+                raise
+
+            record_trace(
+                category="hook",
+                name=f"hook.{event}",
+                phase="completed",
+                status=(
+                    "denied"
+                    if result is not None and result.denied
+                    else "ok"
+                ),
+                correlation_id=hook_call_id,
+                duration_ms=elapsed_ms(started_at),
+                data={
+                    "callback": callback_name,
+                    "action": result.action if result is not None else None,
+                    "reason": result.reason if result is not None else None,
+                    "value": result.value if result is not None else None,
+                    "result_data": result.data if result is not None else {},
+                },
+            )
             if result is None:
                 continue
-            if not isinstance(result, HookResult):
-                raise TypeError(
-                    f"Hook {callback!r} returned {type(result).__name__}; "
-                    "expected HookResult or None."
-                )
             if result.denied:
                 return result
             if effective_result is None or result.replaces_result:

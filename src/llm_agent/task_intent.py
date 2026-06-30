@@ -5,6 +5,7 @@ import re
 from typing import Any
 
 from llm_agent.llm_client import LLMClient
+from llm_agent.trace_system import trace_operation
 
 
 TASK_INTENT_SYSTEM_PROMPT = """
@@ -57,15 +58,16 @@ class TaskIntentClassifier:
             return self._cache[normalized]
 
         try:
-            response = self.llm.chat(
-                [
-                    {"role": "system", "content": TASK_INTENT_SYSTEM_PROMPT},
-                    {"role": "user", "content": normalized},
-                ],
-                tools=None,
-                max_tokens=8,
-                temperature=0,
-            )
+            with trace_operation("task_intent"):
+                response = self.llm.chat(
+                    [
+                        {"role": "system", "content": TASK_INTENT_SYSTEM_PROMPT},
+                        {"role": "user", "content": normalized},
+                    ],
+                    tools=None,
+                    max_tokens=8,
+                    temperature=0,
+                )
             decision = _parse_decision(response.content)
         except Exception:
             decision = None

@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 import sys
+from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
@@ -16,6 +17,12 @@ from llm_agent.memory_system import (
 from llm_agent.skill_system import SkillRegistry, build_skill_catalog_section
 from llm_agent.subagent import SUBAGENT_PARENT_INSTRUCTIONS, SubagentRunner
 from llm_agent.tools import build_default_registry
+from llm_agent.trace_system import (
+    TraceRecorder,
+    record_trace,
+    summarize_text,
+    trace_scope,
+)
 
 
 def build_agent() -> Agent:
@@ -84,13 +91,41 @@ def main() -> None:
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
-        agent.hooks.trigger_hooks(
-            "UserPromptSubmit",
-            query,
-            HookContext(messages=messages, workdir=Path.cwd()),
-        )
-        messages.append({"role": "user", "content": query})
-        agent.run(messages, on_event=print_agent_event)
+        run_id = f"run-{uuid4().hex[:12]}"
+        trace = TraceRecorder.for_run(Path.cwd(), run_id=run_id)
+        try:
+            with trace_scope(
+                trace,
+                run_id=run_id,
+                agent_id=agent.agent_id,
+                parent_run_id=agent.parent_run_id,
+                depth=agent.depth,
+            ):
+                record_trace(
+                    category="run",
+                    name="run.input",
+                    phase="received",
+                    data={"content": summarize_text(query)},
+                )
+                agent.hooks.trigger_hooks(
+                    "UserPromptSubmit",
+                    query,
+                    HookContext(
+                        messages=messages,
+                        workdir=Path.cwd(),
+                        metadata={"run_id": run_id},
+                    ),
+                )
+                messages.append({"role": "user", "content": query})
+                agent.run(
+                    messages,
+                    on_event=print_agent_event,
+                    run_id=run_id,
+                    trace=trace,
+                )
+        finally:
+            trace.render_markdown()
+            print(f"\033[2m[trace] {trace.jsonl_path}\033[0m")
 
 
 if __name__ == "__main__":

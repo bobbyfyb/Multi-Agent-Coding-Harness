@@ -25,6 +25,7 @@ from llm_agent.tool_registry import ToolRegistry
 from llm_agent.tools.basic_tools import register_tools as register_basic_tools
 from llm_agent.tools.search_tools import register_tools as register_search_tools
 from llm_agent.tools.skill_tools import register_tools as register_skill_tools
+from llm_agent.trace_system import record_agent_event
 
 
 SubagentMode = Literal["explore", "general"]
@@ -300,19 +301,18 @@ class SubagentRunner:
         depth: int,
         request: SubagentRequest,
     ) -> None:
-        if parent_context.on_event is None:
-            return
-        parent_context.on_event(
-            AgentEvent(
-                type="subagent_started",
-                step=parent_context.step,
-                data={"task": request.task, "mode": request.mode},
-                agent_id=agent_id,
-                run_id=run_id,
-                parent_run_id=parent_context.run_id,
-                depth=depth,
-            )
+        event = AgentEvent(
+            type="subagent_started",
+            step=parent_context.step,
+            data={"task": request.task, "mode": request.mode},
+            agent_id=agent_id,
+            run_id=run_id,
+            parent_run_id=parent_context.run_id,
+            depth=depth,
         )
+        record_agent_event(event)
+        if parent_context.on_event is not None:
+            parent_context.on_event(event)
 
     @staticmethod
     def _emit(
@@ -321,8 +321,6 @@ class SubagentRunner:
         result: SubagentResult,
         request: SubagentRequest,
     ) -> None:
-        if parent_context.on_event is None:
-            return
         data: dict[str, Any] = {
             "task": request.task,
             "mode": request.mode,
@@ -332,17 +330,18 @@ class SubagentRunner:
         }
         if result.error:
             data["error"] = result.error
-        parent_context.on_event(
-            AgentEvent(
-                type=event_type,
-                step=result.steps,
-                data=data,
-                agent_id=result.agent_id,
-                run_id=result.run_id,
-                parent_run_id=parent_context.run_id,
-                depth=parent_context.depth + 1,
-            )
+        event = AgentEvent(
+            type=event_type,
+            step=result.steps,
+            data=data,
+            agent_id=result.agent_id,
+            run_id=result.run_id,
+            parent_run_id=parent_context.run_id,
+            depth=parent_context.depth + 1,
         )
+        record_agent_event(event)
+        if parent_context.on_event is not None:
+            parent_context.on_event(event)
 
 
 __all__ = [

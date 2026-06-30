@@ -1,6 +1,7 @@
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Callable, Literal
 from uuid import uuid4
 
@@ -8,6 +9,17 @@ from llm_agent.context_manager import ContextManager, ContextUpdate
 from llm_agent.hooks import HookContext, HookManager
 from llm_agent.llm_client import LLMClient, LLMContextLengthError
 from llm_agent.tool_registry import ToolRegistry
+from llm_agent.trace_system import (
+    TraceRecorder,
+    current_trace_recorder,
+    elapsed_ms,
+    record_agent_event,
+    record_trace,
+    summarize_text,
+    trace_operation,
+    trace_scope,
+    update_trace_context,
+)
 
 
 AgentEventType = Literal[
@@ -42,6 +54,7 @@ class AgentEvent:
     run_id: str = ""
     parent_run_id: str | None = None
     depth: int = 0
+    duration_ms: float | None = None
 
 
 AgentCallback = Callable[[AgentEvent], None]
@@ -115,9 +128,72 @@ class Agent:
         *,
         on_event: AgentCallback | None = None,
         run_id: str | None = None,
+        trace: TraceRecorder | None = None,
+    ) -> AgentRunResult:
+        resolved_run_id = run_id or f"run-{uuid4().hex[:12]}"
+        active_trace = trace or current_trace_recorder()
+        started_at = perf_counter()
+        with trace_scope(
+            active_trace,
+            run_id=resolved_run_id,
+            agent_id=self.agent_id,
+            parent_run_id=self.parent_run_id,
+            depth=self.depth,
+        ):
+            record_trace(
+                category="run",
+                name="run.started",
+                phase="started",
+                data={
+                    "message_count": len(messages),
+                    "max_steps": self.max_steps,
+                },
+            )
+            try:
+                result = self._run_loop(
+                    messages,
+                    on_event=on_event,
+                    run_id=resolved_run_id,
+                )
+            except Exception as exc:
+                record_trace(
+                    category="run",
+                    name="run.failed",
+                    phase="failed",
+                    status="error",
+                    duration_ms=elapsed_ms(started_at),
+                    data={"error": exc},
+                )
+                raise
+            else:
+                record_trace(
+                    category="run",
+                    name="run.completed",
+                    phase="completed",
+                    status=("ok" if result.status == "completed" else "warning"),
+                    duration_ms=elapsed_ms(started_at),
+                    data={
+                        "status": result.status,
+                        "steps": result.steps,
+                        "tool_calls": result.tool_calls,
+                        "usage": result.usage,
+                        "content": summarize_text(result.content),
+                    },
+                )
+                return result
+            finally:
+                if trace is not None and self.depth == 0:
+                    trace.render_markdown()
+
+    def _run_loop(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        on_event: AgentCallback | None,
+        run_id: str,
     ) -> AgentRunResult:
         tool_specs = self.tools.tool_specs()
-        resolved_run_id = run_id or f"run-{uuid4().hex[:12]}"
+        resolved_run_id = run_id
         tool_call_count = 0
         usage: dict[str, Any] = {}
         last_content = ""
@@ -130,6 +206,7 @@ class Agent:
         step_index = 0
         while self.max_steps is None or step_index < self.max_steps:
             step = step_index + 1
+            update_trace_context(step=step)
             context_rebuilt = pending_context_rebuilt
             pending_context_rebuilt = False
             context_update = self.context_manager.prepare(
@@ -228,11 +305,15 @@ class Agent:
             )
 
             try:
-                response = self.llm.chat(
-                    request_messages,
-                    tools=tool_specs,
-                    tool_choice="auto",
-                )
+                with trace_operation(
+                    "agent_step",
+                    request_tokens=request_tokens,
+                ):
+                    response = self.llm.chat(
+                        request_messages,
+                        tools=tool_specs,
+                        tool_choice="auto",
+                    )
             except LLMContextLengthError as exc:
                 if reactive_retries >= self.context_manager.max_reactive_retries:
                     raise RuntimeError(
@@ -293,6 +374,7 @@ class Agent:
 
             tool_results = []
             for tool_call in response.tool_calls:
+                tool_started_at = perf_counter()
                 tool_call_count += 1
                 called_tools.add(tool_call.name)
                 self._emit(
@@ -326,6 +408,7 @@ class Agent:
                             "result": tool_result,
                         },
                         resolved_run_id,
+                        duration_ms=elapsed_ms(tool_started_at),
                     )
                     self._emit(
                         on_event,
@@ -337,6 +420,7 @@ class Agent:
                             "result": tool_result,
                         },
                         resolved_run_id,
+                        duration_ms=elapsed_ms(tool_started_at),
                     )
                     continue
 
@@ -387,6 +471,7 @@ class Agent:
                         "result": tool_result,
                     },
                     resolved_run_id,
+                    duration_ms=elapsed_ms(tool_started_at),
                 )
 
             messages.extend(self.llm.tool_result_messages(tool_results))
@@ -416,6 +501,8 @@ class Agent:
         step: int,
         data: dict[str, Any],
         run_id: str,
+        *,
+        duration_ms: float | None = None,
     ) -> None:
         _emit(
             on_event,
@@ -426,6 +513,7 @@ class Agent:
             run_id=run_id,
             parent_run_id=self.parent_run_id,
             depth=self.depth,
+            duration_ms=duration_ms,
         )
 
     def _emit_context_update(
@@ -650,21 +738,21 @@ def _emit(
     run_id: str = "",
     parent_run_id: str | None = None,
     depth: int = 0,
+    duration_ms: float | None = None,
 ) -> None:
-    if on_event is None:
-        return
-
-    on_event(
-        AgentEvent(
-            type=event_type,
-            step=step,
-            data=data,
-            agent_id=agent_id,
-            run_id=run_id,
-            parent_run_id=parent_run_id,
-            depth=depth,
-        )
+    event = AgentEvent(
+        type=event_type,
+        step=step,
+        data=data,
+        agent_id=agent_id,
+        run_id=run_id,
+        parent_run_id=parent_run_id,
+        depth=depth,
+        duration_ms=duration_ms,
     )
+    record_agent_event(event)
+    if on_event is not None:
+        on_event(event)
 
 
 def _hook_messages(result: Any) -> list[str]:

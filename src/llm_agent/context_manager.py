@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from llm_agent.llm_client import LLMClient
 from llm_agent.tool_registry import ToolSpec
+from llm_agent.trace_system import trace_operation
 
 
 IDENTITY_INSTRUCTIONS = """
@@ -448,22 +449,27 @@ class ContextManager:
             recent_groups = []
 
         old_messages = _flatten_groups(old_groups)
-        response = self.llm.chat(
-            [
-                {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        old_messages,
-                        ensure_ascii=False,
-                        default=str,
-                    ),
-                },
-            ],
-            tools=None,
-            max_tokens=self.summary_max_tokens,
-            temperature=0,
-        )
+        with trace_operation(
+            "context_summary",
+            reason=reason,
+            message_count=len(old_messages),
+        ):
+            response = self.llm.chat(
+                [
+                    {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            old_messages,
+                            ensure_ascii=False,
+                            default=str,
+                        ),
+                    },
+                ],
+                tools=None,
+                max_tokens=self.summary_max_tokens,
+                temperature=0,
+            )
         summary = response.content.strip()
         if not summary:
             raise RuntimeError("Context summary was empty.")

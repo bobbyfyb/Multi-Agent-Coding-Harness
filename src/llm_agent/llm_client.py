@@ -4,9 +4,20 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Literal, Mapping, Sequence, TypedDict
+from uuid import uuid4
 
 from llm_agent.tool_registry import ToolSpec
+from llm_agent.trace_system import (
+    current_trace_context,
+    current_trace_recorder,
+    elapsed_ms,
+    record_trace,
+    summarize_text,
+    summarize_value,
+    trace_llm_content_enabled,
+)
 
 
 try:
@@ -115,24 +126,122 @@ class LLMClient:
         temperature: float | None = None,
         extra_body: Mapping[str, Any] | None = None,
     ) -> LLMResponse:
-        if self.provider == "openai":
-            return self._chat_openai(
-                messages,
-                tools=tools,
-                tool_choice=tool_choice,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                extra_body=extra_body,
+        call_id = f"llm-{uuid4().hex[:16]}"
+        started_at = perf_counter()
+        tracing = current_trace_recorder() is not None
+        trace_context = current_trace_context()
+        operation = trace_context.operation if trace_context else "llm.chat"
+        if tracing:
+            record_trace(
+                category="llm",
+                name="llm.call",
+                phase="started",
+                correlation_id=call_id,
+                data=self._trace_request_data(
+                    messages,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                ),
             )
+        try:
+            if self.provider == "openai":
+                response = self._chat_openai(
+                    messages,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    extra_body=extra_body,
+                )
+            else:
+                response = self._chat_anthropic(
+                    messages,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    extra_body=extra_body,
+                )
+        except Exception as exc:
+            if tracing:
+                record_trace(
+                    category="llm",
+                    name="llm.call",
+                    phase="failed",
+                    status="error",
+                    correlation_id=call_id,
+                    duration_ms=elapsed_ms(started_at),
+                    data={
+                        "provider": self.provider,
+                        "model": self.model,
+                        "operation": operation,
+                        "error": exc,
+                    },
+                )
+            raise
 
-        return self._chat_anthropic(
-            messages,
-            tools=tools,
-            tool_choice=tool_choice,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            extra_body=extra_body,
-        )
+        if tracing:
+            response_data: dict[str, Any] = {
+                "provider": self.provider,
+                "model": self.model,
+                "operation": operation,
+                "stop_reason": response.stop_reason,
+                "usage": response.usage,
+                "content": summarize_text(response.content),
+                "tool_calls": [
+                    {
+                        "id": tool_call.id,
+                        "name": tool_call.name,
+                        "arguments": tool_call.arguments,
+                    }
+                    for tool_call in response.tool_calls
+                ],
+            }
+            if trace_llm_content_enabled():
+                response_data["content_text"] = response.content
+            record_trace(
+                category="llm",
+                name="llm.call",
+                phase="completed",
+                correlation_id=call_id,
+                duration_ms=elapsed_ms(started_at),
+                data=response_data,
+            )
+        return response
+
+    def _trace_request_data(
+        self,
+        messages: Sequence[ChatMessage | Mapping[str, Any]],
+        *,
+        tools: Sequence[ToolSpec] | None,
+        tool_choice: ToolChoice,
+        max_tokens: int | None,
+        temperature: float | None,
+    ) -> dict[str, Any]:
+        context = current_trace_context()
+        data: dict[str, Any] = {
+            "provider": self.provider,
+            "model": self.model,
+            "operation": context.operation if context else "llm.chat",
+            "operation_data": context.operation_data if context else {},
+            "message_count": len(messages),
+            "message_roles": [
+                str(message.get("role", "")) for message in messages
+            ],
+            "messages": summarize_value(messages),
+            "tool_names": [tool["name"] for tool in tools or []],
+            "tool_choice": tool_choice,
+            "max_tokens": self.max_tokens if max_tokens is None else max_tokens,
+            "temperature": (
+                self.temperature if temperature is None else temperature
+            ),
+        }
+        if trace_llm_content_enabled():
+            data["message_content"] = [dict(message) for message in messages]
+            data["tool_specs"] = list(tools or [])
+        return data
 
     def assistant_message(self, response: LLMResponse) -> dict[str, Any]:
         if self.provider == "openai":

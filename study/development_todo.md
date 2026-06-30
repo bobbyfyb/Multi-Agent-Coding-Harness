@@ -206,7 +206,8 @@
 当前边界：
 
 - 分类目前使用主 Agent 的同一模型，暂未支持单独配置低成本分类模型。
-- 分类调用暂未进入 `AgentEvent` 和 Trace，后续由 TraceRecorder 统一记录。
+- 分类调用不转换为 `AgentEvent`，由 `LLMClient` 以
+  `operation=task_intent` 写入统一 Trace。
 - 本地降级规则仍是启发式判断，只用于模型不可用或响应不规范的情况。
 
 ### 2.11 Long-term Memory System
@@ -247,21 +248,19 @@
 
 目标：让每一次 agent 执行都可以复盘。
 
-- [ ] 设计 `TraceRecorder`
-- [ ] 记录每轮 LLM request / response metadata
-- [ ] 记录每个 tool call 的参数、结果、耗时
-- [ ] 记录 permission decision
-- [ ] 记录 hook result
-- [ ] 记录 final answer
-- [ ] 支持 trace 输出为 JSONL
-- [ ] 支持 trace 输出为 Markdown summary
-- [ ] CLI 运行时生成 trace 文件路径
-
-推荐实现顺序：
-
-1. 先基于现有 `AgentEvent` 做 JSONL recorder。
-2. 再扩展 LLM metadata、tool latency、token usage。
-3. 最后做可读 Markdown report。
+- [x] 设计 `TraceRecorder`
+- [x] 记录每轮 LLM request / response metadata
+- [x] 记录每个 tool call 的参数、结果、耗时
+- [x] 记录 permission decision
+- [x] 记录 hook result
+- [x] 记录 final answer
+- [x] 支持 trace 输出为 JSONL
+- [x] 支持 trace 输出为 Markdown summary
+- [x] CLI 运行时生成 trace 文件路径
+- [x] 关联父子 Agent 的 `run_id / parent_run_id / depth`
+- [x] 区分 Agent、Context、Memory、Task Intent 等 LLM operation
+- [x] 默认关闭完整 LLM 内容记录，并支持递归脱敏和截断
+- [x] Trace 写入失败默认不影响 Agent 主流程
 
 ### 3.2 更可靠的 Coding Tools
 
@@ -547,11 +546,11 @@ pytest / ruff / build / API test / UI test
 
 ### Milestone 1：可观测单 Agent Harness
 
-- [ ] TraceRecorder
-- [ ] JSONL trace
-- [ ] Markdown trace summary
-- [ ] Tool latency / status 记录
-- [ ] Permission decision 记录
+- [x] TraceRecorder
+- [x] JSONL trace
+- [x] Markdown trace summary
+- [x] Tool latency / status 记录
+- [x] Permission decision 记录
 
 验收标准：
 
@@ -639,8 +638,8 @@ pytest / ruff / build / API test / UI test
 
 1. Tool use：继续完善工具定义和工具调用。
 2. Permission：扩展当前 PermissionHook。
-3. Hooks：完善 HookManager 生命周期和 trace。
-4. Subagent：继续补充预算、取消和 trace，之后再考虑并行执行。
+3. Hooks：继续扩展生命周期；Hook trace 已接入。
+4. Subagent：继续补充预算和取消；父子 trace 已接入，之后再考虑并行执行。
 5. Context：优化 token 估算、摘要质量和后压缩恢复。
 6. Memory：实现 session summary 和长期记忆。
 7. Skills：实现本地 skill 加载。
@@ -701,13 +700,14 @@ pytest / ruff / build / API test / UI test
 
 ### Sprint 1：Trace + Run Tests
 
-- [ ] 实现 `TraceRecorder`
-- [ ] `Agent.run` 支持传入 trace recorder
-- [ ] trace 记录 step/tool/permission/final
+- [x] 实现 `TraceRecorder`
+- [x] `Agent.run` 支持传入 trace recorder
+- [x] trace 记录 step/tool/permission/final
 - [ ] 新增 `run_tests` 工具
 - [ ] 新增 `run_lint` 工具
 - [ ] QA 思路先不单独成 agent，而是让当前 agent 能调用 test 工具并总结失败
-- [ ] 为 trace 和 test tools 写测试
+- [x] 为 trace 写测试
+- [ ] 为 test tools 写测试
 
 完成后，项目就会从“能调用工具”升级成“能复盘执行过程并验证结果”的 coding harness。
 

@@ -12,6 +12,7 @@ import yaml
 
 from llm_agent.context_manager import PromptSection
 from llm_agent.llm_client import LLMClient
+from llm_agent.trace_system import trace_operation
 
 
 MemoryType = Literal["user", "feedback", "project", "reference"]
@@ -318,22 +319,23 @@ class MemoryManager:
             return []
 
         existing = self._catalog(self.store.list())
-        response = self.llm.chat(
-            [
-                {"role": "system", "content": MEMORY_EXTRACTION_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": (
-                        f"Existing memories:\n{existing or '(none)'}\n\n"
-                        f"User:\n{user_text[:4_000]}\n\n"
-                        f"Assistant:\n{assistant_text[:2_000]}"
-                    ),
-                },
-            ],
-            tools=None,
-            max_tokens=800,
-            temperature=0,
-        )
+        with trace_operation("memory_extract", source_run_id=run_id):
+            response = self.llm.chat(
+                [
+                    {"role": "system", "content": MEMORY_EXTRACTION_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Existing memories:\n{existing or '(none)'}\n\n"
+                            f"User:\n{user_text[:4_000]}\n\n"
+                            f"Assistant:\n{assistant_text[:2_000]}"
+                        ),
+                    },
+                ],
+                tools=None,
+                max_tokens=800,
+                temperature=0,
+            )
         items = _parse_json_array(response.content)
         extracted: list[Memory] = []
         for item in items[:3]:
@@ -411,25 +413,29 @@ class MemoryManager:
             return None
         catalog = self._catalog(candidates)
         try:
-            response = self.llm.chat(
-                [
-                    {
-                        "role": "system",
-                        "content": MEMORY_SELECTION_SYSTEM_PROMPT,
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Select at most {self.max_items} memories.\n\n"
-                            f"Request:\n{query[:2_000]}\n\n"
-                            f"Memory catalog:\n{catalog}"
-                        ),
-                    },
-                ],
-                tools=None,
-                max_tokens=200,
-                temperature=0,
-            )
+            with trace_operation(
+                "memory_select",
+                candidate_count=len(candidates),
+            ):
+                response = self.llm.chat(
+                    [
+                        {
+                            "role": "system",
+                            "content": MEMORY_SELECTION_SYSTEM_PROMPT,
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Select at most {self.max_items} memories.\n\n"
+                                f"Request:\n{query[:2_000]}\n\n"
+                                f"Memory catalog:\n{catalog}"
+                            ),
+                        },
+                    ],
+                    tools=None,
+                    max_tokens=200,
+                    temperature=0,
+                )
             values = _parse_json_array(response.content)
         except Exception:
             return None

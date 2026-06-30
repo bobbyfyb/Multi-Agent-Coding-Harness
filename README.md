@@ -1,8 +1,8 @@
 # LLM Agent Harness
 
 一个支持 OpenAI / Anthropic 官方 SDK、tool calling、权限 Hook、持久化
-Task System、长期 Memory、同步 Subagent 和按需 Skill 加载的 Python Agent
-Harness。
+Task System、长期 Memory、同步 Subagent、按需 Skill 加载和结构化 Trace 的
+Python Agent Harness。
 
 ## 运行
 
@@ -118,6 +118,52 @@ print(result.status)
 print(result.content)
 print(result.steps, result.tool_calls, result.usage)
 ```
+
+## Trace / Observability
+
+交互式 CLI 会为每次用户请求创建一份 Trace，并在结束时打印 JSONL 文件路径：
+
+```text
+.llm_agent/traces/<UTC-date>/<run-id>.jsonl
+.llm_agent/traces/<UTC-date>/<run-id>.md
+```
+
+JSONL 是可供程序消费的事实记录，Markdown 是延迟生成的可读时间线。记录内容
+包括 run 生命周期、AgentEvent、LLM metadata/usage/耗时、工具参数与结果、
+权限决策、Hook 结果，以及父子 Agent 的 `run_id/parent_run_id/depth`。
+
+`LLMClient` 会用 `operation` 区分主循环和内部调用：
+
+```text
+agent_step
+task_intent
+context_summary
+memory_select
+memory_extract
+```
+
+程序化使用：
+
+```python
+from llm_agent.trace_system import TraceConfig, TraceRecorder
+
+run_id = "run-example"
+trace = TraceRecorder.for_run(
+    workdir,
+    run_id=run_id,
+    config=TraceConfig(
+        capture_llm_content=False,
+        capture_tool_content=True,
+    ),
+)
+result = agent.run(messages, run_id=run_id, trace=trace)
+print(trace.jsonl_path, trace.markdown_path)
+```
+
+默认不保存完整 LLM prompt 和原始 response，只记录长度、哈希和调用 metadata；
+最终回答会作为 `final` 业务事件保留，工具内容也默认保留。所有字段写入前都会
+递归脱敏和截断。Trace 写入采用 best-effort 策略，默认不会因为观测系统失败
+而中断 Agent；需要强制审计时可设置 `TraceConfig(strict=True)`。
 
 ## Context Management
 
