@@ -2,7 +2,7 @@
 
 一个支持 OpenAI / Anthropic 官方 SDK、tool calling、权限 Hook、持久化
 Task System、长期 Memory、同步 Subagent、按需 Skill 加载和结构化 Trace 的
-Python Agent Harness。
+Python Agent Harness，并提供有界错误恢复。
 
 ## 运行
 
@@ -164,6 +164,46 @@ print(trace.jsonl_path, trace.markdown_path)
 最终回答会作为 `final` 业务事件保留，工具内容也默认保留。所有字段写入前都会
 递归脱敏和截断。Trace 写入采用 best-effort 策略，默认不会因为观测系统失败
 而中断 Agent；需要强制审计时可设置 `TraceConfig(strict=True)`。
+
+## Error Recovery
+
+系统按照错误发生层级执行恢复：
+
+- `LLMClient`：连接失败、超时、408、409、429 和 5xx 使用指数退避与 jitter。
+- `ContextManager`：context-length 错误触发一次 reactive compact。
+- `Agent`：输出截断时先提高 `max_tokens`，仍截断时最多续写两次。
+- `ToolRegistry`：工具错误回灌模型，不自动重试可能产生副作用的工具。
+
+OpenAI 和 Anthropic SDK 自带的重试会被关闭，由 `RecoveryPolicy` 统一控制，
+从而避免双层重试。认证、权限、参数和响应解析错误会直接失败；重复 overload
+可以选择在当前 Agent run 内切换同 provider 的 fallback model。
+
+```python
+from llm_agent.recovery import RecoveryPolicy
+
+policy = RecoveryPolicy(
+    max_retries=4,
+    max_retry_elapsed_seconds=30,
+    fallback_model=None,
+    fallback_after_overloads=3,
+    escalated_max_tokens=8_192,
+    max_continuations=2,
+)
+llm = LLMClient(provider="anthropic", recovery_policy=policy)
+```
+
+CLI 支持以下环境变量：
+
+```dotenv
+LLM_MAX_RETRIES=4
+LLM_MAX_RETRY_ELAPSED_SECONDS=30
+LLM_FALLBACK_MODEL=
+LLM_ESCALATED_MAX_TOKENS=8192
+LLM_MAX_CONTINUATIONS=2
+```
+
+恢复过程通过 `recovery` AgentEvent 输出，并写入 Trace。续写预算耗尽但仍有可用
+文本时，`AgentRunResult.status` 为 `incomplete`；截断的工具调用永远不会执行。
 
 ## Context Management
 

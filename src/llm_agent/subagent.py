@@ -29,7 +29,7 @@ from llm_agent.trace_system import record_agent_event
 
 
 SubagentMode = Literal["explore", "general"]
-SubagentStatus = Literal["completed", "max_steps", "failed"]
+SubagentStatus = Literal["completed", "incomplete", "max_steps", "failed"]
 
 SUBAGENT_BASE_INSTRUCTIONS = """
 You are a worker agent temporarily delegated by a parent agent.

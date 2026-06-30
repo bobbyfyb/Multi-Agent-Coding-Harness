@@ -14,6 +14,7 @@ from llm_agent.memory_system import (
     MemoryManager,
     build_memory_policy_section,
 )
+from llm_agent.recovery import RecoveryPolicy
 from llm_agent.skill_system import SkillRegistry, build_skill_catalog_section
 from llm_agent.subagent import SUBAGENT_PARENT_INSTRUCTIONS, SubagentRunner
 from llm_agent.tools import build_default_registry
@@ -28,6 +29,20 @@ from llm_agent.trace_system import (
 def build_agent() -> Agent:
     workdir = Path.cwd()
     llm = LLMClient(provider="anthropic")
+    llm.recovery_policy = RecoveryPolicy(
+        max_retries=int(os.getenv("LLM_MAX_RETRIES", "4")),
+        max_retry_elapsed_seconds=float(
+            os.getenv("LLM_MAX_RETRY_ELAPSED_SECONDS", "30")
+        ),
+        fallback_model=(
+            os.getenv("LLM_FALLBACK_MODEL")
+            or os.getenv("FALLBACK_MODEL_ID")
+        ),
+        escalated_max_tokens=int(
+            os.getenv("LLM_ESCALATED_MAX_TOKENS", "8192")
+        ),
+        max_continuations=int(os.getenv("LLM_MAX_CONTINUATIONS", "2")),
+    )
     approval_provider = CliApprovalProvider()
     skill_registry = SkillRegistry.for_workdir(workdir)
     memory_manager = MemoryManager.for_workdir(workdir, llm=llm)
@@ -123,6 +138,8 @@ def main() -> None:
                     run_id=run_id,
                     trace=trace,
                 )
+        except Exception as exc:
+            print(f"\033[31m[run failed]\033[0m {exc}")
         finally:
             trace.render_markdown()
             print(f"\033[2m[trace] {trace.jsonl_path}\033[0m")

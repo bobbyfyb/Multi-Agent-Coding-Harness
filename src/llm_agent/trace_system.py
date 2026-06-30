@@ -367,6 +367,8 @@ def record_agent_event(event: Any) -> TraceRecord | None:
     elif event_type == "max_steps":
         status = "warning"
     event_data = dict(getattr(event, "data", {}) or {})
+    if event_type == "final" and event_data.get("status") == "incomplete":
+        status = "warning"
     result = event_data.get("result")
     if (
         event_type == "tool_result"
@@ -448,6 +450,8 @@ def _agent_event_category(event_type: str) -> str:
         return "task"
     if event_type.startswith("subagent_"):
         return "subagent"
+    if event_type == "recovery":
+        return "recovery"
     return "agent"
 
 

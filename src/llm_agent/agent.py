@@ -7,10 +7,24 @@ from uuid import uuid4
 
 from llm_agent.context_manager import ContextManager, ContextUpdate
 from llm_agent.hooks import HookContext, HookManager
-from llm_agent.llm_client import LLMClient, LLMContextLengthError
+from llm_agent.llm_client import (
+    LLMClient,
+    LLMClientError,
+    LLMContextLengthError,
+)
+from llm_agent.recovery import (
+    CONTINUATION_PROMPT,
+    RecoveryNotice,
+    RecoveryPolicy,
+    RecoveryState,
+    current_recovery_state,
+    emit_recovery_notice,
+    recovery_scope,
+)
 from llm_agent.tool_registry import ToolRegistry
 from llm_agent.trace_system import (
     TraceRecorder,
+    current_trace_context,
     current_trace_recorder,
     elapsed_ms,
     record_agent_event,
@@ -41,8 +55,9 @@ AgentEventType = Literal[
     "context_compacted",
     "context_compact_failed",
     "tool_result_persisted",
+    "recovery",
 ]
-AgentRunStatus = Literal["completed", "max_steps"]
+AgentRunStatus = Literal["completed", "incomplete", "max_steps"]
 
 
 @dataclass(frozen=True)
@@ -104,6 +119,7 @@ class Agent:
     agent_id: str = "agent"
     parent_run_id: str | None = None
     depth: int = 0
+    recovery_policy: RecoveryPolicy | None = None
 
     def __post_init__(self) -> None:
         if self.workdir is None:
@@ -118,6 +134,13 @@ class Agent:
             )
         else:
             self.context_manager.bind(llm=self.llm, workdir=self.workdir)
+        if self.recovery_policy is None:
+            llm_policy = getattr(self.llm, "recovery_policy", None)
+            self.recovery_policy = (
+                llm_policy
+                if isinstance(llm_policy, RecoveryPolicy)
+                else RecoveryPolicy()
+            )
 
     def new_messages(self) -> list[dict[str, Any]]:
         return self.context_manager.new_messages()
@@ -133,12 +156,26 @@ class Agent:
         resolved_run_id = run_id or f"run-{uuid4().hex[:12]}"
         active_trace = trace or current_trace_recorder()
         started_at = perf_counter()
-        with trace_scope(
-            active_trace,
-            run_id=resolved_run_id,
-            agent_id=self.agent_id,
-            parent_run_id=self.parent_run_id,
-            depth=self.depth,
+        recovery_state = RecoveryState(
+            primary_model=getattr(self.llm, "model", None),
+        )
+
+        def recovery_callback(notice: RecoveryNotice) -> None:
+            self._forward_recovery_notice(
+                on_event,
+                notice,
+                run_id=resolved_run_id,
+            )
+
+        with (
+            trace_scope(
+                active_trace,
+                run_id=resolved_run_id,
+                agent_id=self.agent_id,
+                parent_run_id=self.parent_run_id,
+                depth=self.depth,
+            ),
+            recovery_scope(recovery_state, recovery_callback),
         ):
             record_trace(
                 category="run",
@@ -202,6 +239,9 @@ class Agent:
         turn_user_text = _latest_external_user_message(messages) or ""
         emitted_runtime_context: dict[str, str] = {}
         called_tools: set[str] = set()
+        recovery_state = current_recovery_state() or RecoveryState()
+        recovery_policy = self.recovery_policy or RecoveryPolicy()
+        output_max_tokens: int | None = None
 
         step_index = 0
         while self.max_steps is None or step_index < self.max_steps:
@@ -309,16 +349,37 @@ class Agent:
                     "agent_step",
                     request_tokens=request_tokens,
                 ):
-                    response = self.llm.chat(
-                        request_messages,
-                        tools=tool_specs,
-                        tool_choice="auto",
-                    )
+                    chat_kwargs: dict[str, Any] = {
+                        "tools": tool_specs,
+                        "tool_choice": "auto",
+                    }
+                    if output_max_tokens is not None:
+                        chat_kwargs["max_tokens"] = output_max_tokens
+                    response = self.llm.chat(request_messages, **chat_kwargs)
             except LLMContextLengthError as exc:
                 if reactive_retries >= self.context_manager.max_reactive_retries:
+                    emit_recovery_notice(
+                        RecoveryNotice(
+                            action="exhausted",
+                            reason="context_length",
+                            attempt=reactive_retries + 1,
+                            max_attempts=(
+                                self.context_manager.max_reactive_retries + 1
+                            ),
+                            detail=str(exc),
+                        )
+                    )
                     raise RuntimeError(
                         "LLM context remained too long after reactive compaction."
                     ) from exc
+                emit_recovery_notice(
+                    RecoveryNotice(
+                        action="context_compact",
+                        reason="context_length",
+                        attempt=reactive_retries + 1,
+                        max_attempts=self.context_manager.max_reactive_retries,
+                    )
+                )
                 context_update = self.context_manager.recover(
                     messages,
                     run_id=resolved_run_id,
@@ -333,22 +394,128 @@ class Agent:
                 pending_context_rebuilt = context_update.context_rebuilt
                 reactive_retries += 1
                 continue
+            except LLMClientError as exc:
+                raise RuntimeError(
+                    f"LLM request failed ({exc.kind}): {exc}"
+                ) from exc
             except Exception as exc:
                 raise RuntimeError("LLM request failed.") from exc
 
             reactive_retries = 0
-            last_content = response.content
             _merge_usage(usage, response.usage)
+            if response.is_output_truncated:
+                requested_max_tokens = output_max_tokens or int(
+                    getattr(self.llm, "max_tokens", 1_024)
+                )
+                escalated_max_tokens = max(
+                    requested_max_tokens,
+                    recovery_policy.escalated_max_tokens,
+                )
+                if not recovery_state.output_escalated:
+                    recovery_state.output_escalated = True
+                    if escalated_max_tokens > requested_max_tokens:
+                        output_max_tokens = escalated_max_tokens
+                        emit_recovery_notice(
+                            RecoveryNotice(
+                                action="output_escalate",
+                                reason="max_tokens",
+                                data={
+                                    "before_max_tokens": requested_max_tokens,
+                                    "after_max_tokens": escalated_max_tokens,
+                                },
+                            )
+                        )
+                        continue
+
+                if response.tool_calls:
+                    emit_recovery_notice(
+                        RecoveryNotice(
+                            action="exhausted",
+                            reason="truncated_tool_call",
+                            detail=(
+                                "The truncated response contained tool calls; "
+                                "none were executed."
+                            ),
+                        )
+                    )
+                    raise RuntimeError(
+                        "LLM output was truncated while producing tool calls."
+                    )
+
+                if response.content:
+                    messages.append(self.llm.assistant_message(response))
+                    recovery_state.partial_outputs.append(response.content)
+                    last_content = _combine_outputs(
+                        recovery_state.partial_outputs
+                    )
+
+                if (
+                    recovery_state.output_continuations
+                    < recovery_policy.max_continuations
+                ):
+                    recovery_state.output_continuations += 1
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": CONTINUATION_PROMPT,
+                        }
+                    )
+                    emit_recovery_notice(
+                        RecoveryNotice(
+                            action="continuation",
+                            reason="max_tokens",
+                            attempt=recovery_state.output_continuations,
+                            max_attempts=recovery_policy.max_continuations,
+                        )
+                    )
+                    continue
+
+                emit_recovery_notice(
+                    RecoveryNotice(
+                        action="exhausted",
+                        reason="max_tokens",
+                        attempt=recovery_state.output_continuations,
+                        max_attempts=recovery_policy.max_continuations,
+                    )
+                )
+                if not last_content:
+                    raise RuntimeError(
+                        "LLM output recovery exhausted without usable content."
+                    )
+                self._emit(
+                    on_event,
+                    "final",
+                    step,
+                    {
+                        "content": last_content,
+                        "status": "incomplete",
+                    },
+                    resolved_run_id,
+                )
+                return AgentRunResult(
+                    status="incomplete",
+                    content=last_content,
+                    steps=step,
+                    tool_calls=tool_call_count,
+                    usage=usage,
+                    run_id=resolved_run_id,
+                    agent_id=self.agent_id,
+                )
+
+            final_content = _combine_outputs(
+                [*recovery_state.partial_outputs, response.content]
+            )
+            last_content = final_content
             if not response.tool_calls:
                 messages.append({"role": "assistant", "content": response.content})
                 self._emit(
                     on_event,
                     "final",
                     step,
-                    {"content": response.content},
+                    {"content": final_content},
                     resolved_run_id,
                 )
-                hook_context.metadata["final_content"] = response.content
+                hook_context.metadata["final_content"] = final_content
                 stop_result = self.hooks.trigger_hooks(
                     "Stop",
                     messages,
@@ -362,7 +529,7 @@ class Agent:
                 )
                 return AgentRunResult(
                     status="completed",
-                    content=response.content,
+                    content=final_content,
                     steps=step,
                     tool_calls=tool_call_count,
                     usage=usage,
@@ -475,6 +642,8 @@ class Agent:
                 )
 
             messages.extend(self.llm.tool_result_messages(tool_results))
+            recovery_state.reset_output()
+            output_max_tokens = None
             step_index += 1
 
         self._emit(
@@ -514,6 +683,28 @@ class Agent:
             parent_run_id=self.parent_run_id,
             depth=self.depth,
             duration_ms=duration_ms,
+        )
+
+    def _forward_recovery_notice(
+        self,
+        on_event: AgentCallback | None,
+        notice: RecoveryNotice,
+        *,
+        run_id: str,
+    ) -> None:
+        if on_event is None:
+            return
+        trace_context = current_trace_context()
+        on_event(
+            AgentEvent(
+                type="recovery",
+                step=trace_context.step if trace_context else 0,
+                data=notice.to_dict(),
+                agent_id=self.agent_id,
+                run_id=run_id,
+                parent_run_id=self.parent_run_id,
+                depth=self.depth,
+            )
         )
 
     def _emit_context_update(
@@ -601,6 +792,10 @@ def print_agent_event(event: AgentEvent) -> None:
         print(f"\n{prefix}{ANSI_BLUE}[step {event.step}] calling llm{ANSI_RESET}")
         return
 
+    if event.type == "recovery":
+        _print_recovery_event(prefix, event.data)
+        return
+
     if event.type == "tool_call":
         arguments = json.dumps(event.data["arguments"], ensure_ascii=False)
         print(
@@ -672,8 +867,13 @@ def print_agent_event(event: AgentEvent) -> None:
         return
 
     if event.type == "final":
+        label = (
+            "[final: incomplete]"
+            if event.data.get("status") == "incomplete"
+            else "[final]"
+        )
         print(
-            f"\n{prefix}{ANSI_BOLD}{ANSI_MAGENTA}[final]{ANSI_RESET}\n"
+            f"\n{prefix}{ANSI_BOLD}{ANSI_MAGENTA}{label}{ANSI_RESET}\n"
             f"{event.data['content']}"
         )
         return
@@ -726,6 +926,47 @@ def print_agent_event(event: AgentEvent) -> None:
             f"{prefix}{ANSI_RED}[context compact failed]{ANSI_RESET} "
             f"{event.data['error']}"
         )
+
+
+def _print_recovery_event(prefix: str, data: dict[str, Any]) -> None:
+    action = str(data.get("action", "recovery"))
+    reason = str(data.get("reason", "unknown"))
+    if action == "retry":
+        attempt = data.get("attempt", "?")
+        maximum = data.get("max_attempts", "?")
+        delay = data.get("delay_seconds", 0)
+        print(
+            f"{prefix}{ANSI_YELLOW}[recovery retry]{ANSI_RESET} "
+            f"{reason} {attempt}/{maximum}, wait {delay}s"
+        )
+        return
+    if action == "fallback":
+        print(
+            f"{prefix}{ANSI_MAGENTA}[model fallback]{ANSI_RESET} "
+            f"{data.get('from_model')} -> {data.get('to_model')}"
+        )
+        return
+    if action == "context_compact":
+        print(
+            f"{prefix}{ANSI_YELLOW}[recovery compact]{ANSI_RESET} "
+            "context length exceeded"
+        )
+        return
+    if action == "output_escalate":
+        print(
+            f"{prefix}{ANSI_YELLOW}[output limit increased]{ANSI_RESET} "
+            f"{data.get('before_max_tokens')} -> "
+            f"{data.get('after_max_tokens')}"
+        )
+        return
+    if action == "continuation":
+        print(
+            f"{prefix}{ANSI_YELLOW}[output continuation]{ANSI_RESET} "
+            f"{data.get('attempt')}/{data.get('max_attempts')}"
+        )
+        return
+    color = ANSI_RED if action == "exhausted" else ANSI_YELLOW
+    print(f"{prefix}{color}[recovery {action}]{ANSI_RESET} {reason}")
 
 
 def _emit(
@@ -788,6 +1029,7 @@ def _latest_external_user_message(
         "<relevant_memories>",
         "<conversation_summary",
         "<context_compacted",
+        "<recovery_continuation>",
     )
     for message in reversed(messages):
         if message.get("role") != "user":
@@ -799,6 +1041,10 @@ def _latest_external_user_message(
         ):
             return content
     return None
+
+
+def _combine_outputs(outputs: list[str]) -> str:
+    return "\n".join(output for output in outputs if output)
 
 
 def _merge_usage(target: dict[str, Any], usage: dict[str, Any]) -> None:

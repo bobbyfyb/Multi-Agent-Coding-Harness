@@ -2,12 +2,23 @@ from __future__ import annotations
 
 import json
 import os
+import random
 from dataclasses import dataclass, field
 from pathlib import Path
-from time import perf_counter
-from typing import Any, Literal, Mapping, Sequence, TypedDict
+from time import perf_counter, sleep
+from typing import Any, Callable, Literal, Mapping, Sequence, TypedDict
 from uuid import uuid4
 
+from llm_agent.recovery import (
+    ClassifiedError,
+    RecoveryNotice,
+    RecoveryPolicy,
+    RecoveryState,
+    classify_llm_error,
+    current_recovery_state,
+    emit_recovery_notice,
+    retry_delay,
+)
 from llm_agent.tool_registry import ToolSpec
 from llm_agent.trace_system import (
     current_trace_context,
@@ -33,12 +44,41 @@ class ChatMessage(TypedDict):
     role: Literal["system", "user", "assistant"]
     content: str
 
+
 class LLMClientError(RuntimeError):
     """Raised when a model SDK call cannot be made or parsed."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: str = "unknown",
+        retryable: bool = False,
+        status_code: int | None = None,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.retryable = retryable
+        self.status_code = status_code
+        self.retry_after_seconds = retry_after_seconds
 
 
 class LLMContextLengthError(LLMClientError):
     """Raised when a provider rejects a request because its context is too long."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            kind="context_length",
+            retryable=False,
+            status_code=status_code,
+        )
 
 
 @dataclass(frozen=True)
@@ -65,6 +105,14 @@ class LLMResponse:
     def has_tool_calls(self) -> bool:
         return bool(self.tool_calls)
 
+    @property
+    def is_output_truncated(self) -> bool:
+        return str(self.stop_reason or "").lower() in {
+            "length",
+            "max_output_tokens",
+            "max_tokens",
+        }
+
 
 @dataclass
 class LLMClient:
@@ -78,6 +126,9 @@ class LLMClient:
     extra_headers: Mapping[str, str] = field(default_factory=dict)
     extra_body: Mapping[str, Any] = field(default_factory=dict)
     env_file: str | Path | None = None
+    recovery_policy: RecoveryPolicy = field(default_factory=RecoveryPolicy)
+    retry_sleep: Callable[[float], None] = field(default=sleep, repr=False)
+    retry_random: Callable[[], float] = field(default=random.random, repr=False)
     openai_client: Any | None = field(default=None, repr=False)
     anthropic_client: Any | None = field(default=None, repr=False)
 
@@ -131,6 +182,11 @@ class LLMClient:
         tracing = current_trace_recorder() is not None
         trace_context = current_trace_context()
         operation = trace_context.operation if trace_context else "llm.chat"
+        state = current_recovery_state() or RecoveryState(
+            primary_model=self.model,
+        )
+        active_model = state.current_model or self.model
+        attempts = 0
         if tracing:
             record_trace(
                 category="llm",
@@ -143,28 +199,121 @@ class LLMClient:
                     tool_choice=tool_choice,
                     max_tokens=max_tokens,
                     temperature=temperature,
+                    model=active_model,
                 ),
             )
-        try:
-            if self.provider == "openai":
-                response = self._chat_openai(
+
+        while True:
+            attempts += 1
+            try:
+                response = self._chat_once(
                     messages,
                     tools=tools,
                     tool_choice=tool_choice,
                     max_tokens=max_tokens,
                     temperature=temperature,
                     extra_body=extra_body,
+                    model=active_model,
                 )
+            except LLMClientError as exc:
+                error = exc
+                classified = ClassifiedError(
+                    kind=exc.kind,
+                    retryable=exc.retryable,
+                    status_code=exc.status_code,
+                    retry_after_seconds=exc.retry_after_seconds,
+                )
+                cause: BaseException = exc
+            except Exception as exc:
+                classified = classify_llm_error(exc)
+                error = _to_llm_client_error(
+                    self.provider,
+                    exc,
+                    classified,
+                )
+                cause = exc
             else:
-                response = self._chat_anthropic(
-                    messages,
-                    tools=tools,
-                    tool_choice=tool_choice,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    extra_body=extra_body,
+                state.consecutive_overloads = 0
+                break
+
+            can_retry = (
+                classified.retryable
+                and attempts <= self.recovery_policy.max_retries
+            )
+            if can_retry:
+                delay = retry_delay(
+                    self.recovery_policy,
+                    attempts - 1,
+                    retry_after_seconds=classified.retry_after_seconds,
+                    random_value=self.retry_random(),
                 )
-        except Exception as exc:
+                elapsed_seconds = elapsed_ms(started_at) / 1_000
+                can_retry = (
+                    elapsed_seconds + delay
+                    <= self.recovery_policy.max_retry_elapsed_seconds
+                )
+
+            if can_retry:
+                if classified.kind == "overloaded":
+                    state.consecutive_overloads += 1
+                    fallback_model = self.recovery_policy.fallback_model
+                    if (
+                        fallback_model
+                        and state.consecutive_overloads
+                        >= self.recovery_policy.fallback_after_overloads
+                        and active_model != fallback_model
+                    ):
+                        previous_model = active_model
+                        active_model = fallback_model
+                        state.current_model = fallback_model
+                        state.fallback_used = True
+                        state.consecutive_overloads = 0
+                        emit_recovery_notice(
+                            RecoveryNotice(
+                                action="fallback",
+                                reason="overloaded",
+                                attempt=attempts + 1,
+                                max_attempts=self.recovery_policy.max_retries
+                                + 1,
+                                from_model=previous_model,
+                                to_model=fallback_model,
+                                status_code=classified.status_code,
+                                call_id=call_id,
+                            )
+                        )
+                else:
+                    state.consecutive_overloads = 0
+
+                state.transport_retries += 1
+                emit_recovery_notice(
+                    RecoveryNotice(
+                        action="retry",
+                        reason=classified.kind,
+                        attempt=attempts + 1,
+                        max_attempts=self.recovery_policy.max_retries + 1,
+                        delay_seconds=round(delay, 3),
+                        model=active_model,
+                        status_code=classified.status_code,
+                        call_id=call_id,
+                        detail=str(cause),
+                    )
+                )
+                self.retry_sleep(delay)
+                continue
+
+            if classified.retryable:
+                emit_recovery_notice(
+                    RecoveryNotice(
+                        action="exhausted",
+                        reason=classified.kind,
+                        attempt=attempts,
+                        max_attempts=self.recovery_policy.max_retries + 1,
+                        model=active_model,
+                        status_code=classified.status_code,
+                        call_id=call_id,
+                        detail=str(cause),
+                    )
+                )
             if tracing:
                 record_trace(
                     category="llm",
@@ -175,18 +324,24 @@ class LLMClient:
                     duration_ms=elapsed_ms(started_at),
                     data={
                         "provider": self.provider,
-                        "model": self.model,
+                        "model": active_model,
                         "operation": operation,
-                        "error": exc,
+                        "attempts": attempts,
+                        "error_kind": classified.kind,
+                        "status_code": classified.status_code,
+                        "error": error,
                     },
                 )
-            raise
+            if error is cause:
+                raise error
+            raise error from cause
 
         if tracing:
             response_data: dict[str, Any] = {
                 "provider": self.provider,
-                "model": self.model,
+                "model": active_model,
                 "operation": operation,
+                "attempts": attempts,
                 "stop_reason": response.stop_reason,
                 "usage": response.usage,
                 "content": summarize_text(response.content),
@@ -219,11 +374,12 @@ class LLMClient:
         tool_choice: ToolChoice,
         max_tokens: int | None,
         temperature: float | None,
+        model: str | None,
     ) -> dict[str, Any]:
         context = current_trace_context()
         data: dict[str, Any] = {
             "provider": self.provider,
-            "model": self.model,
+            "model": model,
             "operation": context.operation if context else "llm.chat",
             "operation_data": context.operation_data if context else {},
             "message_count": len(messages),
@@ -242,6 +398,37 @@ class LLMClient:
             data["message_content"] = [dict(message) for message in messages]
             data["tool_specs"] = list(tools or [])
         return data
+
+    def _chat_once(
+        self,
+        messages: Sequence[ChatMessage | Mapping[str, Any]],
+        *,
+        tools: Sequence[ToolSpec] | None,
+        tool_choice: ToolChoice,
+        max_tokens: int | None,
+        temperature: float | None,
+        extra_body: Mapping[str, Any] | None,
+        model: str | None,
+    ) -> LLMResponse:
+        if self.provider == "openai":
+            return self._chat_openai(
+                messages,
+                tools=tools,
+                tool_choice=tool_choice,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                extra_body=extra_body,
+                model=model,
+            )
+        return self._chat_anthropic(
+            messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            extra_body=extra_body,
+            model=model,
+        )
 
     def assistant_message(self, response: LLMResponse) -> dict[str, Any]:
         if self.provider == "openai":
@@ -294,9 +481,10 @@ class LLMClient:
         max_tokens: int | None,
         temperature: float | None,
         extra_body: Mapping[str, Any] | None,
+        model: str | None,
     ) -> LLMResponse:
         params: dict[str, Any] = {
-            "model": self._require_model(),
+            "model": model or self._require_model(),
             "messages": _to_openai_messages(messages),
             "max_tokens": self.max_tokens if max_tokens is None else max_tokens,
         }
@@ -317,15 +505,8 @@ class LLMClient:
         if self.extra_headers:
             params["extra_headers"] = dict(self.extra_headers)
 
-        try:
-            response = self._openai_client().chat.completions.create(**params)
-        except Exception as exc:
-            if _is_context_length_error(exc):
-                raise LLMContextLengthError(
-                    f"OpenAI context length exceeded: {exc}"
-                ) from exc
-            raise LLMClientError(f"OpenAI SDK request failed: {exc}") from exc
-
+        client = _without_sdk_retries(self._openai_client())
+        response = client.chat.completions.create(**params)
         return _parse_openai_response(_response_to_dict(response))
 
     def _chat_anthropic(
@@ -337,10 +518,11 @@ class LLMClient:
         max_tokens: int | None,
         temperature: float | None,
         extra_body: Mapping[str, Any] | None,
+        model: str | None,
     ) -> LLMResponse:
         anthropic_messages, system = _to_anthropic_messages(messages)
         params: dict[str, Any] = {
-            "model": self._require_model(),
+            "model": model or self._require_model(),
             "max_tokens": self.max_tokens if max_tokens is None else max_tokens,
             "messages": anthropic_messages,
         }
@@ -363,15 +545,8 @@ class LLMClient:
         if self.extra_headers:
             params["extra_headers"] = dict(self.extra_headers)
 
-        try:
-            response = self._anthropic_client().messages.create(**params)
-        except Exception as exc:
-            if _is_context_length_error(exc):
-                raise LLMContextLengthError(
-                    f"Anthropic context length exceeded: {exc}"
-                ) from exc
-            raise LLMClientError(f"Anthropic SDK request failed: {exc}") from exc
-
+        client = _without_sdk_retries(self._anthropic_client())
+        response = client.messages.create(**params)
         return _parse_anthropic_response(_response_to_dict(response))
 
     def _openai_client(self) -> Any:
@@ -386,6 +561,7 @@ class LLMClient:
         kwargs: dict[str, Any] = {
             "api_key": self.api_key or _openai_local_api_key(self.base_url),
             "timeout": self.timeout,
+            "max_retries": 0,
         }
         if self.base_url:
             kwargs["base_url"] = self.base_url
@@ -406,7 +582,11 @@ class LLMClient:
                 "Install the anthropic package to use provider='anthropic'."
             ) from exc
 
-        kwargs: dict[str, Any] = {"api_key": self.api_key, "timeout": self.timeout}
+        kwargs: dict[str, Any] = {
+            "api_key": self.api_key,
+            "timeout": self.timeout,
+            "max_retries": 0,
+        }
         if self.base_url:
             kwargs["base_url"] = self.base_url
         if self.extra_headers:
@@ -433,33 +613,34 @@ def _normalize_provider(provider: str) -> str:
     raise ValueError(f"Unsupported LLM provider: {provider}")
 
 
-def _is_context_length_error(exc: Exception) -> bool:
-    markers = (
-        "context_length_exceeded",
-        "context length exceeded",
-        "maximum context length",
-        "prompt_too_long",
-        "prompt is too long",
-        "too many tokens",
-        "request too large",
+def _to_llm_client_error(
+    provider: str,
+    exc: BaseException,
+    classified: ClassifiedError,
+) -> LLMClientError:
+    label = "OpenAI" if provider == "openai" else "Anthropic"
+    if classified.kind == "context_length":
+        return LLMContextLengthError(
+            f"{label} context length exceeded: {exc}",
+            status_code=classified.status_code,
+        )
+    return LLMClientError(
+        f"{label} SDK request failed: {exc}",
+        kind=classified.kind,
+        retryable=classified.retryable,
+        status_code=classified.status_code,
+        retry_after_seconds=classified.retry_after_seconds,
     )
-    current: BaseException | None = exc
-    visited: set[int] = set()
-    while current is not None and id(current) not in visited:
-        visited.add(id(current))
-        text = str(current).lower()
-        if any(marker in text for marker in markers):
-            return True
 
-        status_code = getattr(current, "status_code", None)
-        code = getattr(current, "code", None)
-        if status_code == 413 or str(code).lower() in {
-            "context_length_exceeded",
-            "prompt_too_long",
-        }:
-            return True
-        current = current.__cause__ or current.__context__
-    return False
+
+def _without_sdk_retries(client: Any) -> Any:
+    with_options = getattr(client, "with_options", None)
+    if not callable(with_options):
+        return client
+    try:
+        return with_options(max_retries=0)
+    except TypeError:
+        return client
 
 
 def _openai_local_api_key(base_url: str | None) -> str | None:

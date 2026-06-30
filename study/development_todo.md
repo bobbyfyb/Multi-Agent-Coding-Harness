@@ -242,6 +242,29 @@
 - 当前 conversation summary 负责会话内 compact 连续性；可恢复 Session
   Memory 等 `AgentSession` 落地后再实现。
 
+### 2.12 Error Recovery
+
+- [x] 实现 `RecoveryPolicy / RecoveryState / RecoveryNotice`
+- [x] 基于异常类型、HTTP status 和 error code 分类 LLM 错误
+- [x] 对连接失败、超时、408、409、429 和 5xx 执行有界指数退避
+- [x] 支持 `Retry-After`、jitter 和累计等待时间限制
+- [x] 关闭 OpenAI / Anthropic SDK 内置重试，避免双层重试
+- [x] 连续 overload 后支持同 provider fallback model
+- [x] 复用 `ContextManager.recover()` 处理 context-length
+- [x] 输出截断时先提升 `max_tokens`，再执行有界 continuation
+- [x] 截断工具调用不会执行
+- [x] 工具错误继续回灌模型，不自动重试副作用工具
+- [x] 恢复动作接入 AgentEvent、终端输出和 Trace
+- [x] CLI 在恢复耗尽后报告错误并保持交互进程
+- [x] 覆盖重试、fallback、截断恢复、Trace 和工具副作用测试
+
+当前边界：
+
+- 仅支持同一 provider 内的 fallback model，不自动跨 Provider 切换。
+- 当前为同步非流式恢复，尚未处理流式中断与断点续传。
+- Error Recovery 只负责当前进程内执行，不等同于跨会话 Session 恢复。
+- 工具需要先引入 idempotent 元数据，才会考虑只读工具自动重试。
+
 ## 3. 接下来优先补全的单 Agent Harness 能力
 
 ### 3.1 Trace / Observability
@@ -542,6 +565,7 @@ pytest / ruff / build / API test / UI test
 - [x] 统一 Task System MVP 已接入
 - [x] TaskPlanningHook 已接入 `BeforeLLM`
 - [x] 同步 Subagent MVP 已接入
+- [x] Error Recovery 已接入
 - [x] 基础测试已覆盖
 
 ### Milestone 1：可观测单 Agent Harness
@@ -640,11 +664,12 @@ pytest / ruff / build / API test / UI test
 2. Permission：扩展当前 PermissionHook。
 3. Hooks：继续扩展生命周期；Hook trace 已接入。
 4. Subagent：继续补充预算和取消；父子 trace 已接入，之后再考虑并行执行。
-5. Context：优化 token 估算、摘要质量和后压缩恢复。
-6. Memory：实现 session summary 和长期记忆。
-7. Skills：实现本地 skill 加载。
-8. MCP：将 MCP tools 接入 ToolRegistry。
-9. Multi-agent：最后再做 PM/Engineer/QA 编排。
+5. Error Recovery：继续补充流式中断和可取消 backoff。
+6. Context：优化 token 估算、摘要质量和后压缩恢复。
+7. Memory：实现 session summary 和长期记忆。
+8. Skills：实现本地 skill 加载。
+9. MCP：将 MCP tools 接入 ToolRegistry。
+10. Multi-agent：最后再做 PM/Engineer/QA 编排。
 
 原则：
 
