@@ -3,6 +3,8 @@ from pathlib import Path
 import sys
 from uuid import uuid4
 
+from prompt_toolkit.patch_stdout import patch_stdout
+
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from llm_agent.agent import Agent, print_agent_event
@@ -10,9 +12,17 @@ from llm_agent.background_jobs import (
     BACKGROUND_JOB_INSTRUCTIONS,
     BackgroundJobManager,
 )
+from llm_agent.cli import (
+    build_approval_prompt_session,
+    build_user_prompt_session,
+    read_user_prompt,
+)
 from llm_agent.context_manager import ContextManager, PromptSection
 from llm_agent.hooks import HookContext, build_default_hook_manager
-from llm_agent.hooks.permission_hooks import CliApprovalProvider
+from llm_agent.hooks.permission_hooks import (
+    ApprovalProvider,
+    CliApprovalProvider,
+)
 from llm_agent.llm_client import LLMClient
 from llm_agent.memory_system import (
     MemoryManager,
@@ -31,7 +41,10 @@ from llm_agent.trace_system import (
 from llm_agent.worktree import WorktreeManager
 
 
-def build_agent() -> Agent:
+def build_agent(
+    *,
+    approval_provider: ApprovalProvider | None = None,
+) -> Agent:
     workdir = Path.cwd()
     llm = LLMClient(provider="anthropic")
     llm.recovery_policy = RecoveryPolicy(
@@ -48,7 +61,8 @@ def build_agent() -> Agent:
         ),
         max_continuations=int(os.getenv("LLM_MAX_CONTINUATIONS", "2")),
     )
-    approval_provider = CliApprovalProvider()
+    if approval_provider is None:
+        approval_provider = CliApprovalProvider()
     skill_registry = SkillRegistry.for_workdir(workdir)
     memory_manager = MemoryManager.for_workdir(workdir, llm=llm)
     worktree_manager = WorktreeManager.for_workdir(workdir)
@@ -118,54 +132,59 @@ def build_agent() -> Agent:
 
 
 def main() -> None:
-    agent = build_agent()
+    workdir = Path.cwd()
+    prompt_session = build_user_prompt_session(workdir)
+    approval_session = build_approval_prompt_session()
+    agent = build_agent(
+        approval_provider=CliApprovalProvider(
+            input_func=approval_session.prompt,
+        )
+    )
     messages = agent.new_messages()
 
     try:
-        while True:
-            try:
-                query = input("\033[36mInput your question >> \033[0m")
-            except (EOFError, KeyboardInterrupt):
-                break
-            if query.strip().lower() in ("q", "exit", ""):
-                break
-            run_id = f"run-{uuid4().hex[:12]}"
-            trace = TraceRecorder.for_run(Path.cwd(), run_id=run_id)
-            try:
-                with trace_scope(
-                    trace,
-                    run_id=run_id,
-                    agent_id=agent.agent_id,
-                    parent_run_id=agent.parent_run_id,
-                    depth=agent.depth,
-                ):
-                    record_trace(
-                        category="run",
-                        name="run.input",
-                        phase="received",
-                        data={"content": summarize_text(query)},
-                    )
-                    agent.hooks.trigger_hooks(
-                        "UserPromptSubmit",
-                        query,
-                        HookContext(
-                            messages=messages,
-                            workdir=Path.cwd(),
-                            metadata={"run_id": run_id},
-                        ),
-                    )
-                    messages.append({"role": "user", "content": query})
-                    agent.run(
-                        messages,
-                        on_event=print_agent_event,
+        with patch_stdout(raw=True):
+            while True:
+                query = read_user_prompt(prompt_session)
+                if query is None:
+                    break
+                run_id = f"run-{uuid4().hex[:12]}"
+                trace = TraceRecorder.for_run(workdir, run_id=run_id)
+                try:
+                    with trace_scope(
+                        trace,
                         run_id=run_id,
-                        trace=trace,
-                    )
-            except Exception as exc:
-                print(f"\033[31m[run failed]\033[0m {exc}")
-            finally:
-                trace.render_markdown()
-                print(f"\033[2m[trace] {trace.jsonl_path}\033[0m")
+                        agent_id=agent.agent_id,
+                        parent_run_id=agent.parent_run_id,
+                        depth=agent.depth,
+                    ):
+                        record_trace(
+                            category="run",
+                            name="run.input",
+                            phase="received",
+                            data={"content": summarize_text(query)},
+                        )
+                        agent.hooks.trigger_hooks(
+                            "UserPromptSubmit",
+                            query,
+                            HookContext(
+                                messages=messages,
+                                workdir=workdir,
+                                metadata={"run_id": run_id},
+                            ),
+                        )
+                        messages.append({"role": "user", "content": query})
+                        agent.run(
+                            messages,
+                            on_event=print_agent_event,
+                            run_id=run_id,
+                            trace=trace,
+                        )
+                except Exception as exc:
+                    print(f"\033[31m[run failed]\033[0m {exc}")
+                finally:
+                    trace.render_markdown()
+                    print(f"\033[2m[trace] {trace.jsonl_path}\033[0m")
     finally:
         if agent.background_jobs is not None:
             agent.background_jobs.shutdown()

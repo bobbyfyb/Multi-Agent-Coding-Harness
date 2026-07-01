@@ -333,6 +333,20 @@
 - Worktree 是文件修改隔离，不是容器或恶意代码安全边界。
 - Worktree 与 Task 保持独立，只通过元数据关联，不自动改变 Task 状态。
 
+### 2.15 CLI Interaction
+
+- [x] 使用 `prompt_toolkit` 替换单行 `input()`
+- [x] 支持多行 Prompt 编辑和提交
+- [x] 使用 `.llm_agent/input_history` 持久化输入历史
+- [x] 支持历史搜索和历史内容建议
+- [x] 使用独立单行 Session 处理权限确认
+- [x] 使用 `patch_stdout` 避免终端输出破坏当前编辑区
+- [x] 支持 `Ctrl+C` 取消当前输入和 `Ctrl+D` 退出
+- [x] 保留 `q / exit` 并增加 `/exit / /quit` 退出命令
+
+当前只增强交互式 CLI，不改变 Agent 的字符串输入接口。后续 Textual TUI 或
+Web UI 可以继续复用同一个 Agent、Hook 和 Event 边界。
+
 ## 3. 接下来优先补全的单 Agent Harness 能力
 
 ### 3.1 Trace / Observability

@@ -22,6 +22,17 @@ LLM_CONTEXT_WINDOW=100000
 uv run python main.py
 ```
 
+CLI 使用多行编辑器：
+
+- `Enter`：插入换行
+- `Esc` 后按 `Enter`：提交完整 Prompt
+- `Ctrl+C`：清空当前输入并重新开始
+- `Ctrl+D`：退出
+- `q`、`exit`、`/exit`、`/quit`：退出
+
+输入历史保存在 `.llm_agent/input_history`，上下方向键可以搜索历史 Prompt。
+终端输出通过 `patch_stdout` 与编辑区协调，不会覆盖尚未提交的内容。
+
 ## 同步 Subagent
 
 主 Agent 可以通过 `subagent_run` 将范围明确的多步骤工作交给一个独立
