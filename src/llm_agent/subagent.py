@@ -130,7 +130,7 @@ class SubagentResult:
 class SubagentRunner:
     llm: LLMClient
     workdir: Path | str
-    max_steps: int = 12
+    max_steps: int = 24
     max_depth: int = 1
     skill_registry: SkillRegistry | None = None
     memory_manager: MemoryManager | None = None
