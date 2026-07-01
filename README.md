@@ -2,7 +2,7 @@
 
 一个支持 OpenAI / Anthropic 官方 SDK、tool calling、权限 Hook、持久化
 Task System、长期 Memory、同步 Subagent、按需 Skill 加载和结构化 Trace 的
-Python Agent Harness，并提供有界错误恢复和托管后台进程。
+Python Agent Harness，并提供可靠代码验证、有界错误恢复和托管后台进程。
 
 ## 运行
 
@@ -126,6 +126,45 @@ print(result.status)
 print(result.content)
 print(result.steps, result.tool_calls, result.usage)
 ```
+
+## Reliable Coding Tools
+
+同步 Bash 返回结构化进程结果，而不是只返回合并文本：
+
+```json
+{
+  "status": "failed",
+  "exit_code": 1,
+  "stdout": "...",
+  "stderr": "...",
+  "duration_ms": 125.4,
+  "timed_out": false,
+  "stdout_path": ".llm_agent/tool-results/.../stdout.log",
+  "stderr_path": ".llm_agent/tool-results/.../stderr.log"
+}
+```
+
+非零退出码是正常工具结果，外层仍为 `ok=true`；只有参数、路径或进程启动错误
+才返回 `ok=false`。完整输出落盘，返回给模型的内容有长度限制并优先保留尾部。
+
+文件与搜索工具：
+
+- `read_file` 支持 `start_line/limit`，并返回完整文件的 SHA256。
+- `edit_file` 要求 `old_text` 恰好出现一次，可使用 `expected_sha256`
+  防止覆盖读取后发生的修改。
+- `write_file/edit_file` 使用同目录临时文件进行原子替换。
+- `search_text` 使用 `rg --json` 返回有上限的结构化匹配。
+
+结构化验证工具：
+
+```text
+run_tests  -> pytest + JUnit XML
+run_lint   -> Ruff JSON diagnostics
+```
+
+两者当前同步执行，使用固定参数数组而不是模型拼接的 Shell 命令。测试失败或
+发现 Lint 问题会返回 `outcome=failed/issues_found`，不会触发工具异常，也不会
+自动修改文件。长时间完整测试仍可使用后台 Bash。
 
 ## Background Jobs
 

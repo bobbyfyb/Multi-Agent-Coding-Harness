@@ -626,6 +626,10 @@ class Agent:
                     step=step,
                     workdir=self.workdir,
                     on_event=on_event,
+                    metadata={
+                        "tool_call_id": tool_call.id,
+                        "tool_name": tool_call.name,
+                    },
                 )
                 tool_result = self.tools.call(
                     tool_call.name,
@@ -894,9 +898,7 @@ def print_agent_event(event: AgentEvent) -> None:
 
     if event.type == "tool_result":
         result = event.data["result"]
-        result_color = ANSI_GREEN
-        if isinstance(result, dict) and result.get("ok") is False:
-            result_color = ANSI_RED
+        result_color = _tool_result_color(result)
 
         print(
             f"{prefix}{result_color}[tool result] "
@@ -1137,3 +1139,20 @@ def _event_prefix(event: AgentEvent) -> str:
     if event.depth <= 0:
         return ""
     return f"{ANSI_DIM}[{event.agent_id}] {ANSI_RESET}"
+
+
+def _tool_result_color(result: Any) -> str:
+    if not isinstance(result, dict):
+        return ANSI_GREEN
+    if result.get("ok") is False:
+        return ANSI_RED
+    payload = result.get("result")
+    if not isinstance(payload, dict):
+        return ANSI_GREEN
+    if payload.get("status") in {"failed", "timed_out"}:
+        return ANSI_RED
+    if payload.get("outcome") in {"failed", "error", "timed_out"}:
+        return ANSI_RED
+    if payload.get("outcome") in {"issues_found", "no_tests"}:
+        return ANSI_YELLOW
+    return ANSI_GREEN

@@ -25,6 +25,9 @@ from llm_agent.tool_registry import ToolRegistry
 from llm_agent.tools.basic_tools import register_tools as register_basic_tools
 from llm_agent.tools.search_tools import register_tools as register_search_tools
 from llm_agent.tools.skill_tools import register_tools as register_skill_tools
+from llm_agent.tools.verification_tools import (
+    register_tools as register_verification_tools,
+)
 from llm_agent.trace_system import record_agent_event
 
 
@@ -62,7 +65,10 @@ SUBAGENT_TOOL_PROFILES: dict[SubagentMode, set[str]] = {
         "bash",
         "read_file",
         "glob",
+        "search_text",
         "search",
+        "run_tests",
+        "run_lint",
         *SUBAGENT_SKILL_TOOLS,
     },
     "general": {
@@ -71,7 +77,10 @@ SUBAGENT_TOOL_PROFILES: dict[SubagentMode, set[str]] = {
         "write_file",
         "edit_file",
         "glob",
+        "search_text",
         "search",
+        "run_tests",
+        "run_lint",
         *SUBAGENT_SKILL_TOOLS,
     },
 }
@@ -198,6 +207,7 @@ class SubagentRunner:
         registry = ToolRegistry()
         register_basic_tools(registry, workdir=self.workdir)
         register_search_tools(registry, workdir=self.workdir)
+        register_verification_tools(registry, workdir=self.workdir)
         if self.skill_registry is not None:
             register_skill_tools(
                 registry,

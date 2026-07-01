@@ -220,6 +220,19 @@ def test_print_agent_event_outputs_human_readable_trace(capsys: Any) -> None:
             {"name": "add", "result": {"ok": True, "result": 3}},
         )
     )
+    print_agent_event(
+        AgentEvent(
+            "tool_result",
+            1,
+            {
+                "name": "run_tests",
+                "result": {
+                    "ok": True,
+                    "result": {"outcome": "failed", "exit_code": 1},
+                },
+            },
+        )
+    )
     print_agent_event(AgentEvent("final", 2, {"content": "done"}))
 
     output = capsys.readouterr().out
@@ -229,6 +242,7 @@ def test_print_agent_event_outputs_human_readable_trace(capsys: Any) -> None:
     assert '{"a": 1, "b": 2}' in output
     assert "[tool result] add ->" in output
     assert '{"ok": true, "result": 3}' in output
+    assert "\033[31m[tool result] run_tests ->" in output
     assert "[final]" in output
     assert "done" in output
 

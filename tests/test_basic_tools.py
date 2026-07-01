@@ -15,22 +15,36 @@ def test_basic_tools_file_workflow(tmp_path: Path) -> None:
         "write_file",
         {"path": "notes/todo.txt", "content": "one\ntwo\nthree"},
     )
-    assert write_result == {
-        "ok": True,
-        "result": "Wrote 13 bytes to notes/todo.txt",
-    }
+    assert write_result["ok"] is True
+    assert write_result["result"]["bytes_written"] == 13
+    assert write_result["result"]["before_sha256"] is None
+    file_sha256 = write_result["result"]["after_sha256"]
 
     read_result = registry.call("read_file", {"path": "notes/todo.txt", "limit": 2})
-    assert read_result == {
-        "ok": True,
-        "result": "one\ntwo\n... (1 more lines)",
+    assert read_result["ok"] is True
+    assert read_result["result"] == {
+        "path": "notes/todo.txt",
+        "sha256": file_sha256,
+        "start_line": 1,
+        "end_line": 2,
+        "total_lines": 3,
+        "content": "one\ntwo",
+        "truncated": True,
     }
 
     edit_result = registry.call(
         "edit_file",
-        {"path": "notes/todo.txt", "old_text": "two", "new_text": "TWO"},
+        {
+            "path": "notes/todo.txt",
+            "old_text": "two",
+            "new_text": "TWO",
+            "expected_sha256": file_sha256,
+        },
     )
-    assert edit_result == {"ok": True, "result": "Edited notes/todo.txt"}
+    assert edit_result["ok"] is True
+    assert edit_result["result"]["before_sha256"] == file_sha256
+    assert "-two" in edit_result["result"]["diff"]
+    assert "+TWO" in edit_result["result"]["diff"]
     assert (tmp_path / "notes/todo.txt").read_text(encoding="utf-8") == (
         "one\nTWO\nthree"
     )
@@ -55,7 +69,28 @@ def test_basic_tools_runs_bash_in_workspace(tmp_path: Path) -> None:
 
     result = registry.call("bash", {"command": "printf '%s' \"$PWD\""})
 
-    assert result == {"ok": True, "result": str(tmp_path)}
+    assert result["ok"] is True
+    assert result["result"]["status"] == "completed"
+    assert result["result"]["exit_code"] == 0
+    assert result["result"]["stdout"] == str(tmp_path)
+    assert result["result"]["stderr"] == ""
+    assert Path(result["result"]["stdout_path"]).exists()
+
+
+def test_basic_tools_preserves_failed_bash_exit_code(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+    register_tools(registry, workdir=tmp_path)
+
+    result = registry.call(
+        "bash",
+        {"command": "printf 'bad' >&2; exit 7"},
+    )
+
+    assert result["ok"] is True
+    assert result["result"]["status"] == "failed"
+    assert result["result"]["exit_code"] == 7
+    assert result["result"]["stdout"] == ""
+    assert result["result"]["stderr"] == "bad"
 
 
 def test_basic_tools_blocks_dangerous_bash(tmp_path: Path) -> None:
@@ -66,6 +101,73 @@ def test_basic_tools_blocks_dangerous_bash(tmp_path: Path) -> None:
 
     assert result["ok"] is False
     assert "Dangerous command blocked" in result["error"]
+
+
+def test_edit_file_rejects_ambiguous_or_stale_content(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+    register_tools(registry, workdir=tmp_path)
+    path = tmp_path / "notes.txt"
+    path.write_text("same\nsame\n", encoding="utf-8")
+
+    ambiguous = registry.call(
+        "edit_file",
+        {"path": "notes.txt", "old_text": "same", "new_text": "new"},
+    )
+    stale = registry.call(
+        "edit_file",
+        {
+            "path": "notes.txt",
+            "old_text": "same\nsame",
+            "new_text": "new",
+            "expected_sha256": "stale",
+        },
+    )
+
+    assert ambiguous["ok"] is False
+    assert "found 2" in ambiguous["error"]
+    assert stale["ok"] is False
+    assert "File changed since it was read" in stale["error"]
+    assert path.read_text(encoding="utf-8") == "same\nsame\n"
+
+
+def test_read_file_supports_line_ranges(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+    register_tools(registry, workdir=tmp_path)
+    (tmp_path / "lines.txt").write_text("one\ntwo\nthree\nfour\n", encoding="utf-8")
+
+    result = registry.call(
+        "read_file",
+        {"path": "lines.txt", "start_line": 2, "limit": 2},
+    )
+
+    assert result["ok"] is True
+    assert result["result"]["content"] == "two\nthree"
+    assert result["result"]["start_line"] == 2
+    assert result["result"]["end_line"] == 3
+    assert result["result"]["truncated"] is True
+
+
+def test_search_text_returns_structured_matches(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+    register_tools(registry, workdir=tmp_path)
+    (tmp_path / "app.py").write_text(
+        "def hello():\n    return 'needle'\n",
+        encoding="utf-8",
+    )
+
+    result = registry.call(
+        "search_text",
+        {"query": "needle", "globs": ["*.py"]},
+    )
+
+    assert result["ok"] is True
+    assert result["result"]["count"] == 1
+    assert result["result"]["matches"][0] == {
+        "path": "app.py",
+        "line": 2,
+        "column": 13,
+        "text": "    return 'needle'",
+    }
 
 
 def test_default_registry_loads_basic_tools(tmp_path: Path) -> None:
@@ -84,6 +186,9 @@ def test_default_registry_loads_basic_tools(tmp_path: Path) -> None:
         "write_file",
         "edit_file",
         "glob",
+        "search_text",
+        "run_tests",
+        "run_lint",
         "task_create",
         "task_update",
         "task_list",

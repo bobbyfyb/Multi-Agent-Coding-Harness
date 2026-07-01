@@ -37,6 +37,9 @@ Tool use:
 - Do not describe a tool call as text when a real tool call is needed.
 - Do not fabricate tool results.
 - Keep file operations inside the workspace.
+- Prefer search_text over shell search commands and read large files in ranges.
+- Use the SHA256 returned by read_file when editing an existing file.
+- Use run_tests and run_lint for structured verification when applicable.
 - If a tool fails, use the error to choose the next reasonable step.
 """.strip()
 

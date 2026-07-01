@@ -72,6 +72,13 @@
 - [x] 实现 `edit_file`
 - [x] 实现 `glob`
 - [x] 实现 `search`
+- [x] 实现基于 `rg --json` 的本地 `search_text`
+- [x] 同步 Bash 返回 exit code、stdout/stderr、耗时和超时状态
+- [x] 命令完整输出持久化到 `.llm_agent/tool-results/`
+- [x] 实现基于 Pytest JUnit XML 的 `run_tests`
+- [x] 实现基于 Ruff JSON 的 `run_lint`
+- [x] `read_file` 支持行范围和 SHA256
+- [x] `edit_file` 支持唯一匹配、版本校验和原子写入
 
 ### 2.4 权限与 Hook
 
@@ -321,16 +328,18 @@
 
 目标：让 agent 能更稳定地改代码、验证代码。
 
-- [ ] 优化 `edit_file`，避免简单字符串替换带来的误改
+- [x] 优化 `edit_file`，要求唯一匹配并支持 SHA256 乐观锁
 - [ ] 新增 `replace_file_range`
 - [ ] 新增 `insert_file_text`
 - [ ] 新增 `list_dir`
 - [ ] 新增 `file_info`
-- [ ] 新增 `run_tests`
-- [ ] 新增 `run_lint`
+- [x] 新增结构化 Pytest `run_tests`
+- [x] 新增结构化 Ruff `run_lint`
 - [ ] 新增 `python_repl` 或安全计算工具
 - [ ] 对 bash 命令做更细粒度权限分级
 - [ ] 对工具输出做统一截断和摘要
+- [x] Bash/测试/Lint 输出落盘并返回有界预览
+- [x] 非零退出码与工具基础设施错误使用不同语义
 
 优先级最高：
 
@@ -616,10 +625,10 @@ pytest / ruff / build / API test / UI test
 
 ### Milestone 2：可靠 Coding Tools
 
-- [ ] run_tests
-- [ ] run_lint
-- [ ] 稳定文件编辑工具
-- [ ] 工具输出摘要
+- [x] run_tests
+- [x] run_lint
+- [x] 最小稳定文件编辑能力
+- [x] 命令输出落盘和有界预览
 
 验收标准：
 
@@ -753,21 +762,20 @@ pytest / ruff / build / API test / UI test
 - Artifact 如何让多 agent 协作更工程化
 - QA 如何形成真实测试反馈闭环
 
-## 10. 最近一个开发周期的建议任务
-
-建议下一步只做一个小闭环：
+## 10. 最近完成的开发周期
 
 ### Sprint 1：Trace + Run Tests
 
 - [x] 实现 `TraceRecorder`
 - [x] `Agent.run` 支持传入 trace recorder
 - [x] trace 记录 step/tool/permission/final
-- [ ] 新增 `run_tests` 工具
-- [ ] 新增 `run_lint` 工具
+- [x] 新增 `run_tests` 工具
+- [x] 新增 `run_lint` 工具
 - [ ] QA 思路先不单独成 agent，而是让当前 agent 能调用 test 工具并总结失败
 - [x] 为 trace 写测试
-- [ ] 为 test tools 写测试
+- [x] 为 test tools 写测试
 
-完成后，项目就会从“能调用工具”升级成“能复盘执行过程并验证结果”的 coding harness。
+这一阶段将项目从“能调用工具”升级为“能复盘执行过程并验证结果”的 coding
+harness。
 
 这是后面多 agent 的地基。

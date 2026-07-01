@@ -9,6 +9,9 @@ from llm_agent.tools.memory_tools import register_tools as register_memory_tools
 from llm_agent.tools.search_tools import register_tools as register_search_tools
 from llm_agent.tools.skill_tools import register_tools as register_skill_tools
 from llm_agent.tools.task_tools import register_tools as register_task_tools
+from llm_agent.tools.verification_tools import (
+    register_tools as register_verification_tools,
+)
 
 if TYPE_CHECKING:
     from llm_agent.background_jobs import BackgroundJobManager
@@ -54,6 +57,7 @@ def register_default_tools(
     if background_manager is not None:
         register_background_tools(registry, manager=background_manager)
     register_search_tools(registry, workdir=workdir)
+    register_verification_tools(registry, workdir=workdir)
     register_task_tools(registry, workdir=workdir)
     if skill_registry is not None:
         register_skill_tools(registry, skill_registry=skill_registry)
@@ -95,5 +99,6 @@ __all__ = [
     "register_skill_tools",
     "register_subagent_tools",
     "register_task_tools",
+    "register_verification_tools",
     "register_default_tools",
 ]

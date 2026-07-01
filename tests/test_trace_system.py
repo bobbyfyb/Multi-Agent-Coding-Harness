@@ -5,13 +5,14 @@ from typing import Any
 
 import pytest
 
-from llm_agent.agent import Agent
+from llm_agent.agent import Agent, AgentEvent
 from llm_agent.hooks import HookManager, HookResult
 from llm_agent.llm_client import LLMClient
 from llm_agent.tool_registry import ToolRegistry
 from llm_agent.trace_system import (
     TraceConfig,
     TraceRecorder,
+    record_agent_event,
     record_trace,
     trace_operation,
     trace_scope,
@@ -106,6 +107,34 @@ def test_trace_can_summarize_tool_arguments_and_results(tmp_path: Path) -> None:
     assert data["arguments"]["type"] == "dict"
     assert data["result"]["type"] == "dict"
     assert "private" not in json.dumps(data)
+
+
+def test_trace_marks_structured_command_failure_as_error(
+    tmp_path: Path,
+) -> None:
+    recorder = TraceRecorder.for_run(tmp_path, run_id="run-tool-failed")
+
+    with trace_scope(
+        recorder,
+        run_id="run-tool-failed",
+        agent_id="main",
+    ):
+        record_agent_event(
+            AgentEvent(
+                type="tool_result",
+                step=1,
+                data={
+                    "name": "run_tests",
+                    "result": {
+                        "ok": True,
+                        "result": {"outcome": "failed", "exit_code": 1},
+                    },
+                },
+                run_id="run-tool-failed",
+            )
+        )
+
+    assert _read_records(recorder)[0]["status"] == "error"
 
 
 def test_llm_client_records_operation_metadata_without_prompt_content(

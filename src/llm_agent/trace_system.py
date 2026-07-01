@@ -371,12 +371,8 @@ def record_agent_event(event: Any) -> TraceRecord | None:
     if event_type == "final" and event_data.get("status") == "incomplete":
         status = "warning"
     result = event_data.get("result")
-    if (
-        event_type == "tool_result"
-        and isinstance(result, dict)
-        and result.get("ok") is False
-    ):
-        status = "error"
+    if event_type == "tool_result":
+        status = _tool_result_status(result)
     duration_ms = getattr(event, "duration_ms", None)
     correlation_id = event_data.get("id")
     context = TraceContext(
@@ -456,6 +452,23 @@ def _agent_event_category(event_type: str) -> str:
     if event_type == "recovery":
         return "recovery"
     return "agent"
+
+
+def _tool_result_status(result: Any) -> str:
+    if not isinstance(result, dict):
+        return "ok"
+    if result.get("ok") is False:
+        return "error"
+    payload = result.get("result")
+    if not isinstance(payload, dict):
+        return "ok"
+    if payload.get("status") in {"failed", "timed_out"}:
+        return "error"
+    if payload.get("outcome") in {"failed", "error", "timed_out"}:
+        return "error"
+    if payload.get("outcome") in {"issues_found", "no_tests"}:
+        return "warning"
+    return "ok"
 
 
 def _sanitize_value(value: Any, *, max_chars: int, depth: int = 0) -> Any:

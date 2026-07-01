@@ -32,7 +32,12 @@ CONFIRM_COMMAND_FRAGMENTS = (
     "uv remove",
 )
 
-PATH_ARGUMENT_TOOLS = {"read_file", "write_file", "edit_file"}
+PATH_ARGUMENT_TOOLS = {
+    "read_file",
+    "write_file",
+    "edit_file",
+    "search_text",
+}
 MUTATING_FILE_TOOLS = {"write_file", "edit_file"}
 
 

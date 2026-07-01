@@ -1,9 +1,16 @@
+import difflib
 import glob as glob_lib
+import hashlib
+import json
+import os
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
+from uuid import uuid4
 
+from llm_agent.command_runner import command_artifact_dir, run_command
 from llm_agent.tool_registry import ToolDefinition, ToolRegistry
 
 if TYPE_CHECKING:
@@ -15,6 +22,7 @@ class BasicTools:
     workdir: Path
     bash_timeout: float = 120.0
     output_limit: int = 50_000
+    max_read_lines: int = 2_000
     background_manager: "BackgroundJobManager | None" = None
 
     def __post_init__(self) -> None:
@@ -33,7 +41,9 @@ class BasicTools:
         task_id: str | None = None,
         *,
         context: Any = None,
-    ) -> str | dict[str, Any]:
+    ) -> dict[str, Any]:
+        if not command.strip():
+            raise ValueError("Command is required.")
         dangerous_fragments = [
             "rm -rf /",
             "sudo",
@@ -65,48 +75,178 @@ class BasicTools:
                 "stderr_path": job.stderr_path,
             }
 
+        return run_command(
+            command,
+            cwd=self.workdir,
+            artifact_dir=command_artifact_dir(
+                self.workdir,
+                context=context,
+                tool_name="bash",
+            ),
+            timeout_seconds=self.bash_timeout,
+            preview_chars=self.output_limit,
+            shell=True,
+        )
+
+    def read_file(
+        self,
+        path: str,
+        start_line: int = 1,
+        limit: int = 400,
+    ) -> dict[str, Any]:
+        if start_line <= 0:
+            raise ValueError("start_line must be greater than zero.")
+        if limit <= 0:
+            raise ValueError("limit must be greater than zero.")
+        file_path = self.safe_path(path)
+        raw = file_path.read_bytes()
+        lines = raw.decode("utf-8", errors="replace").splitlines()
+        if start_line > len(lines) + 1:
+            raise ValueError(
+                f"start_line {start_line} exceeds file length {len(lines)}."
+            )
+
+        resolved_limit = min(limit, self.max_read_lines)
+        selected = lines[start_line - 1 : start_line - 1 + resolved_limit]
+        end_line = start_line + len(selected) - 1 if selected else start_line - 1
+        return {
+            "path": path,
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "start_line": start_line,
+            "end_line": end_line,
+            "total_lines": len(lines),
+            "content": "\n".join(selected),
+            "truncated": end_line < len(lines),
+        }
+
+    def write_file(
+        self,
+        path: str,
+        content: str,
+        expected_sha256: str | None = None,
+    ) -> dict[str, Any]:
+        file_path = self.safe_path(path)
+        before_sha256 = _file_sha256(file_path) if file_path.exists() else None
+        if expected_sha256 is not None and before_sha256 != expected_sha256:
+            raise ValueError(
+                f"File changed since it was read: {path} "
+                f"(expected {expected_sha256}, found {before_sha256})."
+            )
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(file_path, content)
+        return {
+            "path": path,
+            "bytes_written": len(content.encode("utf-8")),
+            "before_sha256": before_sha256,
+            "after_sha256": _file_sha256(file_path),
+        }
+
+    def edit_file(
+        self,
+        path: str,
+        old_text: str,
+        new_text: str,
+        expected_sha256: str | None = None,
+    ) -> dict[str, Any]:
+        if not old_text:
+            raise ValueError("old_text cannot be empty.")
+        file_path = self.safe_path(path)
+        before_sha256 = _file_sha256(file_path)
+        if expected_sha256 is not None and before_sha256 != expected_sha256:
+            raise ValueError(
+                f"File changed since it was read: {path} "
+                f"(expected {expected_sha256}, found {before_sha256})."
+            )
+
+        text = file_path.read_text(encoding="utf-8")
+        occurrences = text.count(old_text)
+        if occurrences != 1:
+            raise ValueError(
+                f"Expected old_text exactly once in {path}, found {occurrences}."
+            )
+
+        updated = text.replace(old_text, new_text, 1)
+        if updated == text:
+            raise ValueError(f"Edit would not change {path}.")
+        _atomic_write_text(file_path, updated)
+        return {
+            "path": path,
+            "before_sha256": before_sha256,
+            "after_sha256": _file_sha256(file_path),
+            "diff": _diff_preview(path, text, updated),
+        }
+
+    def search_text(
+        self,
+        query: str,
+        path: str = ".",
+        globs: list[str] | None = None,
+        regex: bool = False,
+        max_results: int = 100,
+    ) -> dict[str, Any]:
+        if not query:
+            raise ValueError("Search query is required.")
+        if not 1 <= max_results <= 200:
+            raise ValueError("max_results must be between 1 and 200.")
+        search_path = self.safe_path(path)
+        if not search_path.exists():
+            raise ValueError(f"Search path does not exist: {path}")
+
+        command = ["rg", "--json", "--line-number", "--column", "--color", "never"]
+        if not regex:
+            command.append("--fixed-strings")
+        for pattern in globs or []:
+            command.extend(["--glob", pattern])
+        command.extend(["--", query, str(search_path)])
+
         try:
             result = subprocess.run(
                 command,
-                shell=True,
                 cwd=self.workdir,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=self.bash_timeout,
+                timeout=30,
             )
+        except FileNotFoundError as exc:
+            raise RuntimeError("rg is required for search_text.") from exc
         except subprocess.TimeoutExpired as exc:
-            raise TimeoutError(f"Command timed out after {self.bash_timeout:g}s") from exc
-        except (FileNotFoundError, OSError) as exc:
-            raise RuntimeError(str(exc)) from exc
+            raise TimeoutError("search_text timed out after 30 seconds.") from exc
+        if result.returncode not in {0, 1}:
+            raise RuntimeError(result.stderr.strip() or "rg search failed.")
 
-        output = (result.stdout + result.stderr).strip()
-        if not output:
-            return "(no output)"
-        return output[: self.output_limit]
-
-    def read_file(self, path: str, limit: int | None = None) -> str:
-        file_path = self.safe_path(path)
-        lines = file_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        if limit is not None and limit > 0 and limit < len(lines):
-            lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
-        return "\n".join(lines)
-
-    def write_file(self, path: str, content: str) -> str:
-        file_path = self.safe_path(path)
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(content, encoding="utf-8")
-        return f"Wrote {len(content)} bytes to {path}"
-
-    def edit_file(self, path: str, old_text: str, new_text: str) -> str:
-        file_path = self.safe_path(path)
-        text = file_path.read_text(encoding="utf-8", errors="replace")
-        if old_text not in text:
-            raise ValueError(f"Text not found in {path}")
-
-        file_path.write_text(text.replace(old_text, new_text, 1), encoding="utf-8")
-        return f"Edited {path}"
+        matches = []
+        for line in result.stdout.splitlines():
+            event = json.loads(line)
+            if event.get("type") != "match":
+                continue
+            data = event["data"]
+            submatches = data.get("submatches") or []
+            column = int(submatches[0]["start"]) + 1 if submatches else 1
+            raw_path = Path(data["path"]["text"])
+            match_path = (
+                raw_path.resolve()
+                if raw_path.is_absolute()
+                else (self.workdir / raw_path).resolve()
+            )
+            matches.append(
+                {
+                    "path": str(match_path.relative_to(self.workdir)),
+                    "line": int(data["line_number"]),
+                    "column": column,
+                    "text": str(data["lines"]["text"]).rstrip("\r\n"),
+                }
+            )
+            if len(matches) >= max_results:
+                break
+        return {
+            "query": query,
+            "path": path,
+            "matches": matches,
+            "count": len(matches),
+            "truncated": len(matches) >= max_results,
+        }
 
     def glob(self, pattern: str) -> str:
         matches: list[str] = []
@@ -151,8 +291,7 @@ def basic_tool_definitions(
                 "task_id": {
                     "type": "string",
                     "description": (
-                        "Optional planning task id to associate with a "
-                        "background job."
+                        "Optional planning task id to associate with a background job."
                     ),
                 },
             }
@@ -172,7 +311,10 @@ def basic_tool_definitions(
         ),
         ToolDefinition(
             name="read_file",
-            description="Read a UTF-8 text file from the workspace.",
+            description=(
+                "Read a bounded line range from a UTF-8 workspace file and "
+                "return its SHA256 for safe edits."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -182,7 +324,14 @@ def basic_tool_definitions(
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Optional maximum number of lines to return.",
+                        "minimum": 1,
+                        "maximum": tools.max_read_lines,
+                        "description": "Maximum number of lines to return.",
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "One-based first line to read.",
                     },
                 },
                 "required": ["path"],
@@ -202,6 +351,13 @@ def basic_tool_definitions(
                     "content": {
                         "type": "string",
                         "description": "Content to write.",
+                    },
+                    "expected_sha256": {
+                        "type": "string",
+                        "description": (
+                            "Optional SHA256 from read_file. The write is "
+                            "rejected if the file changed."
+                        ),
                     },
                 },
                 "required": ["path", "content"],
@@ -226,10 +382,54 @@ def basic_tool_definitions(
                         "type": "string",
                         "description": "Replacement text.",
                     },
+                    "expected_sha256": {
+                        "type": "string",
+                        "description": (
+                            "Optional SHA256 from read_file. The edit is "
+                            "rejected if the file changed."
+                        ),
+                    },
                 },
                 "required": ["path", "old_text", "new_text"],
             },
             func=tools.edit_file,
+        ),
+        ToolDefinition(
+            name="search_text",
+            description=(
+                "Search workspace text with ripgrep and return bounded, "
+                "structured matches."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Text or regular expression to search.",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative search root.",
+                    },
+                    "globs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional ripgrep glob filters.",
+                    },
+                    "regex": {
+                        "type": "boolean",
+                        "description": "Interpret query as a regular expression.",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 200,
+                        "description": "Maximum number of matches.",
+                    },
+                },
+                "required": ["query"],
+            },
+            func=tools.search_text,
         ),
         ToolDefinition(
             name="glob",
@@ -261,3 +461,39 @@ def register_tools(
             background_manager=background_manager,
         )
     )
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid4().hex[:8]}.tmp")
+    mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else None
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        if mode is not None:
+            os.chmod(temporary, mode)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _diff_preview(
+    path: str,
+    before: str,
+    after: str,
+    *,
+    limit: int = 12_000,
+) -> str:
+    diff = "".join(
+        difflib.unified_diff(
+            before.splitlines(keepends=True),
+            after.splitlines(keepends=True),
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
+        )
+    )
+    if len(diff) <= limit:
+        return diff
+    return f"{diff[:limit]}\n... (diff truncated)"
