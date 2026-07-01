@@ -168,6 +168,7 @@
 
 - 同步执行，父 Agent 等待子 Agent 完成后继续。
 - 暂不支持后台执行、并行子 Agent、取消和恢复。
+- `general` Subagent 可显式使用 Git Worktree 隔离修改。
 - 子 Agent 不直接 claim/complete 父 Task；父 Agent 负责验收并更新 Task。
 - 总运行预算目前由 `max_steps`、LLM timeout 和工具 timeout 共同约束。
 
@@ -303,6 +304,34 @@
 - CLI 空闲等待输入时不异步刷新终端；通知在下一次 Agent run 或管理工具调用时
   展示。
 - 崩溃后保留日志和元数据，但 MVP 不尝试重新连接旧 PID。
+
+### 2.14 Worktree Isolation
+
+- [x] 实现 `WorktreeInfo / WorktreeManager`
+- [x] Git Worktree、分支和 base commit 使用系统生成标识
+- [x] 主工作区不干净时拒绝创建，避免遗漏未提交修改
+- [x] `subagent_run` 支持 `isolation=shared/worktree`
+- [x] Worktree 隔离仅允许 `general` 修改模式
+- [x] 子 Agent 的工具、权限、Context、测试和 Lint 自动切换工作目录
+- [x] 无修改 Worktree 自动清理
+- [x] 有修改 Worktree 保留并返回文件列表、Diff 预览和完整 Patch
+- [x] 实现 `worktree_list / worktree_diff / worktree_apply / worktree_remove`
+- [x] Apply 前校验 base commit 和 `git apply --check`
+- [x] 普通 Remove 拒绝删除未应用修改
+- [x] Apply 和强制丢弃接入 PermissionHook
+- [x] Worktree 生命周期接入 Trace
+- [x] 元数据记录 `task_id / agent_id / run_id`
+- [x] 使用 `RLock` 保护生命周期操作
+- [x] 实现轻量 `reconcile()` 标记目录或 Git 注册信息丢失
+- [x] 覆盖创建、隔离修改、Apply、过期 HEAD、清理和对账测试
+
+当前边界：
+
+- 仍然是同步 Subagent，Worktree 先解决目录隔离和审查，不提供并行执行。
+- 不自动 Commit、Merge、Rebase、Push 或解决冲突。
+- MVP 要求主工作区干净，不实现 Dirty Workspace Snapshot。
+- Worktree 是文件修改隔离，不是容器或恶意代码安全边界。
+- Worktree 与 Task 保持独立，只通过元数据关联，不自动改变 Task 状态。
 
 ## 3. 接下来优先补全的单 Agent Harness 能力
 
@@ -608,6 +637,7 @@ pytest / ruff / build / API test / UI test
 - [x] 同步 Subagent MVP 已接入
 - [x] Error Recovery 已接入
 - [x] Managed Background Jobs 已接入
+- [x] Worktree Isolation 已接入
 - [x] 基础测试已覆盖
 
 ### Milestone 1：可观测单 Agent Harness

@@ -28,6 +28,7 @@ from llm_agent.trace_system import (
     summarize_text,
     trace_scope,
 )
+from llm_agent.worktree import WorktreeManager
 
 
 def build_agent() -> Agent:
@@ -50,6 +51,7 @@ def build_agent() -> Agent:
     approval_provider = CliApprovalProvider()
     skill_registry = SkillRegistry.for_workdir(workdir)
     memory_manager = MemoryManager.for_workdir(workdir, llm=llm)
+    worktree_manager = WorktreeManager.for_workdir(workdir)
     background_jobs = BackgroundJobManager.for_workdir(
         workdir,
         max_concurrent=int(os.getenv("BACKGROUND_MAX_CONCURRENT", "4")),
@@ -62,6 +64,7 @@ def build_agent() -> Agent:
         workdir=workdir,
         skill_registry=skill_registry,
         memory_manager=memory_manager,
+        worktree_manager=worktree_manager,
         approval_provider=approval_provider,
     )
     registry = build_default_registry(
@@ -70,6 +73,7 @@ def build_agent() -> Agent:
         skill_registry=skill_registry,
         memory_manager=memory_manager,
         background_manager=background_jobs,
+        worktree_manager=worktree_manager,
     )
     return Agent(
         llm=llm,

@@ -110,6 +110,23 @@ class PermissionHook:
                 f"memory_forget permanently deletes memory: {memory_id}",
             )
 
+        if tool_call.name == "worktree_apply":
+            worktree_id = str(arguments.get("worktree_id", ""))
+            return self._ask_for_approval(
+                tool_call,
+                f"worktree_apply modifies the main workspace: {worktree_id}",
+            )
+
+        if (
+            tool_call.name == "worktree_remove"
+            and arguments.get("discard_changes") is True
+        ):
+            worktree_id = str(arguments.get("worktree_id", ""))
+            return self._ask_for_approval(
+                tool_call,
+                f"worktree_remove will discard isolated changes: {worktree_id}",
+            )
+
         return None
 
     def _workdir(self, context: HookContext) -> Path:

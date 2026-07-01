@@ -16,6 +16,8 @@ class SubagentTools:
         task: str,
         expected_output: str = "",
         mode: str = "general",
+        isolation: str = "shared",
+        task_id: str | None = None,
         *,
         context: ToolExecutionContext,
     ) -> dict:
@@ -23,6 +25,8 @@ class SubagentTools:
             task=task,
             expected_output=expected_output,
             mode=mode,
+            isolation=isolation,
+            task_id=task_id,
         )
         return self.runner.run(request, parent_context=context).to_dict()
 
@@ -62,6 +66,21 @@ def subagent_tool_definitions(
                         "description": (
                             "explore omits file mutation tools; general permits them "
                             "subject to normal permission hooks."
+                        ),
+                    },
+                    "isolation": {
+                        "type": "string",
+                        "enum": ["shared", "worktree"],
+                        "description": (
+                            "Use worktree for isolated general-mode edits. The "
+                            "main Git workspace must be clean."
+                        ),
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": (
+                            "Optional planning task id to associate with the "
+                            "isolated worktree."
                         ),
                     },
                 },

@@ -3,6 +3,7 @@
 一个支持 OpenAI / Anthropic 官方 SDK、tool calling、权限 Hook、持久化
 Task System、长期 Memory、同步 Subagent、按需 Skill 加载和结构化 Trace 的
 Python Agent Harness，并提供可靠代码验证、有界错误恢复和托管后台进程。
+修改型 Subagent 可选择在独立 Git Worktree 中执行。
 
 ## 运行
 
@@ -65,12 +66,14 @@ from llm_agent.subagent import (
     SubagentRunner,
 )
 from llm_agent.tools import build_default_registry
+from llm_agent.worktree import WorktreeManager
 
 workdir = Path.cwd()
 llm = LLMClient(provider="anthropic")
 approval_provider = CliApprovalProvider()
 skill_registry = SkillRegistry.for_workdir(workdir)
 memory_manager = MemoryManager.for_workdir(workdir, llm=llm)
+worktree_manager = WorktreeManager.for_workdir(workdir)
 background_jobs = BackgroundJobManager.for_workdir(workdir)
 runner = SubagentRunner(
     llm=llm,
@@ -78,6 +81,7 @@ runner = SubagentRunner(
     max_steps=12,
     skill_registry=skill_registry,
     memory_manager=memory_manager,
+    worktree_manager=worktree_manager,
     approval_provider=approval_provider,
 )
 registry = build_default_registry(
@@ -86,6 +90,7 @@ registry = build_default_registry(
     skill_registry=skill_registry,
     memory_manager=memory_manager,
     background_manager=background_jobs,
+    worktree_manager=worktree_manager,
 )
 
 agent = Agent(
@@ -165,6 +170,49 @@ run_lint   -> Ruff JSON diagnostics
 两者当前同步执行，使用固定参数数组而不是模型拼接的 Shell 命令。测试失败或
 发现 Lint 问题会返回 `outcome=failed/issues_found`，不会触发工具异常，也不会
 自动修改文件。长时间完整测试仍可使用后台 Bash。
+
+## Worktree Isolation
+
+修改型 Subagent 可以显式请求隔离工作区：
+
+```json
+{
+  "task": "修改 app.py 并运行目标测试",
+  "mode": "general",
+  "isolation": "worktree",
+  "task_id": "task_0001"
+}
+```
+
+系统基于当前 `HEAD` 创建临时分支和 Git Worktree，子 Agent 的文件、命令、
+权限检查、Context、测试和 Lint 都绑定到隔离目录。主工作区在执行期间保持
+不变。
+
+有修改时，`subagent_run` 返回：
+
+```text
+worktree id / branch / base commit
+changed_files
+diff preview
+diff_path
+```
+
+父 Agent 使用以下工具处理结果：
+
+```text
+worktree_list
+worktree_diff
+worktree_apply
+worktree_remove
+```
+
+`worktree_apply` 会检查主工作区 `HEAD` 仍等于创建时的 base commit，再通过
+`git apply --check` 验证完整 Patch，确认后才应用到主工作区。Apply 和强制
+丢弃修改都需要权限确认；有未应用修改时普通 Remove 会被拒绝。没有产生修改
+的 Worktree 会在 Subagent 结束后自动清理。
+
+MVP 要求创建时主 Git 工作区干净，不自动 Stash、Commit、Merge 或解决冲突。
+Worktree 只提供代码目录隔离，不是运行不可信代码的安全沙箱。
 
 ## Background Jobs
 

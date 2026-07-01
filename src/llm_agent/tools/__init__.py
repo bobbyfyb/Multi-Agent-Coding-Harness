@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from llm_agent.memory_system import MemoryManager
     from llm_agent.skill_system import SkillRegistry
     from llm_agent.subagent import SubagentRunner
+    from llm_agent.worktree import WorktreeManager
 
 
 def register_subagent_tools(
@@ -40,6 +41,16 @@ def register_background_tools(
     register_tools(registry, manager=manager)
 
 
+def register_worktree_tools(
+    registry: ToolRegistry,
+    *,
+    manager: "WorktreeManager",
+) -> None:
+    from llm_agent.tools.worktree_tools import register_tools
+
+    register_tools(registry, manager=manager)
+
+
 def register_default_tools(
     registry: ToolRegistry,
     *,
@@ -48,6 +59,7 @@ def register_default_tools(
     skill_registry: "SkillRegistry | None" = None,
     memory_manager: "MemoryManager | None" = None,
     background_manager: "BackgroundJobManager | None" = None,
+    worktree_manager: "WorktreeManager | None" = None,
 ) -> None:
     register_basic_tools(
         registry,
@@ -56,6 +68,8 @@ def register_default_tools(
     )
     if background_manager is not None:
         register_background_tools(registry, manager=background_manager)
+    if worktree_manager is not None:
+        register_worktree_tools(registry, manager=worktree_manager)
     register_search_tools(registry, workdir=workdir)
     register_verification_tools(registry, workdir=workdir)
     register_task_tools(registry, workdir=workdir)
@@ -77,6 +91,7 @@ def build_default_registry(
     skill_registry: "SkillRegistry | None" = None,
     memory_manager: "MemoryManager | None" = None,
     background_manager: "BackgroundJobManager | None" = None,
+    worktree_manager: "WorktreeManager | None" = None,
 ) -> ToolRegistry:
     registry = ToolRegistry()
     register_default_tools(
@@ -86,6 +101,7 @@ def build_default_registry(
         skill_registry=skill_registry,
         memory_manager=memory_manager,
         background_manager=background_manager,
+        worktree_manager=worktree_manager,
     )
     return registry
 
@@ -100,5 +116,6 @@ __all__ = [
     "register_subagent_tools",
     "register_task_tools",
     "register_verification_tools",
+    "register_worktree_tools",
     "register_default_tools",
 ]

@@ -127,6 +127,39 @@ def test_permission_hook_confirms_memory_deletion(tmp_path: Path) -> None:
     assert "permanently deletes memory" in str(result.reason)
 
 
+def test_permission_hook_confirms_worktree_apply_and_discard(
+    tmp_path: Path,
+) -> None:
+    hook = PermissionHook(
+        workdir=tmp_path,
+        approval_provider=AutoApprovalProvider(approved=False),
+    )
+    context = HookContext(messages=[], workdir=tmp_path)
+
+    apply_result = hook(
+        LLMToolCall(
+            id="call-apply",
+            name="worktree_apply",
+            arguments={"worktree_id": "wt_123456789abc"},
+        ),
+        context,
+    )
+    remove_result = hook(
+        LLMToolCall(
+            id="call-remove",
+            name="worktree_remove",
+            arguments={
+                "worktree_id": "wt_123456789abc",
+                "discard_changes": True,
+            },
+        ),
+        context,
+    )
+
+    assert apply_result is not None and apply_result.denied
+    assert remove_result is not None and remove_result.denied
+
+
 def test_hook_manager_merges_runtime_messages() -> None:
     manager = HookManager()
     manager.register_hook(
