@@ -126,14 +126,12 @@ def test_parent_agent_runs_synchronous_subagent_with_fresh_context(
 
     child_tool_names = {tool["name"] for tool in llm.tools[1]}
     assert child_tool_names == {
-        "bash",
         "read_file",
         "glob",
         "search_text",
         "search",
-        "run_tests",
-        "run_lint",
     }
+    assert not {"bash", "run_tests", "run_lint"} & child_tool_names
     assert "write_file" not in child_tool_names
     assert "subagent_run" not in child_tool_names
     assert "task_create" not in child_tool_names

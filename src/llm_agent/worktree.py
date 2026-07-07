@@ -10,6 +10,7 @@ from threading import RLock
 from typing import Any, Literal
 from uuid import uuid4
 
+from llm_agent.security import safe_subprocess_env
 from llm_agent.trace_system import record_trace
 
 
@@ -445,6 +446,7 @@ class WorktreeManager:
                 encoding="utf-8",
                 errors="replace",
                 timeout=30,
+                env=safe_subprocess_env(cwd or self.workdir),
             )
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
             raise WorktreeError(f"Git command failed to start: {exc}") from exc

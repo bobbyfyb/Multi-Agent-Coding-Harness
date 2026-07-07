@@ -87,6 +87,27 @@ def test_background_job_records_nonzero_exit_as_failed(
         manager.shutdown()
 
 
+def test_background_job_does_not_expose_parent_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LLM_AGENT_TEST_SECRET", "review-marker")
+    manager = BackgroundJobManager.for_workdir(tmp_path)
+    try:
+        job = manager.start_shell(
+            _python_command(
+                "import os; print(os.getenv('LLM_AGENT_TEST_SECRET', 'missing'))"
+            )
+        )
+
+        completed = manager.wait(job.id, timeout_seconds=3)
+
+        assert completed.status == "completed"
+        assert manager.read_output(job.id)["stdout"].strip() == "missing"
+    finally:
+        manager.shutdown()
+
+
 def test_background_job_can_be_cancelled(tmp_path: Path) -> None:
     manager = BackgroundJobManager.for_workdir(
         tmp_path,

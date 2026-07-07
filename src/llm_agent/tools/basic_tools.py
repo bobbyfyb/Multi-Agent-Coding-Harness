@@ -11,6 +11,13 @@ from typing import Any, TYPE_CHECKING
 from uuid import uuid4
 
 from llm_agent.command_runner import command_artifact_dir, run_command
+from llm_agent.security import (
+    is_sensitive_workspace_path,
+    resolve_workspace_path,
+    safe_subprocess_env,
+    sensitive_glob_excludes,
+    validate_shell_command,
+)
 from llm_agent.tool_registry import ToolDefinition, ToolRegistry
 
 if TYPE_CHECKING:
@@ -29,10 +36,7 @@ class BasicTools:
         object.__setattr__(self, "workdir", self.workdir.resolve())
 
     def safe_path(self, path: str) -> Path:
-        candidate = (self.workdir / path).resolve()
-        if not candidate.is_relative_to(self.workdir):
-            raise ValueError(f"Path escapes workspace: {path}")
-        return candidate
+        return resolve_workspace_path(self.workdir, path)
 
     def bash(
         self,
@@ -42,18 +46,7 @@ class BasicTools:
         *,
         context: Any = None,
     ) -> dict[str, Any]:
-        if not command.strip():
-            raise ValueError("Command is required.")
-        dangerous_fragments = [
-            "rm -rf /",
-            "sudo",
-            "shutdown",
-            "reboot",
-            "> /dev/",
-            "mkfs",
-        ]
-        if any(fragment in command for fragment in dangerous_fragments):
-            raise ValueError("Dangerous command blocked")
+        validate_shell_command(command)
 
         if run_in_background:
             if self.background_manager is None:
@@ -197,6 +190,8 @@ class BasicTools:
             command.append("--fixed-strings")
         for pattern in globs or []:
             command.extend(["--glob", pattern])
+        for pattern in sensitive_glob_excludes():
+            command.extend(["--glob", pattern])
         command.extend(["--", query, str(search_path)])
 
         try:
@@ -208,6 +203,7 @@ class BasicTools:
                 encoding="utf-8",
                 errors="replace",
                 timeout=30,
+                env=safe_subprocess_env(self.workdir),
             )
         except FileNotFoundError as exc:
             raise RuntimeError("rg is required for search_text.") from exc
@@ -230,6 +226,8 @@ class BasicTools:
                 if raw_path.is_absolute()
                 else (self.workdir / raw_path).resolve()
             )
+            if is_sensitive_workspace_path(self.workdir, match_path):
+                continue
             matches.append(
                 {
                     "path": str(match_path.relative_to(self.workdir)),
@@ -258,6 +256,8 @@ class BasicTools:
                 else (self.workdir / match_path).resolve()
             )
             if candidate.is_relative_to(self.workdir):
+                if is_sensitive_workspace_path(self.workdir, candidate):
+                    continue
                 matches.append(str(candidate.relative_to(self.workdir)))
 
         return "\n".join(sorted(matches)) if matches else "(no matches)"

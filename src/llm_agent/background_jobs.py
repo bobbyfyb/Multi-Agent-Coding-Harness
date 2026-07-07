@@ -13,6 +13,7 @@ from time import perf_counter
 from typing import Any, Literal
 from uuid import uuid4
 
+from llm_agent.security import safe_subprocess_env, validate_shell_command
 from llm_agent.trace_system import (
     TraceContext,
     TraceRecorder,
@@ -308,8 +309,10 @@ class BackgroundJobManager:
         task_id: str | None = None,
     ) -> BackgroundJob:
         command = command.strip()
-        if not command:
-            raise BackgroundJobError("Background command is required.")
+        try:
+            validate_shell_command(command)
+        except ValueError as exc:
+            raise BackgroundJobError(str(exc)) from exc
 
         with self._lock:
             if self._closed:
@@ -349,6 +352,7 @@ class BackgroundJobManager:
                         command,
                         shell=True,
                         cwd=job.cwd,
+                        env=safe_subprocess_env(job.cwd),
                         stdin=subprocess.DEVNULL,
                         stdout=stdout_file,
                         stderr=stderr_file,

@@ -85,6 +85,24 @@ def test_permission_hook_denies_paths_outside_workspace(tmp_path: Path) -> None:
     assert result.reason == "Path escapes workspace: ../outside.txt"
 
 
+def test_permission_hook_denies_sensitive_paths(tmp_path: Path) -> None:
+    hook = PermissionHook(
+        workdir=tmp_path,
+        approval_provider=AutoApprovalProvider(approved=True),
+    )
+    tool_call = LLMToolCall(
+        id="call_1",
+        name="read_file",
+        arguments={"path": ".env"},
+    )
+
+    result = hook(tool_call, HookContext(messages=[], workdir=tmp_path))
+
+    assert result is not None
+    assert result.denied
+    assert result.reason == "Sensitive path is blocked: .env"
+
+
 def test_permission_hook_uses_approval_provider_for_file_mutations(
     tmp_path: Path,
 ) -> None:
@@ -109,6 +127,36 @@ def test_permission_hook_uses_approval_provider_for_file_mutations(
     assert denied is not None
     assert denied.denied
     assert "denied by user" in str(denied.reason)
+
+
+def test_permission_hook_confirms_execution_tools(tmp_path: Path) -> None:
+    hook = PermissionHook(
+        workdir=tmp_path,
+        approval_provider=AutoApprovalProvider(approved=False),
+    )
+    context = HookContext(messages=[], workdir=tmp_path)
+
+    bash_result = hook(
+        LLMToolCall(
+            id="call_bash",
+            name="bash",
+            arguments={"command": "printf ok"},
+        ),
+        context,
+    )
+    tests_result = hook(
+        LLMToolCall(
+            id="call_tests",
+            name="run_tests",
+            arguments={"targets": ["tests"]},
+        ),
+        context,
+    )
+
+    assert bash_result is not None and bash_result.denied
+    assert "bash executes a shell command" in str(bash_result.reason)
+    assert tests_result is not None and tests_result.denied
+    assert "executes project test code" in str(tests_result.reason)
 
 
 def test_permission_hook_confirms_memory_deletion(tmp_path: Path) -> None:

@@ -64,8 +64,9 @@ def subagent_tool_definitions(
                         "type": "string",
                         "enum": ["explore", "general"],
                         "description": (
-                            "explore omits file mutation tools; general permits them "
-                            "subject to normal permission hooks."
+                            "explore is read-only and only exposes file/search/skill "
+                            "inspection tools; general also permits execution and "
+                            "file mutation tools subject to normal permission hooks."
                         ),
                     },
                     "isolation": {

@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from llm_agent.memory_system import MemoryManager
 from llm_agent.skill_system import SkillRegistry
 from llm_agent.tool_registry import ToolRegistry
@@ -100,7 +102,68 @@ def test_basic_tools_blocks_dangerous_bash(tmp_path: Path) -> None:
     result = registry.call("bash", {"command": "sudo echo no"})
 
     assert result["ok"] is False
-    assert "Dangerous command blocked" in result["error"]
+    assert "blocked fragment" in result["error"]
+
+
+def test_basic_tools_do_not_expose_parent_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LLM_AGENT_TEST_SECRET", "review-marker")
+    registry = ToolRegistry()
+    register_tools(registry, workdir=tmp_path)
+
+    result = registry.call(
+        "bash",
+        {"command": "printf '%s' \"$LLM_AGENT_TEST_SECRET\""},
+    )
+
+    assert result["ok"] is True
+    assert result["result"]["stdout"] == ""
+
+
+def test_basic_tools_block_sensitive_paths(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / ".env").write_text("SECRET=1\n", encoding="utf-8")
+    (tmp_path / "config.env").write_text("SECRET=2\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("SECRET=visible\n", encoding="utf-8")
+    registry = ToolRegistry()
+    register_tools(registry, workdir=tmp_path)
+
+    read_result = registry.call("read_file", {"path": "src/.env"})
+    write_result = registry.call(
+        "write_file",
+        {"path": "config.env", "content": "SECRET=3\n"},
+    )
+    exact_search_result = registry.call(
+        "search_text",
+        {"query": "SECRET", "path": "config.env"},
+    )
+    broad_search_result = registry.call("search_text", {"query": "SECRET"})
+    explicit_env_glob_result = registry.call(
+        "search_text",
+        {"query": "SECRET", "globs": ["*.env"]},
+    )
+    glob_result = registry.call("glob", {"pattern": "**/*.env"})
+
+    assert read_result["ok"] is False
+    assert "Sensitive path is blocked" in read_result["error"]
+    assert write_result["ok"] is False
+    assert "Sensitive path is blocked" in write_result["error"]
+    assert exact_search_result["ok"] is False
+    assert "Sensitive path is blocked" in exact_search_result["error"]
+    assert broad_search_result["ok"] is True
+    assert broad_search_result["result"]["matches"] == [
+        {
+            "path": "app.py",
+            "line": 1,
+            "column": 1,
+            "text": "SECRET=visible",
+        }
+    ]
+    assert explicit_env_glob_result["ok"] is True
+    assert explicit_env_glob_result["result"]["matches"] == []
+    assert glob_result == {"ok": True, "result": "(no matches)"}
 
 
 def test_edit_file_rejects_ambiguous_or_stale_content(tmp_path: Path) -> None:

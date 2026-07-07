@@ -8,6 +8,7 @@ from typing import Any
 import xml.etree.ElementTree as ET
 
 from llm_agent.command_runner import command_artifact_dir, run_command
+from llm_agent.security import resolve_workspace_path
 from llm_agent.tool_registry import ToolDefinition, ToolRegistry
 
 
@@ -215,9 +216,7 @@ def _validate_targets(workdir: Path, targets: list[str]) -> None:
         if not target or target.startswith("-"):
             raise ValueError(f"Invalid target: {target!r}")
         path_text = target.split("::", 1)[0]
-        candidate = (workdir / path_text).resolve()
-        if not candidate.is_relative_to(workdir):
-            raise ValueError(f"Path escapes workspace: {target}")
+        candidate = resolve_workspace_path(workdir, path_text)
         if not candidate.exists():
             raise ValueError(f"Target does not exist: {target}")
 

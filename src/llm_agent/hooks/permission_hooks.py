@@ -6,31 +6,7 @@ from typing import Any, Callable, Protocol
 
 from llm_agent.hooks import HookContext, HookResult
 from llm_agent.llm_client import LLMToolCall
-
-
-HARD_DENY_COMMAND_FRAGMENTS = (
-    "rm -rf /",
-    "sudo",
-    "shutdown",
-    "reboot",
-    "mkfs",
-    "dd if=",
-    "> /dev/sda",
-)
-
-CONFIRM_COMMAND_FRAGMENTS = (
-    "rm ",
-    "rm\t",
-    "chmod ",
-    "chown ",
-    "> /etc/",
-    ">> /etc/",
-    "git push",
-    "git reset",
-    "pip install",
-    "uv add",
-    "uv remove",
-)
+from llm_agent.security import resolve_workspace_path, validate_shell_command
 
 PATH_ARGUMENT_TOOLS = {
     "read_file",
@@ -39,6 +15,10 @@ PATH_ARGUMENT_TOOLS = {
     "search_text",
 }
 MUTATING_FILE_TOOLS = {"write_file", "edit_file"}
+EXECUTION_TOOL_REASONS = {
+    "run_tests": "run_tests executes project test code",
+    "run_lint": "run_lint executes project lint tooling",
+}
 
 
 @dataclass(frozen=True)
@@ -81,7 +61,9 @@ class PermissionHook:
         default_factory=CliApprovalProvider
     )
     confirm_file_mutations: bool = True
-    confirm_destructive_bash: bool = True
+    confirm_shell_commands: bool = True
+    # Backwards-compatible alias for older callers.
+    confirm_destructive_bash: bool | None = None
 
     def __call__(
         self,
@@ -97,6 +79,12 @@ class PermissionHook:
 
         if tool_call.name == "bash":
             return self._check_bash(tool_call, arguments)
+
+        if tool_call.name in EXECUTION_TOOL_REASONS:
+            return self._ask_for_approval(
+                tool_call,
+                EXECUTION_TOOL_REASONS[tool_call.name],
+            )
 
         if tool_call.name in MUTATING_FILE_TOOLS and self.confirm_file_mutations:
             path = str(arguments.get("path", ""))
@@ -146,9 +134,10 @@ class PermissionHook:
         if not isinstance(path, str):
             return None
 
-        candidate = (workdir / path).resolve()
-        if not candidate.is_relative_to(workdir):
-            return f"Path escapes workspace: {path}"
+        try:
+            resolve_workspace_path(workdir, path)
+        except ValueError as exc:
+            return str(exc)
         return None
 
     def _check_bash(
@@ -157,22 +146,21 @@ class PermissionHook:
         arguments: dict[str, Any],
     ) -> HookResult | None:
         command = str(arguments.get("command", ""))
-        for fragment in HARD_DENY_COMMAND_FRAGMENTS:
-            if fragment in command:
-                return HookResult.deny(
-                    f"bash command contains blocked fragment: {fragment}"
-                )
+        try:
+            validate_shell_command(command)
+        except ValueError as exc:
+            return HookResult.deny(str(exc))
 
-        if not self.confirm_destructive_bash:
+        confirm_shell = self.confirm_shell_commands
+        if self.confirm_destructive_bash is not None:
+            confirm_shell = self.confirm_destructive_bash
+        if not confirm_shell:
             return None
 
-        for fragment in CONFIRM_COMMAND_FRAGMENTS:
-            if fragment in command:
-                return self._ask_for_approval(
-                    tool_call,
-                    f"bash command may be destructive: {fragment}",
-                )
-        return None
+        reason = "bash executes a shell command"
+        if arguments.get("run_in_background") is True:
+            reason = "bash starts a background shell command"
+        return self._ask_for_approval(tool_call, reason)
 
     def _ask_for_approval(
         self,

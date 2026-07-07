@@ -10,6 +10,8 @@ from time import perf_counter
 from typing import Any, Sequence
 from uuid import uuid4
 
+from llm_agent.security import safe_subprocess_env, validate_shell_command
+
 
 def command_artifact_dir(
     workdir: Path,
@@ -42,6 +44,10 @@ def run_command(
         raise ValueError("timeout_seconds must be greater than zero.")
     if preview_chars <= 0:
         raise ValueError("preview_chars must be greater than zero.")
+    if shell:
+        if not isinstance(command, str):
+            raise ValueError("shell=True requires command to be a string.")
+        validate_shell_command(command)
 
     artifact_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = artifact_dir / "stdout.log"
@@ -57,6 +63,7 @@ def run_command(
                 command,
                 shell=shell,
                 cwd=cwd,
+                env=safe_subprocess_env(cwd),
                 stdin=subprocess.DEVNULL,
                 stdout=stdout_file,
                 stderr=stderr_file,

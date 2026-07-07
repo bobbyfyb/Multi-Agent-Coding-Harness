@@ -67,13 +67,10 @@ SUBAGENT_SKILL_TOOLS = {"skill_load", "skill_read_resource"}
 
 SUBAGENT_TOOL_PROFILES: dict[SubagentMode, set[str]] = {
     "explore": {
-        "bash",
         "read_file",
         "glob",
         "search_text",
         "search",
-        "run_tests",
-        "run_lint",
         *SUBAGENT_SKILL_TOOLS,
     },
     "general": {
@@ -300,6 +297,12 @@ class SubagentRunner:
                 content=(
                     f"Mode: {mode}. Available tool profile: "
                     f"{', '.join(sorted(self._available_tool_names(mode)))}."
+                    + (
+                        " Explore mode is read-only and cannot execute shell, "
+                        "test, lint, or file mutation tools."
+                        if mode == "explore"
+                        else ""
+                    )
                 ),
                 priority=30,
             ),

@@ -103,3 +103,18 @@ def test_command_runner_returns_timeout_as_structured_result(
     assert result["status"] == "timed_out"
     assert result["timed_out"] is True
     assert result["exit_code"] != 0
+
+
+def test_verification_tools_reject_sensitive_targets(tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text("SECRET=1\n", encoding="utf-8")
+    registry = ToolRegistry()
+    register_tools(registry, workdir=tmp_path)
+
+    result = registry.call(
+        "run_lint",
+        {"paths": [".env"]},
+        context=_context(tmp_path, "call-lint-sensitive"),
+    )
+
+    assert result["ok"] is False
+    assert "Sensitive path is blocked" in result["error"]
