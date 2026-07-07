@@ -12,6 +12,7 @@ from llm_agent.task_system import OPEN_TASK_STATUSES, TaskManager
 INTERNAL_USER_MESSAGE_PREFIXES = (
     "<current_tasks>",
     "<task_reminder>",
+    "<relevant_artifacts>",
     "<relevant_memories>",
     "<conversation_summary",
     "<context_compacted",

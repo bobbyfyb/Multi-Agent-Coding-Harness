@@ -347,6 +347,34 @@
 当前只增强交互式 CLI，不改变 Agent 的字符串输入接口。后续 Textual TUI 或
 Web UI 可以继续复用同一个 Agent、Hook 和 Event 边界。
 
+### 2.16 Artifact System MVP
+
+- [x] 实现 `Artifact / ArtifactStore / ArtifactManager`
+- [x] 使用 `.llm_agent/artifacts/<collection_id>/` 持久化结构化工作产物
+- [x] 使用 `.highwatermark` 递增生成稳定 `artifact_0001` ID
+- [x] 支持 `prd / task_spec / implementation_report / test_report /
+  acceptance_report / note` 类型
+- [x] 支持 `draft / ready / accepted / superseded / archived` 状态
+- [x] 支持 `task_id / owner / metadata` 关联任务、角色和额外上下文
+- [x] 支持 `version` 和 `expected_version` 乐观锁，避免旧版本覆盖
+- [x] 记录 artifact 创建和更新 history
+- [x] 实现 `artifact_create / artifact_update / artifact_get / artifact_list`
+- [x] 将 artifact 工具接入默认 `ToolRegistry`
+- [x] 实现 `ArtifactContextHook`，在 `BeforeLLM` 阶段注入相关 artifact
+- [x] 优先注入当前 open task 相关 artifact，其次注入 PRD/TaskSpec 等基础产物
+- [x] Runtime context 使用 `<relevant_artifacts>`，不写入 canonical history
+- [x] Artifact 创建和更新接入 `TraceRecorder`
+- [x] 在 system prompt 中加入 Artifact 使用策略
+- [x] 覆盖持久化、工具、上下文注入、版本冲突和 Trace 测试
+
+当前边界：
+
+- MVP 使用统一 Markdown `content`，尚未为每种 artifact 建立强 schema。
+- Artifact 是多 agent 通讯协议和交接产物，Task 仍然负责工作状态流转。
+- 当前只做 create/update/get/list，不提供 delete；归档通过 `status=archived` 表达。
+- 暂未实现 artifact diff、依赖图、文件锁和自动 LLM 总结。
+- Subagent 暂不直接获得 artifact 工具，后续 PM/Engineer/QA 编排时再按角色分配。
+
 ## 3. 接下来优先补全的单 Agent Harness 能力
 
 ### 3.1 Trace / Observability
@@ -487,23 +515,24 @@ MCP tools -> ToolRegistry -> Agent loop 不变
 
 核心 Artifact：
 
+- [x] `PRD`
+- [x] `TaskSpec`
+- [x] `ImplementationReport`
+- [x] `TestReport`
+- [x] `AcceptanceReport`
+- [x] `Note`
 - [ ] `Requirement`
-- [ ] `PRD`
-- [ ] `TaskSpec`
 - [ ] `ImplementationPlan`
-- [ ] `WorkReport`
 - [ ] `TestPlan`
 - [ ] `TestCase`
-- [ ] `TestReport`
 - [ ] `DefectReport`
-- [ ] `AcceptanceReport`
 
 推荐数据格式：
 
-- 初期使用 Pydantic model。
-- 存储为 JSON / Markdown。
-- 每个 artifact 有 id、status、owner、created_at、updated_at。
-- Task System 已经提供了任务级持久化状态，Artifact store 后续可以复用相同的持久化和 ID 思路。
+- MVP 使用 dataclass model + JSON 存储，`content` 使用 Markdown 文本。
+- 每个 artifact 有 id、kind、status、owner、task_id、version、created_at、updated_at。
+- 使用 `expected_version` 进行乐观锁更新。
+- 后续再为 PRD、TaskSpec、TestReport 等引入更严格的 Pydantic schema。
 
 Artifact 流转：
 
@@ -521,6 +550,9 @@ User Requirement
 
 第一版最小闭环：
 
+- [x] Artifact store / manager / tools
+- [x] Artifact runtime context 注入
+- [x] Artifact Trace 记录
 - [ ] PM 生成 PRD
 - [ ] PM 生成 TaskSpec
 - [ ] Engineer 根据 TaskSpec 修改代码
@@ -695,17 +727,20 @@ pytest / ruff / build / API test / UI test
 
 ### Milestone 4：Artifact 工作流
 
-- [ ] PRD model
-- [ ] TaskSpec model
-- [ ] WorkReport model
-- [ ] TestReport model
-- [ ] AcceptanceReport model
-- [ ] Artifact store
+- [x] Artifact store
+- [x] Artifact tools
+- [x] Artifact runtime context hook
+- [x] Artifact trace events
+- [ ] PRD strong schema
+- [ ] TaskSpec strong schema
+- [ ] WorkReport strong schema
+- [ ] TestReport strong schema
+- [ ] AcceptanceReport strong schema
 
 验收标准：
 
-- 一个需求可以被转换为 PRD 和 TaskSpec。
-- 开发和测试过程都能沉淀为 artifact。
+- [x] 开发和测试过程可以沉淀为 artifact。
+- [ ] 一个需求可以由 PM Agent 自动转换为 PRD 和 TaskSpec。
 
 ### Milestone 5：多 Agent MVP
 

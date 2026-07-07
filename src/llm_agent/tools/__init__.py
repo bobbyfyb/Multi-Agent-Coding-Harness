@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from llm_agent.tool_registry import ToolRegistry
+from llm_agent.tools.artifact_tools import register_tools as register_artifact_tools
 from llm_agent.tools.basic_tools import register_tools as register_basic_tools
 from llm_agent.tools.memory_tools import register_tools as register_memory_tools
 from llm_agent.tools.search_tools import register_tools as register_search_tools
@@ -14,6 +15,7 @@ from llm_agent.tools.verification_tools import (
 )
 
 if TYPE_CHECKING:
+    from llm_agent.artifact_system import ArtifactManager
     from llm_agent.background_jobs import BackgroundJobManager
     from llm_agent.memory_system import MemoryManager
     from llm_agent.skill_system import SkillRegistry
@@ -58,6 +60,7 @@ def register_default_tools(
     subagent_runner: "SubagentRunner | None" = None,
     skill_registry: "SkillRegistry | None" = None,
     memory_manager: "MemoryManager | None" = None,
+    artifact_manager: "ArtifactManager | None" = None,
     background_manager: "BackgroundJobManager | None" = None,
     worktree_manager: "WorktreeManager | None" = None,
 ) -> None:
@@ -73,6 +76,11 @@ def register_default_tools(
     register_search_tools(registry, workdir=workdir)
     register_verification_tools(registry, workdir=workdir)
     register_task_tools(registry, workdir=workdir)
+    register_artifact_tools(
+        registry,
+        manager=artifact_manager,
+        workdir=workdir,
+    )
     if skill_registry is not None:
         register_skill_tools(registry, skill_registry=skill_registry)
     if memory_manager is not None:
@@ -90,6 +98,7 @@ def build_default_registry(
     subagent_runner: "SubagentRunner | None" = None,
     skill_registry: "SkillRegistry | None" = None,
     memory_manager: "MemoryManager | None" = None,
+    artifact_manager: "ArtifactManager | None" = None,
     background_manager: "BackgroundJobManager | None" = None,
     worktree_manager: "WorktreeManager | None" = None,
 ) -> ToolRegistry:
@@ -100,6 +109,7 @@ def build_default_registry(
         subagent_runner=subagent_runner,
         skill_registry=skill_registry,
         memory_manager=memory_manager,
+        artifact_manager=artifact_manager,
         background_manager=background_manager,
         worktree_manager=worktree_manager,
     )
@@ -108,6 +118,7 @@ def build_default_registry(
 
 __all__ = [
     "build_default_registry",
+    "register_artifact_tools",
     "register_basic_tools",
     "register_background_tools",
     "register_memory_tools",

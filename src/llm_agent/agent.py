@@ -44,6 +44,7 @@ AgentEventType = Literal[
     "step",
     "task_context",
     "task_reminder",
+    "artifact_context",
     "memory_context",
     "memory_extracted",
     "memory_extract_failed",
@@ -310,6 +311,14 @@ class Agent:
                 ):
                     data["memory_ids"] = before_llm_result.data.get(
                         "memory_ids",
+                        [],
+                    )
+                if (
+                    event_type == "artifact_context"
+                    and before_llm_result is not None
+                ):
+                    data["artifact_ids"] = before_llm_result.data.get(
+                        "artifact_ids",
                         [],
                     )
                 self._emit(
@@ -882,6 +891,14 @@ def print_agent_event(event: AgentEvent) -> None:
         )
         return
 
+    if event.type == "artifact_context":
+        artifact_ids = event.data.get("artifact_ids", [])
+        print(
+            f"{prefix}{ANSI_DIM}[artifacts loaded]{ANSI_RESET} "
+            f"{', '.join(str(artifact_id) for artifact_id in artifact_ids)}"
+        )
+        return
+
     if event.type == "memory_extracted":
         print(
             f"{prefix}{ANSI_YELLOW}[memory saved]{ANSI_RESET} "
@@ -1089,6 +1106,8 @@ def _runtime_context_event_type(content: str) -> AgentEventType | None:
         return "task_context"
     if content.startswith("<task_reminder>"):
         return "task_reminder"
+    if content.startswith("<relevant_artifacts>"):
+        return "artifact_context"
     if content.startswith("<relevant_memories>"):
         return "memory_context"
     return None
@@ -1105,6 +1124,7 @@ def _latest_external_user_message(
     internal_prefixes = (
         "<current_tasks>",
         "<task_reminder>",
+        "<relevant_artifacts>",
         "<relevant_memories>",
         "<conversation_summary",
         "<context_compacted",

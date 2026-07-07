@@ -8,6 +8,10 @@ from prompt_toolkit.patch_stdout import patch_stdout
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from llm_agent.agent import Agent, print_agent_event
+from llm_agent.artifact_system import (
+    ArtifactManager,
+    build_artifact_policy_section,
+)
 from llm_agent.background_jobs import (
     BACKGROUND_JOB_INSTRUCTIONS,
     BackgroundJobManager,
@@ -65,6 +69,7 @@ def build_agent(
         approval_provider = CliApprovalProvider()
     skill_registry = SkillRegistry.for_workdir(workdir)
     memory_manager = MemoryManager.for_workdir(workdir, llm=llm)
+    artifact_manager = ArtifactManager.for_workdir(workdir)
     worktree_manager = WorktreeManager.for_workdir(workdir)
     background_jobs = BackgroundJobManager.for_workdir(
         workdir,
@@ -86,6 +91,7 @@ def build_agent(
         subagent_runner=subagent_runner,
         skill_registry=skill_registry,
         memory_manager=memory_manager,
+        artifact_manager=artifact_manager,
         background_manager=background_jobs,
         worktree_manager=worktree_manager,
     )
@@ -97,6 +103,7 @@ def build_agent(
             approval_provider=approval_provider,
             llm=llm,
             memory_manager=memory_manager,
+            artifact_manager=artifact_manager,
         ),
         workdir=workdir,
         max_steps=None,
@@ -125,6 +132,7 @@ def build_agent(
                     priority=35,
                 ),
                 build_memory_policy_section(),
+                build_artifact_policy_section(),
                 build_skill_catalog_section(skill_registry),
             ]
         ),
