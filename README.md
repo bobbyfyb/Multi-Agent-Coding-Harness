@@ -350,6 +350,9 @@ llm = LLMClient(provider="anthropic", recovery_policy=policy)
 CLI 支持以下环境变量：
 
 ```dotenv
+LLM_PROVIDER=anthropic
+LLM_MAX_TOKENS=4096
+LLM_TIMEOUT=240
 LLM_MAX_RETRIES=4
 LLM_MAX_RETRY_ELAPSED_SECONDS=30
 LLM_FALLBACK_MODEL=

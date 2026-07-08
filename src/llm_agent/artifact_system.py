@@ -40,6 +40,8 @@ ARTIFACT_POLICY_INSTRUCTIONS = """
 Artifacts are durable handoff documents for multi-agent coding work.
 - Use artifact_create for PRDs, task specs, implementation reports, test
   reports, acceptance reports, and important project notes.
+- Create one artifact per artifact_create call; do not pass an array of
+  artifacts as tool input.
 - Link artifacts to task_id when they describe or verify a task.
 - Before updating an artifact, read it with artifact_get and pass
   expected_version to artifact_update.

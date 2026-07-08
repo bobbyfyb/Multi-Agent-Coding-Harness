@@ -55,7 +55,11 @@ def build_agent(
     approval_provider: ApprovalProvider | None = None,
 ) -> Agent:
     workdir = Path.cwd()
-    llm = LLMClient(provider="anthropic")
+    llm = LLMClient(
+        provider=os.getenv("LLM_PROVIDER", "anthropic"),
+        max_tokens=int(os.getenv("LLM_MAX_TOKENS", "4096")),
+        timeout=float(os.getenv("LLM_TIMEOUT", "240")),
+    )
     llm.recovery_policy = RecoveryPolicy(
         max_retries=int(os.getenv("LLM_MAX_RETRIES", "4")),
         max_retry_elapsed_seconds=float(

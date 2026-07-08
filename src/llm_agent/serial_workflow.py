@@ -45,6 +45,17 @@ WorkflowPhase = Literal[
 ]
 
 
+WORKFLOW_WORKER_OUTPUT_INSTRUCTIONS = """
+Workflow worker output:
+- The required artifacts are the handoff contract; put detailed PRD, task,
+  implementation, verification, or acceptance content in artifacts.
+- Final chat responses should be concise status summaries, not full artifact
+  copies. Prefer 3-5 short bullets.
+- If a loaded skill expects interactive clarification, adapt it to this workflow:
+  make reasonable assumptions, record open questions or risks in the artifact,
+  and continue unless the original request has no usable core idea.
+""".strip()
+
 SKILL_TOOLS = {"skill_list", "skill_load", "skill_read_resource"}
 PM_TOOLS = {
     "artifact_create",
@@ -517,6 +528,11 @@ class SerialCodingWorkflow:
                 name="role",
                 content=role.instructions,
                 priority=30,
+            ),
+            PromptSection(
+                name="workflow_worker_output",
+                content=WORKFLOW_WORKER_OUTPUT_INSTRUCTIONS,
+                priority=32,
             ),
             *self._build_role_skill_sections(role),
             build_artifact_policy_section(priority=40),

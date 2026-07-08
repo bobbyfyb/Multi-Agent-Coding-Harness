@@ -39,6 +39,9 @@ except ImportError:  # pragma: no cover - python-dotenv is a project dependency.
 
 Provider = str
 ToolChoice = str | Mapping[str, Any] | None
+BATCHED_TOOL_INPUTS_KEY = "__batched_tool_inputs__"
+INVALID_TOOL_INPUT_KEY = "__invalid_tool_input__"
+BATCHABLE_ARRAY_INPUT_TOOLS = {"artifact_create"}
 
 class ChatMessage(TypedDict):
     role: Literal["system", "user", "assistant"]
@@ -122,7 +125,7 @@ class LLMClient:
     api_key: str | None = None
     max_tokens: int = 1024
     temperature: float | None = None
-    timeout: float = 60.0
+    timeout: float = 120.0
     extra_headers: Mapping[str, str] = field(default_factory=dict)
     extra_body: Mapping[str, Any] = field(default_factory=dict)
     env_file: str | Path | None = None
@@ -821,20 +824,25 @@ def _parse_anthropic_response(data: dict[str, Any]) -> LLMResponse:
 
     text_parts: list[str] = []
     tool_calls: list[LLMToolCall] = []
+    normalized_blocks: list[dict[str, Any]] = []
 
     for block in blocks:
         if not isinstance(block, Mapping):
             continue
+        normalized_block = dict(block)
         block_type = block.get("type")
         if block_type == "text":
             text_parts.append(str(block.get("text", "")))
         elif block_type == "tool_use":
-            tool_calls.append(_parse_anthropic_tool_call(block))
+            tool_call = _parse_anthropic_tool_call(block)
+            tool_calls.append(tool_call)
+            normalized_block["input"] = tool_call.arguments
+        normalized_blocks.append(normalized_block)
 
     return LLMResponse(
         content="\n".join(part for part in text_parts if part),
         tool_calls=tool_calls,
-        raw=data,
+        raw={**data, "content": normalized_blocks},
         stop_reason=data.get("stop_reason"),
         usage=dict(data.get("usage") or {}),
     )
@@ -846,15 +854,13 @@ def _parse_anthropic_tool_call(block: Mapping[str, Any]) -> LLMToolCall:
     if not name or not tool_call_id:
         raise LLMClientError("Anthropic tool_use missing id or name.")
 
-    arguments = block.get("input") or {}
-    if not isinstance(arguments, dict):
-        raise LLMClientError(f"Tool arguments for {name} must be a JSON object.")
+    arguments = _normalize_tool_input(block.get("input"), str(name))
 
     return LLMToolCall(
         id=str(tool_call_id),
         name=str(name),
         arguments=arguments,
-        raw=dict(block),
+        raw={**dict(block), "input": arguments},
     )
 
 
@@ -878,13 +884,43 @@ def _parse_arguments(value: Any, tool_name: str) -> dict[str, Any]:
     return parsed
 
 
+def _normalize_tool_input(value: Any, tool_name: str) -> dict[str, Any]:
+    if value is None or value == "":
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, list):
+        if len(value) == 1 and isinstance(value[0], dict):
+            return dict(value[0])
+        if tool_name in BATCHABLE_ARRAY_INPUT_TOOLS and all(
+            isinstance(item, dict) for item in value
+        ):
+            return {
+                BATCHED_TOOL_INPUTS_KEY: [dict(item) for item in value],
+            }
+        return {
+            INVALID_TOOL_INPUT_KEY: value,
+            "error": (
+                f"Tool arguments for {tool_name} must be a JSON object. "
+                "Call the tool once per object instead of passing an array."
+            ),
+        }
+    return {
+        INVALID_TOOL_INPUT_KEY: value,
+        "error": f"Tool arguments for {tool_name} must be a JSON object.",
+    }
+
+
 def _response_to_dict(response: Any) -> dict[str, Any]:
     if isinstance(response, dict):
         return response
-    if hasattr(response, "model_dump"):
-        data = response.model_dump()
-    elif hasattr(response, "to_dict"):
+    if hasattr(response, "to_dict"):
         data = response.to_dict()
+    elif hasattr(response, "model_dump"):
+        try:
+            data = response.model_dump(mode="json", warnings=False)
+        except TypeError:
+            data = response.model_dump()
     else:
         raise LLMClientError(f"Unsupported SDK response type: {type(response).__name__}")
 

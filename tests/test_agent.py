@@ -5,6 +5,7 @@ from llm_agent.agent import Agent, AgentEvent, print_agent_event
 from llm_agent.context_manager import ContextManager
 from llm_agent.hooks import HookContext, HookManager
 from llm_agent.llm_client import (
+    BATCHED_TOOL_INPUTS_KEY,
     LLMContextLengthError,
     LLMResponse,
     LLMToolCall,
@@ -157,6 +158,46 @@ def test_agent_batches_native_tool_results_then_final_answer() -> None:
         ],
     }
     assert messages[-1] == {"role": "assistant", "content": "results are 3 and 7"}
+
+
+def test_agent_executes_batched_artifact_create_arguments() -> None:
+    created: list[dict[str, Any]] = []
+    registry = ToolRegistry()
+    registry.register(
+        name="artifact_create",
+        description="Create artifact.",
+        parameters={},
+        func=lambda **kwargs: created.append(kwargs) or f"created {kwargs['kind']}",
+    )
+    tool_call = LLMToolCall(
+        id="call_batch",
+        name="artifact_create",
+        arguments={
+            BATCHED_TOOL_INPUTS_KEY: [
+                {"kind": "prd", "title": "PRD", "content": "Plan"},
+                {"kind": "task_spec", "title": "Task", "content": "Build"},
+            ]
+        },
+        raw={"id": "call_batch", "name": "artifact_create"},
+    )
+    llm = FakeLLM(
+        [
+            LLMResponse(content="", tool_calls=[tool_call], raw={}),
+            LLMResponse(content="done", tool_calls=[], raw={}),
+        ]
+    )
+    agent = Agent(llm=llm, tools=registry, context_manager="system")
+    messages = agent.new_messages()
+    messages.append({"role": "user", "content": "create artifacts"})
+
+    result = agent.run(messages)
+
+    assert result.status == "completed"
+    assert [item["kind"] for item in created] == ["prd", "task_spec"]
+    tool_result = llm.messages[1][-1]["content"][0]["content"]
+    assert tool_result["ok"] is True
+    assert tool_result["batched"] is True
+    assert tool_result["count"] == 2
 
 
 def test_agent_emits_key_step_events() -> None:

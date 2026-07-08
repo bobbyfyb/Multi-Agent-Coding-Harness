@@ -12,9 +12,12 @@ from llm_agent.background_jobs import (
 from llm_agent.context_manager import ContextManager, ContextUpdate
 from llm_agent.hooks import HookContext, HookManager
 from llm_agent.llm_client import (
+    BATCHED_TOOL_INPUTS_KEY,
+    INVALID_TOOL_INPUT_KEY,
     LLMClient,
     LLMClientError,
     LLMContextLengthError,
+    LLMToolCall,
 )
 from llm_agent.recovery import (
     CONTINUATION_PROMPT,
@@ -579,6 +582,23 @@ class Agent:
                     resolved_run_id,
                 )
 
+                invalid_arguments = self._invalid_tool_arguments_result(tool_call)
+                if invalid_arguments is not None:
+                    tool_results.append((tool_call, invalid_arguments))
+                    self._emit(
+                        on_event,
+                        "tool_result",
+                        step,
+                        {
+                            "id": tool_call.id,
+                            "name": tool_call.name,
+                            "result": invalid_arguments,
+                        },
+                        resolved_run_id,
+                        duration_ms=elapsed_ms(tool_started_at),
+                    )
+                    continue
+
                 pre_tool_result = self.hooks.trigger_hooks(
                     "PreToolUse",
                     tool_call,
@@ -640,11 +660,7 @@ class Agent:
                         "tool_name": tool_call.name,
                     },
                 )
-                tool_result = self.tools.call(
-                    tool_call.name,
-                    tool_call.arguments,
-                    context=tool_context,
-                )
+                tool_result = self._execute_tool_call(tool_call, tool_context)
                 post_tool_result = self.hooks.trigger_hooks(
                     "PostToolUse",
                     tool_call,
@@ -689,6 +705,78 @@ class Agent:
             run_id=resolved_run_id,
             agent_id=self.agent_id,
         )
+
+    def _invalid_tool_arguments_result(
+        self,
+        tool_call: LLMToolCall,
+    ) -> dict[str, Any] | None:
+        invalid_input = tool_call.arguments.get(INVALID_TOOL_INPUT_KEY)
+        if invalid_input is None:
+            return None
+        return {
+            "ok": False,
+            "error": tool_call.arguments.get(
+                "error",
+                (
+                    f"Tool arguments for {tool_call.name} must be a JSON object. "
+                    "Call the tool once per object instead of passing an array."
+                ),
+            ),
+            "received_type": type(invalid_input).__name__,
+        }
+
+    def _execute_tool_call(
+        self,
+        tool_call: LLMToolCall,
+        tool_context: ToolExecutionContext,
+    ) -> dict[str, Any]:
+        batched_inputs = tool_call.arguments.get(BATCHED_TOOL_INPUTS_KEY)
+        if batched_inputs is None:
+            return self.tools.call(
+                tool_call.name,
+                tool_call.arguments,
+                context=tool_context,
+            )
+
+        if not isinstance(batched_inputs, list):
+            return {
+                "ok": False,
+                "error": (
+                    f"Batched tool inputs for {tool_call.name} must be a list."
+                ),
+            }
+
+        results = []
+        all_ok = True
+        for index, arguments in enumerate(batched_inputs, start=1):
+            if not isinstance(arguments, dict):
+                result = {
+                    "ok": False,
+                    "error": (
+                        f"Batched input #{index} for {tool_call.name} must be "
+                        "a JSON object."
+                    ),
+                }
+            else:
+                result = self.tools.call(
+                    tool_call.name,
+                    arguments,
+                    context=tool_context,
+                )
+            all_ok = all_ok and bool(result.get("ok"))
+            results.append(
+                {
+                    "index": index,
+                    "result": result,
+                }
+            )
+
+        return {
+            "ok": all_ok,
+            "batched": True,
+            "count": len(results),
+            "results": results,
+        }
 
     def _emit(
         self,

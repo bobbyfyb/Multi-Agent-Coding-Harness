@@ -48,7 +48,11 @@ class ArtifactTools:
             owner=owner,
             metadata=metadata,
         )
-        return f"Created artifact:\n{format_artifact(artifact)}"
+        return (
+            "Created artifact:\n"
+            f"{format_artifact(artifact, include_content=False)}\n"
+            "Content stored. Use artifact_get to read the full artifact body."
+        )
 
     def artifact_get(self, artifact_id: str) -> str:
         return format_artifact(self.manager.get_artifact(artifact_id))
@@ -95,7 +99,11 @@ class ArtifactTools:
             expected_version=expected_version,
             change_summary=change_summary,
         )
-        return f"Updated artifact:\n{format_artifact(artifact)}"
+        return (
+            "Updated artifact:\n"
+            f"{format_artifact(artifact, include_content=False)}\n"
+            "Content stored. Use artifact_get to read the full artifact body."
+        )
 
 
 def artifact_tool_definitions(
