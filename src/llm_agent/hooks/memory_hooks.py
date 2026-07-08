@@ -10,6 +10,7 @@ from llm_agent.memory_system import MemoryManager, format_memory_context
 INTERNAL_USER_MESSAGE_PREFIXES = (
     "<current_tasks>",
     "<task_reminder>",
+    "<relevant_artifacts>",
     "<relevant_memories>",
     "<conversation_summary",
     "<context_compacted",

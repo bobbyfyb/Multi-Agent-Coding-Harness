@@ -570,26 +570,28 @@ class BackgroundJobManager:
             self.store.save(job)
             self._running.pop(job_id, None)
             self._enqueue_notification(job_id)
-            running.done.set()
 
         trace_status = "ok" if final_status == "completed" else "error"
         if final_status in {"cancelled", "interrupted"}:
             trace_status = "warning"
-        self._record_trace(
-            running.trace_recorder,
-            running.trace_context,
-            job,
-            name=f"background.{final_status}",
-            phase="completed",
-            status=trace_status,
-            duration_ms=(perf_counter() - running.started_at) * 1_000,
-            data={
-                "return_code": return_code,
-                "error": error,
-                "stdout_path": job.stdout_path,
-                "stderr_path": job.stderr_path,
-            },
-        )
+        try:
+            self._record_trace(
+                running.trace_recorder,
+                running.trace_context,
+                job,
+                name=f"background.{final_status}",
+                phase="completed",
+                status=trace_status,
+                duration_ms=(perf_counter() - running.started_at) * 1_000,
+                data={
+                    "return_code": return_code,
+                    "error": error,
+                    "stdout_path": job.stdout_path,
+                    "stderr_path": job.stderr_path,
+                },
+            )
+        finally:
+            running.done.set()
 
     def _request_stop(
         self,
