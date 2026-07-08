@@ -1,11 +1,17 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from llm_agent.artifact_system import ArtifactManager
 from llm_agent.hooks.permission_hooks import AutoApprovalProvider
 from llm_agent.llm_client import LLMResponse, LLMToolCall
-from llm_agent.serial_workflow import SerialCodingWorkflow, parse_workflow_command
+from llm_agent.serial_workflow import (
+    ROLE_SPECS,
+    SerialCodingWorkflow,
+    parse_workflow_command,
+)
+from llm_agent.skill_system import SkillRegistry
 from llm_agent.trace_system import TraceRecorder
 
 
@@ -311,6 +317,142 @@ def test_serial_workflow_runs_fix_cycle_after_qa_fail(
     assert implementation_report.content == "Fixed implementation."
 
 
+def test_serial_workflow_roles_can_discover_and_load_skills(
+    tmp_path: Path,
+) -> None:
+    _write_skill(
+        tmp_path,
+        "prd-writer",
+        """---
+name: prd-writer
+description: Write implementation-ready PRDs.
+when_to_use: Use during product planning.
+---
+
+# PRD Method
+
+Clarify users, requirements, acceptance criteria, and delivery risks.
+""",
+    )
+    _write_skill(
+        tmp_path,
+        "code-review",
+        """---
+name: code-review
+description: Review patches for behavioral defects.
+---
+
+# Code Review Method
+
+Inspect changed files and tests before approval.
+""",
+    )
+    _write_skill(
+        tmp_path,
+        "qa-checklist",
+        """---
+name: qa-checklist
+description: Verify behavior against requirements.
+---
+
+# QA Method
+
+Map each requirement to evidence.
+""",
+    )
+    role_specs = dict(ROLE_SPECS)
+    role_specs["pm"] = replace(
+        ROLE_SPECS["pm"],
+        required_skills=("prd-writer",),
+    )
+    role_specs["engineer"] = replace(
+        ROLE_SPECS["engineer"],
+        optional_skills=("code-review",),
+    )
+    role_specs["qa"] = replace(
+        ROLE_SPECS["qa"],
+        optional_skills=("qa-checklist",),
+    )
+    llm = FakeLLM(
+        [
+            _response(
+                _create_call(
+                    "call-prd",
+                    kind="prd",
+                    title="PRD",
+                    content="Build the requested feature.",
+                    status="ready",
+                ),
+                _create_call(
+                    "call-task",
+                    kind="task_spec",
+                    title="Task Spec",
+                    content="Implementation scope.",
+                    status="ready",
+                ),
+            ),
+            LLMResponse(content="planning done", tool_calls=[], raw={}),
+            _response(
+                _create_call(
+                    "call-impl",
+                    kind="implementation_report",
+                    title="Implementation Report",
+                    content="Implemented.",
+                )
+            ),
+            LLMResponse(content="implementation done", tool_calls=[], raw={}),
+            _response(
+                _create_call(
+                    "call-test",
+                    kind="test_report",
+                    title="Test Report",
+                    content="Pass.",
+                    metadata={"verdict": "pass"},
+                )
+            ),
+            LLMResponse(content="qa pass", tool_calls=[], raw={}),
+            _response(
+                _create_call(
+                    "call-accept",
+                    kind="acceptance_report",
+                    title="Acceptance Report",
+                    content="Accepted.",
+                )
+            ),
+            LLMResponse(content="accepted", tool_calls=[], raw={}),
+        ]
+    )
+    workflow = SerialCodingWorkflow(
+        llm=llm,  # type: ignore[arg-type]
+        workdir=tmp_path,
+        artifact_manager=ArtifactManager.for_workdir(tmp_path),
+        approval_provider=AutoApprovalProvider(approved=True),
+        skill_registry=SkillRegistry.for_workdir(tmp_path),
+        role_specs=role_specs,
+    )
+
+    result = workflow.run("Build a feature with role skills.", run_id="wf-skills")
+
+    assert result.status == "completed"
+    pm_system_prompt = llm.messages[0][0]["content"]
+    engineer_system_prompt = llm.messages[2][0]["content"]
+    qa_system_prompt = llm.messages[4][0]["content"]
+    assert "prd-writer: Write implementation-ready PRDs." in pm_system_prompt
+    assert "PRD Method" in pm_system_prompt
+    assert (
+        "code-review: Review patches for behavioral defects."
+        in engineer_system_prompt
+    )
+    assert "Code Review Method" not in engineer_system_prompt
+    assert "qa-checklist: Verify behavior against requirements." in qa_system_prompt
+    assert "QA Method" not in qa_system_prompt
+    skill_tools = {"skill_list", "skill_load", "skill_read_resource"}
+    assert all(
+        skill_tools <= {tool["name"] for tool in tool_specs}
+        for tool_specs in llm.tools
+    )
+
+
 def test_parse_workflow_command() -> None:
     assert parse_workflow_command("/workflow build feature") == "build feature"
     assert parse_workflow_command("/workflow\nbuild feature") == "build feature"
@@ -326,6 +468,12 @@ def _workflow(tmp_path: Path, llm: FakeLLM) -> SerialCodingWorkflow:
         artifact_manager=ArtifactManager.for_workdir(tmp_path),
         approval_provider=AutoApprovalProvider(approved=True),
     )
+
+
+def _write_skill(tmp_path: Path, directory: str, manifest: str) -> None:
+    skill_dir = tmp_path / ".llm_agent" / "skills" / directory
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(manifest, encoding="utf-8")
 
 
 def _response(*tool_calls: LLMToolCall) -> LLMResponse:

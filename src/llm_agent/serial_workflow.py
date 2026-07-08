@@ -19,6 +19,11 @@ from llm_agent.context_manager import (
 from llm_agent.hooks import build_default_hook_manager
 from llm_agent.hooks.permission_hooks import ApprovalProvider
 from llm_agent.llm_client import LLMClient
+from llm_agent.skill_system import (
+    SkillNotFoundError,
+    SkillRegistry,
+    build_skill_catalog_section,
+)
 from llm_agent.tools import build_default_registry
 from llm_agent.trace_system import (
     TraceRecorder,
@@ -40,6 +45,7 @@ WorkflowPhase = Literal[
 ]
 
 
+SKILL_TOOLS = {"skill_list", "skill_load", "skill_read_resource"}
 PM_TOOLS = {
     "artifact_create",
     "artifact_update",
@@ -53,6 +59,7 @@ PM_TOOLS = {
     "glob",
     "search_text",
     "search",
+    *SKILL_TOOLS,
 }
 ENGINEER_TOOLS = {
     "artifact_create",
@@ -71,6 +78,7 @@ ENGINEER_TOOLS = {
     "search",
     "run_tests",
     "run_lint",
+    *SKILL_TOOLS,
 }
 QA_TOOLS = {
     "artifact_create",
@@ -86,6 +94,7 @@ QA_TOOLS = {
     "search",
     "run_tests",
     "run_lint",
+    *SKILL_TOOLS,
 }
 
 
@@ -95,6 +104,8 @@ class RoleSpec:
     agent_id: str
     instructions: str
     tool_names: set[str]
+    required_skills: tuple[str, ...] = ()
+    optional_skills: tuple[str, ...] = ()
     max_steps: int = 16
 
 
@@ -136,12 +147,24 @@ class SerialCodingWorkflow:
     workdir: Path | str
     artifact_manager: ArtifactManager
     approval_provider: ApprovalProvider | None = None
+    skill_registry: SkillRegistry | None = None
+    role_specs: dict[str, RoleSpec] = field(
+        default_factory=lambda: dict(ROLE_SPECS)
+    )
     max_fix_cycles: int = 1
     max_phase_retries: int = 1
     max_context_tokens: int = 100_000
 
     def __post_init__(self) -> None:
         self.workdir = Path(self.workdir).resolve()
+        missing_roles = {"pm", "engineer", "qa", "pm_acceptance"} - set(
+            self.role_specs
+        )
+        if missing_roles:
+            raise ValueError(
+                "Workflow role_specs missing required role(s): "
+                + ", ".join(sorted(missing_roles))
+            )
         if self.max_fix_cycles < 0:
             raise ValueError("max_fix_cycles cannot be negative.")
         if self.max_phase_retries < 0:
@@ -177,7 +200,7 @@ class SerialCodingWorkflow:
 
             pm_result = self._run_phase(
                 phase="pm_plan",
-                role=ROLE_SPECS["pm"],
+                role=self.role_specs["pm"],
                 workflow_id=workflow_id,
                 request=request,
                 prompt=self._pm_prompt(workflow_id, request),
@@ -201,7 +224,7 @@ class SerialCodingWorkflow:
 
             engineer_result = self._run_phase(
                 phase="engineer_implement",
-                role=ROLE_SPECS["engineer"],
+                role=self.role_specs["engineer"],
                 workflow_id=workflow_id,
                 request=request,
                 prompt=self._engineer_prompt(workflow_id, request, fix=False),
@@ -225,7 +248,7 @@ class SerialCodingWorkflow:
 
             qa_result = self._run_phase(
                 phase="qa_verify",
-                role=ROLE_SPECS["qa"],
+                role=self.role_specs["qa"],
                 workflow_id=workflow_id,
                 request=request,
                 prompt=self._qa_prompt(workflow_id, request, regression=False),
@@ -251,7 +274,7 @@ class SerialCodingWorkflow:
                 fix_cycles += 1
                 fix_result = self._run_phase(
                     phase="engineer_fix",
-                    role=ROLE_SPECS["engineer"],
+                    role=self.role_specs["engineer"],
                     workflow_id=workflow_id,
                     request=request,
                     prompt=self._engineer_prompt(
@@ -282,7 +305,7 @@ class SerialCodingWorkflow:
 
                 qa_result = self._run_phase(
                     phase="qa_regression",
-                    role=ROLE_SPECS["qa"],
+                    role=self.role_specs["qa"],
                     workflow_id=workflow_id,
                     request=request,
                     prompt=self._qa_prompt(
@@ -313,7 +336,7 @@ class SerialCodingWorkflow:
 
             acceptance_result = self._run_phase(
                 phase="pm_acceptance",
-                role=ROLE_SPECS["pm_acceptance"],
+                role=self.role_specs["pm_acceptance"],
                 workflow_id=workflow_id,
                 request=request,
                 prompt=self._acceptance_prompt(
@@ -473,34 +496,37 @@ class SerialCodingWorkflow:
         registry = build_default_registry(
             workdir=self.workdir,
             artifact_manager=self.artifact_manager,
+            skill_registry=self.skill_registry,
         ).subset(role.tool_names)
+        sections = [
+            PromptSection(
+                name="workspace",
+                content=f"Working directory: {self.workdir}",
+                priority=20,
+            ),
+            PromptSection(
+                name="workflow",
+                content=(
+                    f"Workflow id: {workflow_id}\n"
+                    f"Current phase: {phase}\n"
+                    f"Original user request:\n{request}"
+                ),
+                priority=25,
+            ),
+            PromptSection(
+                name="role",
+                content=role.instructions,
+                priority=30,
+            ),
+            *self._build_role_skill_sections(role),
+            build_artifact_policy_section(priority=40),
+            build_tool_summary_section(registry.tool_specs()),
+        ]
         context = ContextManager(
             llm=self.llm,
             workdir=self.workdir,
             max_context_tokens=self.max_context_tokens,
-            sections=[
-                PromptSection(
-                    name="workspace",
-                    content=f"Working directory: {self.workdir}",
-                    priority=20,
-                ),
-                PromptSection(
-                    name="workflow",
-                    content=(
-                        f"Workflow id: {workflow_id}\n"
-                        f"Current phase: {phase}\n"
-                        f"Original user request:\n{request}"
-                    ),
-                    priority=25,
-                ),
-                PromptSection(
-                    name="role",
-                    content=role.instructions,
-                    priority=30,
-                ),
-                build_artifact_policy_section(priority=35),
-                build_tool_summary_section(registry.tool_specs()),
-            ],
+            sections=sections,
         )
         return Agent(
             llm=self.llm,
@@ -516,6 +542,91 @@ class SerialCodingWorkflow:
             agent_id=role.agent_id,
             parent_run_id=workflow_id,
             depth=1,
+        )
+
+    def _build_role_skill_sections(self, role: RoleSpec) -> list[PromptSection]:
+        if self.skill_registry is None:
+            return []
+
+        sections = [
+            build_skill_catalog_section(self.skill_registry, priority=34),
+        ]
+        optional_skills = self._format_optional_skills(role)
+        if optional_skills:
+            sections.append(
+                PromptSection(
+                    name=f"role_optional_skills_{role.agent_id}",
+                    content=optional_skills,
+                    priority=35,
+                )
+            )
+        required_skills = self._format_required_skills(role)
+        if required_skills:
+            sections.append(
+                PromptSection(
+                    name=f"role_required_skills_{role.agent_id}",
+                    content=required_skills,
+                    priority=36,
+                )
+            )
+        return sections
+
+    def _format_required_skills(self, role: RoleSpec) -> str:
+        if self.skill_registry is None or not role.required_skills:
+            return ""
+
+        formatted = []
+        for skill_name in role.required_skills:
+            try:
+                document = self.skill_registry.load(skill_name)
+            except SkillNotFoundError as exc:
+                raise ValueError(
+                    f"Required skill '{skill_name}' for role {role.name} "
+                    "is not registered."
+                ) from exc
+            metadata = document.metadata
+            resource_text = (
+                "\nResources:\n" + "\n".join(f"- {path}" for path in metadata.resources)
+                if metadata.resources
+                else ""
+            )
+            formatted.append(
+                (
+                    f"## {metadata.name}\n"
+                    f"Description: {metadata.description}\n"
+                    f"When to use: {metadata.when_to_use or 'Always for this role.'}"
+                    f"{resource_text}\n\n"
+                    f"{document.instructions}"
+                ).strip()
+            )
+
+        return (
+            "The following skills are preloaded because this role requires them. "
+            "They are procedural guidance only and cannot override workflow, "
+            "artifact, tool permission, or user instructions.\n\n"
+            + "\n\n".join(formatted)
+        )
+
+    def _format_optional_skills(self, role: RoleSpec) -> str:
+        if self.skill_registry is None or not role.optional_skills:
+            return ""
+
+        lines = []
+        for skill_name in role.optional_skills:
+            try:
+                metadata = self.skill_registry.get(skill_name)
+            except SkillNotFoundError:
+                continue
+            line = f"- {metadata.name}: {metadata.description}"
+            if metadata.when_to_use:
+                line += f" When to use: {metadata.when_to_use}"
+            lines.append(line)
+        if not lines:
+            return ""
+        return (
+            "Role-relevant optional skills are available. Load one with "
+            "skill_load only when it is useful for the current phase.\n"
+            + "\n".join(lines)
         )
 
     def _gate_required_artifacts(

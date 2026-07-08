@@ -159,6 +159,7 @@ def main() -> None:
         workdir=workdir,
         artifact_manager=ArtifactManager.for_workdir(workdir),
         approval_provider=approval_provider,
+        skill_registry=SkillRegistry.for_workdir(workdir),
     )
     messages = agent.new_messages()
 

@@ -10,6 +10,14 @@ from llm_agent.tool_registry import ToolDefinition, ToolRegistry
 class SkillTools:
     registry: SkillRegistry
 
+    def skill_list(self) -> dict:
+        return {
+            "skills": [
+                skill.to_dict()
+                for skill in self.registry.list_skills()
+            ]
+        }
+
     def skill_load(self, name: str) -> dict:
         return self.registry.load(name).to_dict()
 
@@ -24,6 +32,19 @@ class SkillTools:
 def skill_tool_definitions(registry: SkillRegistry) -> list[ToolDefinition]:
     tools = SkillTools(registry)
     return [
+        ToolDefinition(
+            name="skill_list",
+            description=(
+                "List available project skills and their metadata. Use this when "
+                "you need to rediscover skills after context changes or before "
+                "choosing which skill to load."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {},
+            },
+            func=tools.skill_list,
+        ),
         ToolDefinition(
             name="skill_load",
             description=(

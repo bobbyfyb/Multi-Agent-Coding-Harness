@@ -180,6 +180,7 @@
 - [x] 支持无 frontmatter 时从目录名和首个标题生成基础元数据
 - [x] 启动时扫描 Skill 并检测非法 YAML、非法名称和重复名称
 - [x] 将有字符预算限制的 Skill Catalog 注入 system prompt
+- [x] 实现 `skill_list`，支持运行时重新发现可用 Skill
 - [x] 实现 `skill_load`，按需将完整正文作为 tool result 注入 messages
 - [x] 实现 `skill_read_resource`
 - [x] 防止 Skill 资源路径穿越
@@ -187,6 +188,7 @@
 - [x] Skill 内容不能绕过 system/user 指令、workspace 和权限策略
 - [x] 主 Agent 和 Subagent 共用 Skill 索引
 - [x] Subagent 在独立上下文中重新按需加载 Skill
+- [x] Workflow role agent 可发现、动态加载和读取 Skill 资源
 - [x] 添加 `code-review` 示例 Skill
 - [x] 覆盖解析、索引、预算、资源安全、Agent 加载和 Subagent 加载测试
 
@@ -387,6 +389,8 @@ Web UI 可以继续复用同一个 Agent、Hook 和 Event 边界。
 - [x] PM Acceptance worker 负责生成 `acceptance_report`
 - [x] 每个 worker 使用独立 `ContextManager`、system prompt 和工具白名单
 - [x] 每个 worker 复用同一个 `LLMClient / ArtifactManager / workspace`
+- [x] 每个 worker 可通过 `RoleSpec` 绑定 required/optional Skill
+- [x] Required Skill 自动注入 role context，Optional Skill 保持按需加载
 - [x] Artifact gate 检查每个阶段是否新建或更新了必需 artifact
 - [x] QA gate 要求 `metadata.verdict` 明确为 `pass` 或 `fail`
 - [x] 阶段 artifact gate 失败时自动给同一 worker 一次纠正机会
@@ -485,14 +489,15 @@ Web UI 可以继续复用同一个 Agent、Hook 和 Event 边界。
 - [x] 支持读取 `skills/<name>/SKILL.md`
 - [x] 支持 Skill metadata
 - [x] 由模型根据精简 Catalog 进行语义选择
+- [x] 支持通过 `skill_list()` 运行时发现 Skill
 - [x] 支持通过 `skill_load(name)` 手动指定 Skill
 - [x] 将 Skill Catalog 注入 `ContextManager`
 - [x] 将完整 Skill 内容通过 tool result 按需注入 messages
+- [x] 支持 Orchestrator 通过 `RoleSpec` 程序化指定或预加载 Skill
 - [x] 提供 `code-review` 默认示例 Skill
 - [ ] 为 test/debug task 准备默认 skill
 - [ ] 为 frontend/backend task 准备默认 skill
 - [ ] 支持用户级和额外目录 Skill 来源
-- [ ] 支持 Orchestrator 程序化指定或预加载 Skill
 - [ ] 与 Context Compression 协作保留或摘要已加载 Skill
 
 当前实现：
@@ -598,6 +603,7 @@ User Requirement
 - [x] 每个 Worker 有独立 name / agent_id
 - [x] 每个 Worker 有独立 system prompt
 - [x] 每个 Worker 有独立 tools 白名单
+- [x] 每个 Worker 可配置 required/optional Skill
 - [x] 每个 Worker 有独立 ContextManager
 - [x] 每个 Worker 可以读写 artifact
 - [x] 每个 Worker 可以输出 phase result
