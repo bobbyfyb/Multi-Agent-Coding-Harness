@@ -375,6 +375,34 @@ Web UI 可以继续复用同一个 Agent、Hook 和 Event 边界。
 - 暂未实现 artifact diff、依赖图、文件锁和自动 LLM 总结。
 - Subagent 暂不直接获得 artifact 工具，后续 PM/Engineer/QA 编排时再按角色分配。
 
+### 2.17 Serial Orchestrator-Worker Workflow MVP
+
+- [x] 实现 `SerialCodingWorkflow`
+- [x] 实现轻量 `RoleSpec`
+- [x] 实现 `WorkflowPhaseResult / WorkflowResult`
+- [x] 使用代码层状态机控制 PM -> Engineer -> QA -> Engineer Fix -> QA -> PM Acceptance
+- [x] PM worker 负责生成 `prd` 和 `task_spec`
+- [x] Engineer worker 负责实现并生成/更新 `implementation_report`
+- [x] QA worker 负责验证并生成 `test_report`
+- [x] PM Acceptance worker 负责生成 `acceptance_report`
+- [x] 每个 worker 使用独立 `ContextManager`、system prompt 和工具白名单
+- [x] 每个 worker 复用同一个 `LLMClient / ArtifactManager / workspace`
+- [x] Artifact gate 检查每个阶段是否新建或更新了必需 artifact
+- [x] QA gate 要求 `metadata.verdict` 明确为 `pass` 或 `fail`
+- [x] 阶段 artifact gate 失败时自动给同一 worker 一次纠正机会
+- [x] QA verdict 为 `fail` 时触发一次 Engineer fix cycle 和 QA regression
+- [x] Workflow 生命周期和 phase 事件写入 Trace
+- [x] CLI 支持显式 `/workflow <request>` 入口
+- [x] 覆盖成功流程、artifact gate retry、QA fail fix cycle 和命令解析测试
+
+当前边界：
+
+- 目前是同步串行 Orchestrator-Worker，不支持并行 Agent Team。
+- Workflow 状态只在当前进程内运行，尚未持久化到 `.llm_agent/workflows/`。
+- Role 目前使用 `RoleSpec` 配置，没有单独抽象 `PMAgent / EngineerAgent / QAAgent` 类。
+- Artifact gate 仍基于 artifact kind/status/metadata，尚未接入强 schema 校验。
+- Engineer 默认在主 workspace 执行，尚未默认启用 Worktree isolation。
+
 ## 3. 接下来优先补全的单 Agent Harness 能力
 
 ### 3.1 Trace / Observability
@@ -553,12 +581,12 @@ User Requirement
 - [x] Artifact store / manager / tools
 - [x] Artifact runtime context 注入
 - [x] Artifact Trace 记录
-- [ ] PM 生成 PRD
-- [ ] PM 生成 TaskSpec
-- [ ] Engineer 根据 TaskSpec 修改代码
+- [x] PM 生成 PRD
+- [x] PM 生成 TaskSpec
+- [x] Engineer 根据 TaskSpec 修改代码或确认无需修改
 - [ ] QA 生成 TestPlan
-- [ ] QA 执行测试并生成 TestReport
-- [ ] PM 根据 TestReport 生成 AcceptanceReport
+- [x] QA 执行测试并生成 TestReport
+- [x] PM 根据 TestReport 生成 AcceptanceReport
 
 ## 5. 多 Agent 编排系统
 
@@ -566,19 +594,21 @@ User Requirement
 
 目标：把当前单 Agent 包装成可复用角色 agent。
 
-- [ ] 设计 `RoleAgent`
-- [ ] 每个 RoleAgent 有独立 name
-- [ ] 每个 RoleAgent 有独立 system prompt
-- [ ] 每个 RoleAgent 有独立 tools
-- [ ] 每个 RoleAgent 有独立 context builder
-- [ ] 每个 RoleAgent 可以读写 artifact
-- [ ] 每个 RoleAgent 可以输出结构化 result
+- [x] 设计轻量 `RoleSpec`
+- [x] 每个 Worker 有独立 name / agent_id
+- [x] 每个 Worker 有独立 system prompt
+- [x] 每个 Worker 有独立 tools 白名单
+- [x] 每个 Worker 有独立 ContextManager
+- [x] 每个 Worker 可以读写 artifact
+- [x] 每个 Worker 可以输出 phase result
+- [ ] 提炼正式 `RoleAgent` 抽象
 
 候选角色：
 
-- [ ] `PMAgent`
-- [ ] `EngineerAgent`
-- [ ] `QAAgent`
+- [x] `PM` worker
+- [x] `Engineer` worker
+- [x] `QA` worker
+- [ ] 独立 `PMAgent / EngineerAgent / QAAgent` 类
 
 不要一开始强行区分 FE/BE：
 
@@ -589,16 +619,17 @@ User Requirement
 
 目标：用代码层状态机控制多 agent 流程，而不是完全交给 LLM 自由发挥。
 
-- [ ] 设计 `Orchestrator`
-- [ ] 设计任务状态枚举
-- [ ] 支持 planning 状态
-- [ ] 支持 implementation 状态
-- [ ] 支持 qa 状态
-- [ ] 支持 fix 状态
-- [ ] 支持 acceptance 状态
-- [ ] 支持 failed / aborted 状态
-- [ ] 支持最大迭代次数
-- [ ] 支持 trace 每个状态转移
+- [x] 设计 `SerialCodingWorkflow` 作为轻量 Orchestrator
+- [x] 设计 phase 状态和 result
+- [x] 支持 planning 状态
+- [x] 支持 implementation 状态
+- [x] 支持 qa 状态
+- [x] 支持 fix 状态
+- [x] 支持 acceptance 状态
+- [x] 支持 failed 状态
+- [ ] 支持 aborted 状态
+- [x] 支持最大迭代次数
+- [x] 支持 trace 每个状态转移
 
 状态流：
 

@@ -33,6 +33,11 @@ from llm_agent.memory_system import (
     build_memory_policy_section,
 )
 from llm_agent.recovery import RecoveryPolicy
+from llm_agent.serial_workflow import (
+    SerialCodingWorkflow,
+    WorkflowResult,
+    parse_workflow_command,
+)
 from llm_agent.skill_system import SkillRegistry, build_skill_catalog_section
 from llm_agent.subagent import SUBAGENT_PARENT_INSTRUCTIONS, SubagentRunner
 from llm_agent.tools import build_default_registry
@@ -143,10 +148,17 @@ def main() -> None:
     workdir = Path.cwd()
     prompt_session = build_user_prompt_session(workdir)
     approval_session = build_approval_prompt_session()
+    approval_provider = CliApprovalProvider(
+        input_func=approval_session.prompt,
+    )
     agent = build_agent(
-        approval_provider=CliApprovalProvider(
-            input_func=approval_session.prompt,
-        )
+        approval_provider=approval_provider,
+    )
+    workflow = SerialCodingWorkflow(
+        llm=agent.llm,
+        workdir=workdir,
+        artifact_manager=ArtifactManager.for_workdir(workdir),
+        approval_provider=approval_provider,
     )
     messages = agent.new_messages()
 
@@ -172,6 +184,23 @@ def main() -> None:
                             phase="received",
                             data={"content": summarize_text(query)},
                         )
+                        workflow_request = parse_workflow_command(query)
+                        if workflow_request is not None:
+                            if not workflow_request:
+                                print(
+                                    "\033[33m[workflow]\033[0m "
+                                    "usage: /workflow <request>"
+                                )
+                                continue
+                            result = workflow.run(
+                                workflow_request,
+                                on_event=print_agent_event,
+                                run_id=run_id,
+                                trace=trace,
+                            )
+                            print(_format_workflow_result(result))
+                            continue
+
                         agent.hooks.trigger_hooks(
                             "UserPromptSubmit",
                             query,
@@ -196,6 +225,21 @@ def main() -> None:
     finally:
         if agent.background_jobs is not None:
             agent.background_jobs.shutdown()
+
+
+def _format_workflow_result(result: WorkflowResult) -> str:
+    color = "\033[32m" if result.status == "completed" else "\033[31m"
+    reset = "\033[0m"
+    artifacts = ", ".join(result.artifact_ids) or "none"
+    verdict = result.qa_verdict or "unknown"
+    lines = [
+        f"\n{color}[workflow {result.status}]{reset} {result.workflow_id}",
+        f"qa_verdict={verdict} fix_cycles={result.fix_cycles}",
+        f"artifacts={artifacts}",
+    ]
+    if result.error:
+        lines.append(f"error={result.error}")
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
