@@ -391,6 +391,9 @@ Web UI 可以继续复用同一个 Agent、Hook 和 Event 边界。
 - [x] 每个 worker 复用同一个 `LLMClient / ArtifactManager / workspace`
 - [x] 每个 worker 可通过 `RoleSpec` 绑定 required/optional Skill
 - [x] Required Skill 自动注入 role context，Optional Skill 保持按需加载
+- [x] 支持 `.llm_agent/workflow.yaml` 配置 workflow 预算和 role skill
+- [x] 配置层只开放 `required_skills / optional_skills / max_steps`，不开放工具权限
+- [x] Required Skill 缺失时 fail fast，Optional Skill 缺失时忽略并 warning
 - [x] Artifact gate 检查每个阶段是否新建或更新了必需 artifact
 - [x] QA gate 要求 `metadata.verdict` 明确为 `pass` 或 `fail`
 - [x] 阶段 artifact gate 失败时自动给同一 worker 一次纠正机会
@@ -604,6 +607,7 @@ User Requirement
 - [x] 每个 Worker 有独立 system prompt
 - [x] 每个 Worker 有独立 tools 白名单
 - [x] 每个 Worker 可配置 required/optional Skill
+- [x] 每个 Worker 的 Skill 和步数预算可通过 `.llm_agent/workflow.yaml` 配置
 - [x] 每个 Worker 有独立 ContextManager
 - [x] 每个 Worker 可以读写 artifact
 - [x] 每个 Worker 可以输出 phase result

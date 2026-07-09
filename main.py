@@ -47,6 +47,7 @@ from llm_agent.trace_system import (
     summarize_text,
     trace_scope,
 )
+from llm_agent.workflow_config import load_workflow_config
 from llm_agent.worktree import WorktreeManager
 
 
@@ -158,12 +159,23 @@ def main() -> None:
     agent = build_agent(
         approval_provider=approval_provider,
     )
+    workflow_skill_registry = SkillRegistry.for_workdir(workdir)
+    workflow_config = load_workflow_config(
+        workdir,
+        skill_registry=workflow_skill_registry,
+    )
+    for warning in workflow_config.warnings:
+        print(f"\033[33m[workflow config]\033[0m {warning}")
     workflow = SerialCodingWorkflow(
         llm=agent.llm,
         workdir=workdir,
         artifact_manager=ArtifactManager.for_workdir(workdir),
         approval_provider=approval_provider,
-        skill_registry=SkillRegistry.for_workdir(workdir),
+        skill_registry=workflow_skill_registry,
+        role_specs=workflow_config.role_specs,
+        max_fix_cycles=workflow_config.max_fix_cycles,
+        max_phase_retries=workflow_config.max_phase_retries,
+        max_context_tokens=workflow_config.max_context_tokens,
     )
     messages = agent.new_messages()
 

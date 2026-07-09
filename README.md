@@ -525,3 +525,42 @@ skill_read_resource(
 ```text
 加载 code-review skill，检查当前代码改动并按严重程度报告问题。
 ```
+
+## Workflow Configuration
+
+串行 workflow 支持项目级配置文件：
+
+```text
+.llm_agent/workflow.yaml
+```
+
+MVP 只开放 role skill 和运行预算配置，不开放工具权限、phase 顺序或模型覆盖。
+这样可以保持 PM / Engineer / QA 的安全边界稳定。
+
+```yaml
+version: 1
+
+workflow:
+  max_fix_cycles: 1
+  max_phase_retries: 1
+  max_context_tokens: 100000
+
+roles:
+  pm:
+    required_skills:
+      - prd-writer
+    max_steps: 12
+
+  engineer:
+    optional_skills:
+      - code-review
+    max_steps: 24
+
+  qa:
+    optional_skills:
+      - qa-checklist
+```
+
+`required_skills` 在 role agent 启动时自动注入完整 Skill 正文；缺失会让启动失败。
+`optional_skills` 只是候选增强能力，缺失时会被忽略并打印 warning，实际加载仍
+通过 `skill_load` 工具调用发生。
