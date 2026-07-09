@@ -31,6 +31,10 @@ from llm_agent.trace_system import (
     summarize_text,
     trace_scope,
 )
+from llm_agent.workflow_store import (
+    WorkflowRunRecord,
+    WorkflowStore,
+)
 
 
 WorkflowStatus = Literal["completed", "failed"]
@@ -159,6 +163,7 @@ class SerialCodingWorkflow:
     artifact_manager: ArtifactManager
     approval_provider: ApprovalProvider | None = None
     skill_registry: SkillRegistry | None = None
+    workflow_store: WorkflowStore | None = None
     role_specs: dict[str, RoleSpec] = field(
         default_factory=lambda: dict(ROLE_SPECS)
     )
@@ -168,6 +173,8 @@ class SerialCodingWorkflow:
 
     def __post_init__(self) -> None:
         self.workdir = Path(self.workdir).resolve()
+        if self.workflow_store is None:
+            self.workflow_store = WorkflowStore.for_workdir(self.workdir)
         missing_roles = {"pm", "engineer", "qa", "pm_acceptance"} - set(
             self.role_specs
         )
@@ -194,9 +201,13 @@ class SerialCodingWorkflow:
 
         workflow_id = run_id or f"workflow-{uuid4().hex[:12]}"
         initial_artifact_ids = self._artifact_ids()
-        phases: list[WorkflowPhaseResult] = []
-        qa_verdict: str | None = None
-        fix_cycles = 0
+        if self.workflow_store is None:
+            raise RuntimeError("Workflow store is required.")
+        record = self.workflow_store.create_run(
+            workflow_id=workflow_id,
+            request=request,
+            initial_artifact_ids=sorted(initial_artifact_ids),
+        )
 
         with trace_scope(
             trace,
@@ -208,37 +219,118 @@ class SerialCodingWorkflow:
                 phase="started",
                 data={"workflow_id": workflow_id, "request": summarize_text(request)},
             )
-
-            pm_result = self._run_phase(
-                phase="pm_plan",
-                role=self.role_specs["pm"],
-                workflow_id=workflow_id,
-                request=request,
-                prompt=self._pm_prompt(workflow_id, request),
-                gate=lambda before: self._gate_required_artifacts(
-                    initial_artifact_ids,
-                    before,
-                    required={"prd": {"ready", "accepted"}, "task_spec": {"ready", "accepted"}},
-                ),
+            return self._execute_record(
+                record,
                 on_event=on_event,
                 trace=trace,
             )
-            phases.append(pm_result)
-            if pm_result.status == "failed":
-                return self._finish(
-                    workflow_id,
-                    status="failed",
-                    phases=phases,
-                    initial_artifact_ids=initial_artifact_ids,
-                    error=pm_result.error,
-                )
 
-            engineer_result = self._run_phase(
-                phase="engineer_implement",
+    def _execute_record(
+        self,
+        record: WorkflowRunRecord,
+        *,
+        on_event: AgentCallback | None,
+        trace: TraceRecorder | None,
+    ) -> WorkflowResult:
+        workflow_id = record.workflow_id
+        request = record.request
+        initial_artifact_ids = set(record.initial_artifact_ids)
+
+        pm_result = self._ensure_phase(
+            record,
+            phase_key="pm_plan",
+            phase="pm_plan",
+            role=self.role_specs["pm"],
+            request=request,
+            prompt=self._pm_prompt(workflow_id, request),
+            gate=lambda before: self._gate_required_artifacts(
+                initial_artifact_ids,
+                before,
+                required={
+                    "prd": {"ready", "accepted"},
+                    "task_spec": {"ready", "accepted"},
+                },
+            ),
+            on_event=on_event,
+            trace=trace,
+        )
+        if pm_result.status == "failed":
+            return self._finish(
+                workflow_id,
+                status="failed",
+                phases=self._record_phase_results(record),
+                initial_artifact_ids=initial_artifact_ids,
+                error=pm_result.error,
+                record=record,
+            )
+
+        engineer_result = self._ensure_phase(
+            record,
+            phase_key="engineer_implement",
+            phase="engineer_implement",
+            role=self.role_specs["engineer"],
+            request=request,
+            prompt=self._engineer_prompt(workflow_id, request, fix=False),
+            gate=lambda before: self._gate_required_artifacts(
+                initial_artifact_ids,
+                before,
+                required={"implementation_report": None},
+            ),
+            on_event=on_event,
+            trace=trace,
+        )
+        if engineer_result.status == "failed":
+            return self._finish(
+                workflow_id,
+                status="failed",
+                phases=self._record_phase_results(record),
+                initial_artifact_ids=initial_artifact_ids,
+                error=engineer_result.error,
+                record=record,
+            )
+
+        qa_result = self._ensure_phase(
+            record,
+            phase_key="qa_verify",
+            phase="qa_verify",
+            role=self.role_specs["qa"],
+            request=request,
+            prompt=self._qa_prompt(workflow_id, request, regression=False),
+            gate=lambda before: self._gate_test_report(initial_artifact_ids, before),
+            on_event=on_event,
+            trace=trace,
+        )
+        if qa_result.status == "failed":
+            return self._finish(
+                workflow_id,
+                status="failed",
+                phases=self._record_phase_results(record),
+                initial_artifact_ids=initial_artifact_ids,
+                error=qa_result.error,
+                record=record,
+            )
+        qa_verdict = str(qa_result.data.get("qa_verdict", "unknown"))
+        record.qa_verdict = qa_verdict
+        self._save_record(record)
+
+        fix_cycles = 0
+        while qa_verdict == "fail" and fix_cycles < self.max_fix_cycles:
+            fix_cycles += 1
+            record.fix_cycles = fix_cycles
+            self._save_record(record)
+
+            fix_result = self._ensure_phase(
+                record,
+                phase_key=f"engineer_fix_{fix_cycles}",
+                phase="engineer_fix",
                 role=self.role_specs["engineer"],
-                workflow_id=workflow_id,
                 request=request,
-                prompt=self._engineer_prompt(workflow_id, request, fix=False),
+                prompt=self._engineer_prompt(
+                    workflow_id,
+                    request,
+                    fix=True,
+                    fix_cycle=fix_cycles,
+                ),
                 gate=lambda before: self._gate_required_artifacts(
                     initial_artifact_ids,
                     before,
@@ -247,22 +339,30 @@ class SerialCodingWorkflow:
                 on_event=on_event,
                 trace=trace,
             )
-            phases.append(engineer_result)
-            if engineer_result.status == "failed":
+            if fix_result.status == "failed":
                 return self._finish(
                     workflow_id,
                     status="failed",
-                    phases=phases,
+                    phases=self._record_phase_results(record),
                     initial_artifact_ids=initial_artifact_ids,
-                    error=engineer_result.error,
+                    qa_verdict=qa_verdict,
+                    fix_cycles=fix_cycles,
+                    error=fix_result.error,
+                    record=record,
                 )
 
-            qa_result = self._run_phase(
-                phase="qa_verify",
+            qa_result = self._ensure_phase(
+                record,
+                phase_key=f"qa_regression_{fix_cycles}",
+                phase="qa_regression",
                 role=self.role_specs["qa"],
-                workflow_id=workflow_id,
                 request=request,
-                prompt=self._qa_prompt(workflow_id, request, regression=False),
+                prompt=self._qa_prompt(
+                    workflow_id,
+                    request,
+                    regression=True,
+                    fix_cycle=fix_cycles,
+                ),
                 gate=lambda before: self._gate_test_report(
                     initial_artifact_ids,
                     before,
@@ -270,127 +370,165 @@ class SerialCodingWorkflow:
                 on_event=on_event,
                 trace=trace,
             )
-            phases.append(qa_result)
             if qa_result.status == "failed":
                 return self._finish(
                     workflow_id,
                     status="failed",
-                    phases=phases,
-                    initial_artifact_ids=initial_artifact_ids,
-                    error=qa_result.error,
-                )
-            qa_verdict = str(qa_result.data.get("qa_verdict", "unknown"))
-
-            while qa_verdict == "fail" and fix_cycles < self.max_fix_cycles:
-                fix_cycles += 1
-                fix_result = self._run_phase(
-                    phase="engineer_fix",
-                    role=self.role_specs["engineer"],
-                    workflow_id=workflow_id,
-                    request=request,
-                    prompt=self._engineer_prompt(
-                        workflow_id,
-                        request,
-                        fix=True,
-                        fix_cycle=fix_cycles,
-                    ),
-                    gate=lambda before: self._gate_required_artifacts(
-                        initial_artifact_ids,
-                        before,
-                        required={"implementation_report": None},
-                    ),
-                    on_event=on_event,
-                    trace=trace,
-                )
-                phases.append(fix_result)
-                if fix_result.status == "failed":
-                    return self._finish(
-                        workflow_id,
-                        status="failed",
-                        phases=phases,
-                        initial_artifact_ids=initial_artifact_ids,
-                        qa_verdict=qa_verdict,
-                        fix_cycles=fix_cycles,
-                        error=fix_result.error,
-                    )
-
-                qa_result = self._run_phase(
-                    phase="qa_regression",
-                    role=self.role_specs["qa"],
-                    workflow_id=workflow_id,
-                    request=request,
-                    prompt=self._qa_prompt(
-                        workflow_id,
-                        request,
-                        regression=True,
-                        fix_cycle=fix_cycles,
-                    ),
-                    gate=lambda before: self._gate_test_report(
-                        initial_artifact_ids,
-                        before,
-                    ),
-                    on_event=on_event,
-                    trace=trace,
-                )
-                phases.append(qa_result)
-                if qa_result.status == "failed":
-                    return self._finish(
-                        workflow_id,
-                        status="failed",
-                        phases=phases,
-                        initial_artifact_ids=initial_artifact_ids,
-                        qa_verdict=qa_verdict,
-                        fix_cycles=fix_cycles,
-                        error=qa_result.error,
-                    )
-                qa_verdict = str(qa_result.data.get("qa_verdict", "unknown"))
-
-            acceptance_result = self._run_phase(
-                phase="pm_acceptance",
-                role=self.role_specs["pm_acceptance"],
-                workflow_id=workflow_id,
-                request=request,
-                prompt=self._acceptance_prompt(
-                    workflow_id,
-                    request,
-                    qa_verdict=qa_verdict,
-                ),
-                gate=lambda before: self._gate_required_artifacts(
-                    initial_artifact_ids,
-                    before,
-                    required={"acceptance_report": None},
-                ),
-                on_event=on_event,
-                trace=trace,
-            )
-            phases.append(acceptance_result)
-            if acceptance_result.status == "failed":
-                return self._finish(
-                    workflow_id,
-                    status="failed",
-                    phases=phases,
+                    phases=self._record_phase_results(record),
                     initial_artifact_ids=initial_artifact_ids,
                     qa_verdict=qa_verdict,
                     fix_cycles=fix_cycles,
-                    error=acceptance_result.error,
+                    error=qa_result.error,
+                    record=record,
                 )
+            qa_verdict = str(qa_result.data.get("qa_verdict", "unknown"))
+            record.qa_verdict = qa_verdict
+            record.fix_cycles = fix_cycles
+            self._save_record(record)
 
-            status: WorkflowStatus = "completed" if qa_verdict == "pass" else "failed"
-            error = None if status == "completed" else "QA verdict did not pass."
+        acceptance_result = self._ensure_phase(
+            record,
+            phase_key="pm_acceptance",
+            phase="pm_acceptance",
+            role=self.role_specs["pm_acceptance"],
+            request=request,
+            prompt=self._acceptance_prompt(
+                workflow_id,
+                request,
+                qa_verdict=qa_verdict,
+            ),
+            gate=lambda before: self._gate_required_artifacts(
+                initial_artifact_ids,
+                before,
+                required={"acceptance_report": None},
+            ),
+            on_event=on_event,
+            trace=trace,
+        )
+        if acceptance_result.status == "failed":
             return self._finish(
                 workflow_id,
-                status=status,
-                phases=phases,
+                status="failed",
+                phases=self._record_phase_results(record),
                 initial_artifact_ids=initial_artifact_ids,
                 qa_verdict=qa_verdict,
                 fix_cycles=fix_cycles,
-                error=error,
+                error=acceptance_result.error,
+                record=record,
+            )
+
+        status: WorkflowStatus = "completed" if qa_verdict == "pass" else "failed"
+        error = None if status == "completed" else "QA verdict did not pass."
+        return self._finish(
+            workflow_id,
+            status=status,
+            phases=self._record_phase_results(record),
+            initial_artifact_ids=initial_artifact_ids,
+            qa_verdict=qa_verdict,
+            fix_cycles=fix_cycles,
+            error=error,
+            record=record,
+        )
+
+    def _ensure_phase(
+        self,
+        record: WorkflowRunRecord,
+        *,
+        phase_key: str,
+        phase: WorkflowPhase,
+        role: RoleSpec,
+        request: str,
+        prompt: str,
+        gate: Callable[[dict[str, int]], _GateResult],
+        on_event: AgentCallback | None,
+        trace: TraceRecorder | None,
+    ) -> WorkflowPhaseResult:
+        completed_result = self._record_phase_result(record, phase_key)
+        if completed_result is not None and completed_result.status == "completed":
+            return completed_result
+
+        checkpoint = record.checkpoints.get(phase_key)
+        before_versions = checkpoint.before_versions if checkpoint else None
+        if checkpoint is not None:
+            gate_result = gate(checkpoint.before_versions)
+            if gate_result.ok:
+                recovered = WorkflowPhaseResult(
+                    phase=phase,
+                    role=role.name,
+                    status="completed",
+                    run_ids=list(checkpoint.run_ids),
+                    artifact_ids=gate_result.artifact_ids,
+                    summary="Recovered completed phase from persisted checkpoint.",
+                    attempts=max(1, checkpoint.attempts),
+                    data=gate_result.data,
+                )
+                self._record_workflow_trace(
+                    "workflow.phase.recovered",
+                    phase="completed",
+                    data={
+                        "workflow_id": record.workflow_id,
+                        "phase_key": phase_key,
+                        "phase": phase,
+                        "role": role.name,
+                        "artifact_ids": gate_result.artifact_ids,
+                        **gate_result.data,
+                    },
+                )
+                self._persist_phase_completed(record, phase_key, recovered)
+                return recovered
+
+        return self._run_phase(
+            phase=phase,
+            phase_key=phase_key,
+            role=role,
+            workflow_id=record.workflow_id,
+            request=request,
+            prompt=prompt,
+            gate=gate,
+            on_event=on_event,
+            trace=trace,
+            record=record,
+            before_versions=before_versions,
+        )
+
+    def resume(
+        self,
+        workflow_id: str,
+        *,
+        on_event: AgentCallback | None = None,
+        trace: TraceRecorder | None = None,
+    ) -> WorkflowResult:
+        if self.workflow_store is None:
+            raise RuntimeError("Workflow store is required.")
+        record = self.workflow_store.load_run(workflow_id)
+        if record.status == "completed":
+            return self._record_to_result(record)
+
+        with trace_scope(
+            trace,
+            run_id=workflow_id,
+            agent_id="workflow-orchestrator",
+        ):
+            self._record_workflow_trace(
+                "workflow.resumed",
+                phase="started",
+                data={
+                    "workflow_id": workflow_id,
+                    "previous_status": record.status,
+                    "request": summarize_text(record.request),
+                },
+            )
+            return self._execute_record(
+                record,
+                on_event=on_event,
+                trace=trace,
             )
 
     def _run_phase(
         self,
         *,
         phase: WorkflowPhase,
+        phase_key: str,
         role: RoleSpec,
         workflow_id: str,
         request: str,
@@ -398,17 +536,33 @@ class SerialCodingWorkflow:
         gate: Callable[[dict[str, int]], _GateResult],
         on_event: AgentCallback | None,
         trace: TraceRecorder | None,
+        record: WorkflowRunRecord | None = None,
+        before_versions: dict[str, int] | None = None,
     ) -> WorkflowPhaseResult:
-        before_versions = self._artifact_versions()
+        if before_versions is None:
+            before_versions = self._artifact_versions()
         run_ids: list[str] = []
         messages: list[dict[str, Any]] | None = None
         last_summary = ""
         last_gate = _GateResult(ok=False, message="Phase did not run.")
+        if record is not None and self.workflow_store is not None:
+            self.workflow_store.mark_phase_started(
+                record,
+                phase_key=phase_key,
+                phase=phase,
+                role=role.name,
+                before_versions=before_versions,
+            )
 
         self._record_workflow_trace(
             "workflow.phase.started",
             phase="started",
-            data={"workflow_id": workflow_id, "phase": phase, "role": role.name},
+            data={
+                "workflow_id": workflow_id,
+                "phase_key": phase_key,
+                "phase": phase,
+                "role": role.name,
+            },
         )
 
         for attempt in range(1, self.max_phase_retries + 2):
@@ -446,6 +600,7 @@ class SerialCodingWorkflow:
                     phase="completed",
                     data={
                         "workflow_id": workflow_id,
+                        "phase_key": phase_key,
                         "phase": phase,
                         "role": role.name,
                         "attempts": attempt,
@@ -453,7 +608,7 @@ class SerialCodingWorkflow:
                         **last_gate.data,
                     },
                 )
-                return WorkflowPhaseResult(
+                phase_result = WorkflowPhaseResult(
                     phase=phase,
                     role=role.name,
                     status="completed",
@@ -463,6 +618,8 @@ class SerialCodingWorkflow:
                     attempts=attempt,
                     data=last_gate.data,
                 )
+                self._persist_phase_completed(record, phase_key, phase_result)
+                return phase_result
 
             if attempt <= self.max_phase_retries:
                 messages.append(
@@ -478,13 +635,14 @@ class SerialCodingWorkflow:
             status="error",
             data={
                 "workflow_id": workflow_id,
+                "phase_key": phase_key,
                 "phase": phase,
                 "role": role.name,
                 "attempts": self.max_phase_retries + 1,
                 "error": last_gate.message,
             },
         )
-        return WorkflowPhaseResult(
+        failed_result = WorkflowPhaseResult(
             phase=phase,
             role=role.name,
             status="failed",
@@ -495,6 +653,8 @@ class SerialCodingWorkflow:
             error=last_gate.message,
             data=last_gate.data,
         )
+        self._persist_phase_failed(record, phase_key, failed_result)
+        return failed_result
 
     def _build_role_agent(
         self,
@@ -764,6 +924,7 @@ class SerialCodingWorkflow:
         qa_verdict: str | None = None,
         fix_cycles: int = 0,
         error: str | None = None,
+        record: WorkflowRunRecord | None = None,
     ) -> WorkflowResult:
         artifact_ids = [
             artifact.id for artifact in self._workflow_artifacts(initial_artifact_ids)
@@ -777,6 +938,15 @@ class SerialCodingWorkflow:
             fix_cycles=fix_cycles,
             error=error,
         )
+        if record is not None and self.workflow_store is not None:
+            self.workflow_store.mark_finished(
+                record,
+                status=status,
+                artifact_ids=artifact_ids,
+                qa_verdict=qa_verdict,
+                fix_cycles=fix_cycles,
+                error=error,
+            )
         self._record_workflow_trace(
             "workflow.completed",
             phase="completed",
@@ -791,6 +961,107 @@ class SerialCodingWorkflow:
             },
         )
         return result
+
+    def _persist_phase_completed(
+        self,
+        record: WorkflowRunRecord | None,
+        phase_key: str,
+        result: WorkflowPhaseResult,
+    ) -> None:
+        if record is None or self.workflow_store is None:
+            return
+        self.workflow_store.mark_phase_completed(
+            record,
+            phase_key=phase_key,
+            phase_result=self._phase_result_to_dict(result),
+            attempts=result.attempts,
+            run_ids=result.run_ids,
+            artifact_ids=result.artifact_ids,
+            data=result.data,
+        )
+
+    def _persist_phase_failed(
+        self,
+        record: WorkflowRunRecord | None,
+        phase_key: str,
+        result: WorkflowPhaseResult,
+    ) -> None:
+        if record is None or self.workflow_store is None:
+            return
+        self.workflow_store.mark_phase_failed(
+            record,
+            phase_key=phase_key,
+            phase_result=self._phase_result_to_dict(result),
+            attempts=result.attempts,
+            run_ids=result.run_ids,
+            artifact_ids=result.artifact_ids,
+            error=result.error,
+            data=result.data,
+        )
+
+    def _save_record(self, record: WorkflowRunRecord) -> None:
+        if self.workflow_store is not None:
+            self.workflow_store.save_run(record)
+
+    def _record_phase_result(
+        self,
+        record: WorkflowRunRecord,
+        phase_key: str,
+    ) -> WorkflowPhaseResult | None:
+        for item in record.phases:
+            if item.get("phase_key") == phase_key:
+                return self._phase_result_from_dict(item)
+        return None
+
+    def _record_phase_results(
+        self,
+        record: WorkflowRunRecord,
+    ) -> list[WorkflowPhaseResult]:
+        return [self._phase_result_from_dict(item) for item in record.phases]
+
+    def _record_to_result(self, record: WorkflowRunRecord) -> WorkflowResult:
+        status: WorkflowStatus = (
+            "completed" if record.status == "completed" else "failed"
+        )
+        return WorkflowResult(
+            workflow_id=record.workflow_id,
+            status=status,
+            phases=self._record_phase_results(record),
+            artifact_ids=list(record.artifact_ids),
+            qa_verdict=record.qa_verdict,
+            fix_cycles=record.fix_cycles,
+            error=record.error,
+        )
+
+    @staticmethod
+    def _phase_result_to_dict(result: WorkflowPhaseResult) -> dict[str, Any]:
+        return {
+            "phase": result.phase,
+            "role": result.role,
+            "status": result.status,
+            "run_ids": list(result.run_ids),
+            "artifact_ids": list(result.artifact_ids),
+            "summary": result.summary,
+            "attempts": result.attempts,
+            "error": result.error,
+            "data": dict(result.data),
+        }
+
+    @staticmethod
+    def _phase_result_from_dict(data: dict[str, Any]) -> WorkflowPhaseResult:
+        return WorkflowPhaseResult(
+            phase=str(data["phase"]),  # type: ignore[arg-type]
+            role=str(data["role"]),
+            status=str(data["status"]),  # type: ignore[arg-type]
+            run_ids=[str(value) for value in data.get("run_ids") or []],
+            artifact_ids=[
+                str(value) for value in data.get("artifact_ids") or []
+            ],
+            summary=str(data.get("summary") or ""),
+            attempts=int(data.get("attempts") or 1),
+            error=str(data["error"]) if data.get("error") is not None else None,
+            data=dict(data.get("data") or {}),
+        )
 
     def _record_workflow_trace(
         self,

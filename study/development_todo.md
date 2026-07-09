@@ -400,12 +400,15 @@ Web UI 可以继续复用同一个 Agent、Hook 和 Event 边界。
 - [x] QA verdict 为 `fail` 时触发一次 Engineer fix cycle 和 QA regression
 - [x] Workflow 生命周期和 phase 事件写入 Trace
 - [x] CLI 支持显式 `/workflow <request>` 入口
+- [x] Workflow run record 持久化到 `.llm_agent/workflows/<workflow_id>/run.json`
+- [x] 支持 `/workflow-list`、`/workflow-show <id>`、`/workflow-resume <id>`
+- [x] Resume 基于 phase checkpoint 和 artifact gate，不做完整 message replay
 - [x] 覆盖成功流程、artifact gate retry、QA fail fix cycle 和命令解析测试
 
 当前边界：
 
 - 目前是同步串行 Orchestrator-Worker，不支持并行 Agent Team。
-- Workflow 状态只在当前进程内运行，尚未持久化到 `.llm_agent/workflows/`。
+- Workflow 已支持 checkpoint resume，但暂不支持跨机器锁、并发 resume 或 phase 内精确断点。
 - Role 目前使用 `RoleSpec` 配置，没有单独抽象 `PMAgent / EngineerAgent / QAAgent` 类。
 - Artifact gate 仍基于 artifact kind/status/metadata，尚未接入强 schema 校验。
 - Engineer 默认在主 workspace 执行，尚未默认启用 Worktree isolation。

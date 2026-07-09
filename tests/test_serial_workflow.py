@@ -156,6 +156,104 @@ def test_serial_workflow_runs_pm_engineer_qa_acceptance(
     assert workflow_events[0] == "workflow.started"
     assert "workflow.phase.completed" in workflow_events
     assert workflow_events[-1] == "workflow.completed"
+    run_data = json.loads(
+        (tmp_path / ".llm_agent" / "workflows" / "wf-pass" / "run.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert run_data["status"] == "completed"
+    assert run_data["qa_verdict"] == "pass"
+    assert [phase["phase_key"] for phase in run_data["phases"]] == [
+        "pm_plan",
+        "engineer_implement",
+        "qa_verify",
+        "pm_acceptance",
+    ]
+
+
+def test_serial_workflow_resume_completed_run_does_not_call_llm(
+    tmp_path: Path,
+) -> None:
+    llm = FakeLLM(_successful_outputs("wf-done"))
+    workflow = _workflow(tmp_path, llm)
+
+    result = workflow.run("Build a completed workflow.", run_id="wf-done")
+    message_count = len(llm.messages)
+    resumed = workflow.resume("wf-done")
+
+    assert result.status == "completed"
+    assert resumed.status == "completed"
+    assert resumed.workflow_id == "wf-done"
+    assert len(llm.messages) == message_count
+
+
+def test_serial_workflow_resume_recovers_running_phase_when_gate_is_satisfied(
+    tmp_path: Path,
+) -> None:
+    llm = FakeLLM(_successful_outputs("wf-recover", include_pm=False))
+    workflow = _workflow(tmp_path, llm)
+    assert workflow.workflow_store is not None
+    record = workflow.workflow_store.create_run(
+        workflow_id="wf-recover",
+        request="Build from recovered planning.",
+        initial_artifact_ids=[],
+    )
+    workflow.workflow_store.mark_phase_started(
+        record,
+        phase_key="pm_plan",
+        phase="pm_plan",
+        role="PM",
+        before_versions={},
+    )
+    manager = ArtifactManager.for_workdir(tmp_path)
+    manager.create_artifact(
+        kind="prd",
+        title="PRD",
+        content="Recovered plan.",
+        status="ready",
+        metadata={"workflow_id": "wf-recover", "role": "pm"},
+    )
+    manager.create_artifact(
+        kind="task_spec",
+        title="Task Spec",
+        content="Recovered task.",
+        status="ready",
+        metadata={"workflow_id": "wf-recover", "role": "pm"},
+    )
+
+    result = workflow.resume("wf-recover")
+
+    assert result.status == "completed"
+    assert result.phases[0].phase == "pm_plan"
+    assert result.phases[0].summary.startswith("Recovered completed phase")
+    assert len(llm.messages) == 6
+
+
+def test_serial_workflow_resume_reruns_running_phase_when_gate_is_missing(
+    tmp_path: Path,
+) -> None:
+    llm = FakeLLM(_successful_outputs("wf-rerun"))
+    workflow = _workflow(tmp_path, llm)
+    assert workflow.workflow_store is not None
+    record = workflow.workflow_store.create_run(
+        workflow_id="wf-rerun",
+        request="Build from rerun planning.",
+        initial_artifact_ids=[],
+    )
+    workflow.workflow_store.mark_phase_started(
+        record,
+        phase_key="pm_plan",
+        phase="pm_plan",
+        role="PM",
+        before_versions={},
+    )
+
+    result = workflow.resume("wf-rerun")
+
+    assert result.status == "completed"
+    assert result.phases[0].phase == "pm_plan"
+    assert result.phases[0].summary == "planning done"
+    assert len(llm.messages) == 8
 
 
 def test_serial_workflow_retries_missing_artifact_gate(
@@ -468,6 +566,77 @@ def _workflow(tmp_path: Path, llm: FakeLLM) -> SerialCodingWorkflow:
         artifact_manager=ArtifactManager.for_workdir(tmp_path),
         approval_provider=AutoApprovalProvider(approved=True),
     )
+
+
+def _successful_outputs(
+    workflow_id: str,
+    *,
+    include_pm: bool = True,
+) -> list[LLMResponse]:
+    outputs: list[LLMResponse] = []
+    if include_pm:
+        outputs.extend(
+            [
+                _response(
+                    _create_call(
+                        f"{workflow_id}-prd",
+                        kind="prd",
+                        title="PRD",
+                        content="Build the requested feature.",
+                        status="ready",
+                        metadata={"workflow_id": workflow_id, "role": "pm"},
+                    ),
+                    _create_call(
+                        f"{workflow_id}-task",
+                        kind="task_spec",
+                        title="Task Spec",
+                        content="Implementation scope.",
+                        status="ready",
+                        metadata={"workflow_id": workflow_id, "role": "pm"},
+                    ),
+                ),
+                LLMResponse(content="planning done", tool_calls=[], raw={}),
+            ]
+        )
+    outputs.extend(
+        [
+            _response(
+                _create_call(
+                    f"{workflow_id}-impl",
+                    kind="implementation_report",
+                    title="Implementation Report",
+                    content="No code changes needed.",
+                    metadata={"workflow_id": workflow_id, "role": "engineer"},
+                )
+            ),
+            LLMResponse(content="implementation done", tool_calls=[], raw={}),
+            _response(
+                _create_call(
+                    f"{workflow_id}-test",
+                    kind="test_report",
+                    title="Test Report",
+                    content="Checks pass.",
+                    metadata={
+                        "workflow_id": workflow_id,
+                        "role": "qa",
+                        "verdict": "pass",
+                    },
+                )
+            ),
+            LLMResponse(content="qa pass", tool_calls=[], raw={}),
+            _response(
+                _create_call(
+                    f"{workflow_id}-accept",
+                    kind="acceptance_report",
+                    title="Acceptance Report",
+                    content="Accepted.",
+                    metadata={"workflow_id": workflow_id, "role": "pm"},
+                )
+            ),
+            LLMResponse(content="accepted", tool_calls=[], raw={}),
+        ]
+    )
+    return outputs
 
 
 def _write_skill(tmp_path: Path, directory: str, manifest: str) -> None:

@@ -48,6 +48,7 @@ from llm_agent.trace_system import (
     trace_scope,
 )
 from llm_agent.workflow_config import load_workflow_config
+from llm_agent.workflow_store import WorkflowRunRecord
 from llm_agent.worktree import WorktreeManager
 
 
@@ -201,6 +202,43 @@ def main() -> None:
                             phase="received",
                             data={"content": summarize_text(query)},
                         )
+                        workflow_command = _parse_workflow_cli_command(query)
+                        if workflow_command is not None:
+                            command, argument = workflow_command
+                            if command == "list":
+                                print(
+                                    _format_workflow_runs(
+                                        workflow.workflow_store.list_runs()
+                                        if workflow.workflow_store is not None
+                                        else []
+                                    )
+                                )
+                                continue
+                            if command == "show":
+                                if not argument:
+                                    print(
+                                        "\033[33m[workflow]\033[0m "
+                                        "usage: /workflow-show <workflow_id>"
+                                    )
+                                    continue
+                                record = workflow.workflow_store.load_run(argument)
+                                print(_format_workflow_record(record))
+                                continue
+                            if command == "resume":
+                                if not argument:
+                                    print(
+                                        "\033[33m[workflow]\033[0m "
+                                        "usage: /workflow-resume <workflow_id>"
+                                    )
+                                    continue
+                                result = workflow.resume(
+                                    argument,
+                                    on_event=print_agent_event,
+                                    trace=trace,
+                                )
+                                print(_format_workflow_result(result))
+                                continue
+
                         workflow_request = parse_workflow_command(query)
                         if workflow_request is not None:
                             if not workflow_request:
@@ -256,6 +294,55 @@ def _format_workflow_result(result: WorkflowResult) -> str:
     ]
     if result.error:
         lines.append(f"error={result.error}")
+    return "\n".join(lines)
+
+
+def _parse_workflow_cli_command(query: str) -> tuple[str, str] | None:
+    stripped = query.strip()
+    commands = {
+        "/workflow-list": "list",
+        "/workflow-show": "show",
+        "/workflow-resume": "resume",
+    }
+    for prefix, command in commands.items():
+        if stripped == prefix:
+            return command, ""
+        if stripped.startswith(prefix + " "):
+            return command, stripped.removeprefix(prefix).strip()
+    return None
+
+
+def _format_workflow_runs(records: list[WorkflowRunRecord]) -> str:
+    if not records:
+        return "\033[33m[workflow]\033[0m no workflow runs found"
+    lines = ["\n\033[36m[workflow runs]\033[0m"]
+    for record in records[:20]:
+        phase = record.current_phase_key or "-"
+        verdict = record.qa_verdict or "-"
+        lines.append(
+            f"- {record.workflow_id} status={record.status} "
+            f"phase={phase} verdict={verdict} updated={record.updated_at}"
+        )
+    return "\n".join(lines)
+
+
+def _format_workflow_record(record: WorkflowRunRecord) -> str:
+    lines = [
+        f"\n\033[36m[workflow]\033[0m {record.workflow_id}",
+        f"status={record.status} current_phase={record.current_phase_key or '-'}",
+        f"qa_verdict={record.qa_verdict or '-'} fix_cycles={record.fix_cycles}",
+        f"artifacts={', '.join(record.artifact_ids) or 'none'}",
+        f"request={record.request}",
+    ]
+    if record.error:
+        lines.append(f"error={record.error}")
+    if record.phases:
+        lines.append("phases:")
+        for phase in record.phases:
+            lines.append(
+                f"- {phase.get('phase_key')} status={phase.get('status')} "
+                f"role={phase.get('role')} attempts={phase.get('attempts')}"
+            )
     return "\n".join(lines)
 
 

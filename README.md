@@ -564,3 +564,26 @@ roles:
 `required_skills` 在 role agent 启动时自动注入完整 Skill 正文；缺失会让启动失败。
 `optional_skills` 只是候选增强能力，缺失时会被忽略并打印 warning，实际加载仍
 通过 `skill_load` 工具调用发生。
+
+## Workflow Persistence
+
+每次 `/workflow <request>` 会写入一个可恢复 run record：
+
+```text
+.llm_agent/workflows/<workflow_id>/run.json
+```
+
+Workflow 恢复采用 checkpoint 策略，而不是完整 message replay。系统保存每个
+phase 开始前的 artifact versions；如果进程中断后 artifact gate 已经满足，resume
+会补写该 phase completed 并继续后续阶段。否则会从该 phase 重新运行。
+
+CLI 命令：
+
+```text
+/workflow-list
+/workflow-show <workflow_id>
+/workflow-resume <workflow_id>
+```
+
+Artifacts 仍然是跨角色交接和恢复的主数据；Trace 负责审计和调试，workflow
+record 只保存编排状态。
