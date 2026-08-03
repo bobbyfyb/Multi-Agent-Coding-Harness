@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
 from llm_agent.agent import (
@@ -25,11 +25,16 @@ from llm_agent.tool_registry import ToolRegistry
 from llm_agent.tools.basic_tools import register_tools as register_basic_tools
 from llm_agent.tools.search_tools import register_tools as register_search_tools
 from llm_agent.tools.skill_tools import register_tools as register_skill_tools
+from llm_agent.tools.mcp_tools import register_tools as register_mcp_tools
 from llm_agent.tools.verification_tools import (
     register_tools as register_verification_tools,
 )
 from llm_agent.trace_system import record_agent_event
 from llm_agent.worktree import WorktreeInfo, WorktreeManager
+
+
+if TYPE_CHECKING:
+    from llm_agent.mcp_system import MCPManager
 
 
 SubagentMode = Literal["explore", "general"]
@@ -132,6 +137,7 @@ class SubagentRunner:
     skill_registry: SkillRegistry | None = None
     memory_manager: MemoryManager | None = None
     worktree_manager: WorktreeManager | None = None
+    mcp_manager: MCPManager | None = None
     approval_provider: ApprovalProvider | None = field(
         default_factory=CliApprovalProvider
     )
@@ -267,7 +273,17 @@ class SubagentRunner:
                 registry,
                 skill_registry=self.skill_registry,
             )
-        return registry.subset(SUBAGENT_TOOL_PROFILES[mode])
+        allowed_tools = set(SUBAGENT_TOOL_PROFILES[mode])
+        if mode == "general" and self.mcp_manager is not None:
+            register_mcp_tools(
+                registry,
+                manager=self.mcp_manager,
+                scope="subagent",
+            )
+            allowed_tools.update(
+                self.mcp_manager.tool_names_for_scope("subagent")
+            )
+        return registry.subset(allowed_tools)
 
     def _build_hooks(self, workdir: Path) -> HookManager:
         manager = HookManager()
@@ -278,6 +294,16 @@ class SubagentRunner:
                 approval_provider=self.approval_provider,
             ),
         )
+        if self.mcp_manager is not None:
+            from llm_agent.hooks.mcp_hooks import MCPPermissionHook
+
+            manager.register_hook(
+                "PreToolUse",
+                MCPPermissionHook(
+                    self.mcp_manager,
+                    approval_provider=self.approval_provider,
+                ),
+            )
         return manager
 
     def _build_context(
@@ -336,6 +362,8 @@ class SubagentRunner:
         names = set(SUBAGENT_TOOL_PROFILES[mode])
         if self.skill_registry is None:
             names -= SUBAGENT_SKILL_TOOLS
+        if mode == "general" and self.mcp_manager is not None:
+            names.update(self.mcp_manager.tool_names_for_scope("subagent"))
         return names
 
     @staticmethod

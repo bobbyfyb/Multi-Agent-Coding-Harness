@@ -32,6 +32,8 @@ from llm_agent.memory_system import (
     MemoryManager,
     build_memory_policy_section,
 )
+from llm_agent.mcp_config import load_mcp_config
+from llm_agent.mcp_system import MCPManager
 from llm_agent.recovery import RecoveryPolicy
 from llm_agent.serial_workflow import (
     SerialCodingWorkflow,
@@ -55,27 +57,12 @@ from llm_agent.worktree import WorktreeManager
 def build_agent(
     *,
     approval_provider: ApprovalProvider | None = None,
+    llm: LLMClient | None = None,
+    mcp_manager: MCPManager | None = None,
 ) -> Agent:
     workdir = Path.cwd()
-    llm = LLMClient(
-        provider=os.getenv("LLM_PROVIDER", "anthropic"),
-        max_tokens=int(os.getenv("LLM_MAX_TOKENS", "4096")),
-        timeout=float(os.getenv("LLM_TIMEOUT", "240")),
-    )
-    llm.recovery_policy = RecoveryPolicy(
-        max_retries=int(os.getenv("LLM_MAX_RETRIES", "4")),
-        max_retry_elapsed_seconds=float(
-            os.getenv("LLM_MAX_RETRY_ELAPSED_SECONDS", "30")
-        ),
-        fallback_model=(
-            os.getenv("LLM_FALLBACK_MODEL")
-            or os.getenv("FALLBACK_MODEL_ID")
-        ),
-        escalated_max_tokens=int(
-            os.getenv("LLM_ESCALATED_MAX_TOKENS", "8192")
-        ),
-        max_continuations=int(os.getenv("LLM_MAX_CONTINUATIONS", "2")),
-    )
+    if llm is None:
+        llm = _build_llm()
     if approval_provider is None:
         approval_provider = CliApprovalProvider()
     skill_registry = SkillRegistry.for_workdir(workdir)
@@ -95,6 +82,7 @@ def build_agent(
         skill_registry=skill_registry,
         memory_manager=memory_manager,
         worktree_manager=worktree_manager,
+        mcp_manager=mcp_manager,
         approval_provider=approval_provider,
     )
     registry = build_default_registry(
@@ -105,6 +93,8 @@ def build_agent(
         artifact_manager=artifact_manager,
         background_manager=background_jobs,
         worktree_manager=worktree_manager,
+        mcp_manager=mcp_manager,
+        mcp_scope="main",
     )
     return Agent(
         llm=llm,
@@ -115,6 +105,7 @@ def build_agent(
             llm=llm,
             memory_manager=memory_manager,
             artifact_manager=artifact_manager,
+            mcp_manager=mcp_manager,
         ),
         workdir=workdir,
         max_steps=None,
@@ -150,6 +141,29 @@ def build_agent(
     )
 
 
+def _build_llm() -> LLMClient:
+    llm = LLMClient(
+        provider=os.getenv("LLM_PROVIDER", "anthropic"),
+        max_tokens=int(os.getenv("LLM_MAX_TOKENS", "4096")),
+        timeout=float(os.getenv("LLM_TIMEOUT", "240")),
+    )
+    llm.recovery_policy = RecoveryPolicy(
+        max_retries=int(os.getenv("LLM_MAX_RETRIES", "4")),
+        max_retry_elapsed_seconds=float(
+            os.getenv("LLM_MAX_RETRY_ELAPSED_SECONDS", "30")
+        ),
+        fallback_model=(
+            os.getenv("LLM_FALLBACK_MODEL")
+            or os.getenv("FALLBACK_MODEL_ID")
+        ),
+        escalated_max_tokens=int(
+            os.getenv("LLM_ESCALATED_MAX_TOKENS", "8192")
+        ),
+        max_continuations=int(os.getenv("LLM_MAX_CONTINUATIONS", "2")),
+    )
+    return llm
+
+
 def main() -> None:
     workdir = Path.cwd()
     prompt_session = build_user_prompt_session(workdir)
@@ -157,30 +171,45 @@ def main() -> None:
     approval_provider = CliApprovalProvider(
         input_func=approval_session.prompt,
     )
-    agent = build_agent(
-        approval_provider=approval_provider,
-    )
-    workflow_skill_registry = SkillRegistry.for_workdir(workdir)
-    workflow_config = load_workflow_config(
-        workdir,
-        skill_registry=workflow_skill_registry,
-    )
-    for warning in workflow_config.warnings:
-        print(f"\033[33m[workflow config]\033[0m {warning}")
-    workflow = SerialCodingWorkflow(
-        llm=agent.llm,
-        workdir=workdir,
-        artifact_manager=ArtifactManager.for_workdir(workdir),
-        approval_provider=approval_provider,
-        skill_registry=workflow_skill_registry,
-        worktree_manager=WorktreeManager.for_workdir(workdir),
-        isolation=workflow_config.isolation,
-        role_specs=workflow_config.role_specs,
-        max_fix_cycles=workflow_config.max_fix_cycles,
-        max_phase_retries=workflow_config.max_phase_retries,
-        max_context_tokens=workflow_config.max_context_tokens,
-    )
-    messages = agent.new_messages()
+    llm = _build_llm()
+    mcp_manager = MCPManager(load_mcp_config(workdir), workdir=workdir)
+    mcp_manager.start()
+    for warning in mcp_manager.warnings:
+        print(f"\033[33m[mcp]\033[0m {warning}")
+    agent: Agent | None = None
+    try:
+        agent = build_agent(
+            approval_provider=approval_provider,
+            llm=llm,
+            mcp_manager=mcp_manager,
+        )
+        workflow_skill_registry = SkillRegistry.for_workdir(workdir)
+        workflow_config = load_workflow_config(
+            workdir,
+            skill_registry=workflow_skill_registry,
+        )
+        for warning in workflow_config.warnings:
+            print(f"\033[33m[workflow config]\033[0m {warning}")
+        workflow = SerialCodingWorkflow(
+            llm=agent.llm,
+            workdir=workdir,
+            artifact_manager=ArtifactManager.for_workdir(workdir),
+            approval_provider=approval_provider,
+            skill_registry=workflow_skill_registry,
+            worktree_manager=WorktreeManager.for_workdir(workdir),
+            isolation=workflow_config.isolation,
+            role_specs=workflow_config.role_specs,
+            max_fix_cycles=workflow_config.max_fix_cycles,
+            max_phase_retries=workflow_config.max_phase_retries,
+            max_context_tokens=workflow_config.max_context_tokens,
+            mcp_manager=mcp_manager,
+        )
+        messages = agent.new_messages()
+    except Exception:
+        if agent is not None and agent.background_jobs is not None:
+            agent.background_jobs.shutdown()
+        mcp_manager.close()
+        raise
 
     try:
         with patch_stdout(raw=True):
@@ -204,6 +233,9 @@ def main() -> None:
                             phase="received",
                             data={"content": summarize_text(query)},
                         )
+                        if query.strip() == "/mcp-list":
+                            print(_format_mcp_status(mcp_manager))
+                            continue
                         workflow_command = _parse_workflow_cli_command(query)
                         if workflow_command is not None:
                             command, argument = workflow_command
@@ -280,8 +312,26 @@ def main() -> None:
                     trace.render_markdown()
                     print(f"\033[2m[trace] {trace.jsonl_path}\033[0m")
     finally:
-        if agent.background_jobs is not None:
+        if agent is not None and agent.background_jobs is not None:
             agent.background_jobs.shutdown()
+        mcp_manager.close()
+
+
+def _format_mcp_status(manager: MCPManager) -> str:
+    statuses = manager.status()
+    if not statuses:
+        return "\033[33m[mcp]\033[0m no servers configured"
+    lines = ["\n\033[36m[mcp servers]\033[0m"]
+    for status in statuses:
+        line = (
+            f"- {status.name} state={status.state} "
+            f"transport={status.transport} tools={status.tool_count} "
+            f"sessions={status.session_count}"
+        )
+        if status.error:
+            line += f" error={status.error}"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def _format_workflow_result(result: WorkflowResult) -> str:

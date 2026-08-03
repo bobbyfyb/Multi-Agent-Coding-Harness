@@ -534,20 +534,29 @@ Web UI 可以继续复用同一个 Agent、Hook 和 Event 边界。
 
 目标：让外部 MCP tools 可以进入当前 ToolRegistry。
 
-- [ ] 学习 MCP tool schema
-- [ ] 设计 `MCPToolAdapter`
-- [ ] 将 MCP tool 转为 `ToolDefinition`
-- [ ] 支持调用 MCP tool
-- [ ] 支持 MCP tool error 包装
-- [ ] 支持 MCP server 配置
-- [ ] 支持启动/连接本地 MCP server
-- [ ] 为常见 filesystem/git/search MCP 做 demo
+- [x] 基于官方 Python SDK v2 接入 MCP tool schema
+- [x] 通过薄适配层将 MCP tool 转为 `ToolDefinition`
+- [x] 支持 stdio 与 Streamable HTTP transport
+- [x] 使用 AnyIO BlockingPortal 保持同步 Agent loop
+- [x] 支持工具调用和 `isError` / 协议错误包装
+- [x] 支持 `.llm_agent/mcp.yaml` server 配置
+- [x] 支持工具命名空间、scope、include/exclude 和数量上限
+- [x] 支持 allow / confirm / deny 权限策略
+- [x] 支持主 Agent、Workflow 角色和 general Subagent
+- [x] 支持 worktree-aware stdio session
+- [x] 隔离 stdio 子进程环境并限制远程 HTTP URL
+- [x] 提供本地 stdio demo 和真实协议集成测试
+- [ ] 根据实际需求接入一个业务型 MCP server
+- [ ] 按需评估 Resources、Prompts、OAuth 与动态 tool-list 订阅
 
 初版目标：
 
 ```text
 MCP tools -> ToolRegistry -> Agent loop 不变
 ```
+
+当前实现保留本地核心 coding tools。MCP 是外部能力扩展协议，不替代 Harness
+内部高频、强权限约束且需要 Worktree/Trace 深度协作的原生工具。
 
 ### 3.6 更完整的权限策略
 
@@ -849,7 +858,7 @@ pytest / ruff / build / API test / UI test
 7. Context：优化 token 估算、摘要质量和后压缩恢复。
 8. Memory：实现 session summary 和长期记忆。
 9. Skills：实现本地 skill 加载。
-10. MCP：将 MCP tools 接入 ToolRegistry。
+10. MCP：已将 MCP tools 接入 ToolRegistry；后续按业务场景扩充 server。
 11. Multi-agent：最后再做 PM/Engineer/QA 编排。
 
 原则：
