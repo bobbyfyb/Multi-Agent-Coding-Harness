@@ -225,6 +225,20 @@ worktree_remove
 MVP 要求创建时主 Git 工作区干净，不自动 Stash、Commit、Merge 或解决冲突。
 Worktree 只提供代码目录隔离，不是运行不可信代码的安全沙箱。
 
+串行 Workflow 默认也使用 Worktree 隔离，但生命周期按整个 Workflow 管理：
+
+```text
+PM planning（主工作区）
+  -> 创建一个 Workflow Worktree
+  -> Engineer / QA / Fix / Regression / Acceptance 共用该 Worktree
+  -> 输出 changed_files 和 Patch
+  -> 用户显式调用 worktree_apply
+```
+
+Artifact、Task、Skill、Workflow Record 和 Trace 保留在主工作区；代码工具、权限
+边界和验证工具绑定到隔离目录。Workflow 不自动 Apply，失败时也会保留 Worktree，
+以便检查或 `/workflow-resume` 继续执行。运行时 `.llm_agent` 目录不会进入 Patch。
+
 ## Background Jobs
 
 主 Agent 的 `bash` 默认同步执行。模型只有显式传入
@@ -350,6 +364,9 @@ llm = LLMClient(provider="anthropic", recovery_policy=policy)
 CLI 支持以下环境变量：
 
 ```dotenv
+LLM_PROVIDER=anthropic
+LLM_MAX_TOKENS=4096
+LLM_TIMEOUT=240
 LLM_MAX_RETRIES=4
 LLM_MAX_RETRY_ELAPSED_SECONDS=30
 LLM_FALLBACK_MODEL=
@@ -522,3 +539,100 @@ skill_read_resource(
 ```text
 加载 code-review skill，检查当前代码改动并按严重程度报告问题。
 ```
+
+## Workflow Configuration
+
+串行 workflow 支持项目级配置文件：
+
+```text
+.llm_agent/workflow.yaml
+```
+
+MVP 只开放隔离模式、role skill 和运行预算配置，不开放工具权限、phase 顺序或模型覆盖。
+这样可以保持 PM / Engineer / QA 的安全边界稳定。
+
+```yaml
+version: 1
+
+workflow:
+  isolation: worktree
+  max_fix_cycles: 1
+  max_phase_retries: 1
+  max_context_tokens: 100000
+
+roles:
+  pm:
+    required_skills:
+      - prd-writer
+    max_steps: 12
+
+  engineer:
+    optional_skills:
+      - code-review
+    max_steps: 24
+
+  qa:
+    optional_skills:
+      - qa-checklist
+```
+
+`required_skills` 在 role agent 启动时自动注入完整 Skill 正文；缺失会让启动失败。
+`optional_skills` 只是候选增强能力，缺失时会被忽略并打印 warning，实际加载仍
+通过 `skill_load` 工具调用发生。
+
+`isolation` 支持 `worktree` 和 `shared`。CLI 默认使用 `worktree`；非 Git 目录或
+兼容场景可以显式选择 `shared`。创建 Worktree 前要求主 Git 工作区干净。
+
+## Workflow Persistence
+
+每次 `/workflow <request>` 会写入一个可恢复 run record：
+
+```text
+.llm_agent/workflows/<workflow_id>/run.json
+```
+
+Workflow 恢复采用 checkpoint 策略，而不是完整 message replay。系统保存每个
+phase 开始前的 artifact versions、Worktree Diff 基线和验证工具结果；如果进程
+中断后 completion gate 已经满足，resume 会补写该 phase completed 并继续后续
+阶段。否则会从该 phase 重新运行。
+Run Record 同时保存 `worktree_id` 和 `worktree_base_commit`；Resume 会复用原
+Worktree，若隔离目录已经丢失则明确失败，不会静默创建新目录并丢弃中间修改。
+
+## Workflow Evidence Gates
+
+默认 `worktree` 模式不会只相信角色生成的报告。Workflow 将三类信息组合为
+阶段完成证据：Artifact 是角色声明，Worktree Diff 是代码事实，`run_tests` /
+`run_lint` 的结构化结果是验证事实。
+
+- PM 的 TaskSpec 必须设置布尔值 `metadata.change_required`。
+- Engineer 的 ImplementationReport 必须设置 `metadata.outcome` 和
+  `metadata.changed_files`；`outcome=changed` 要求该阶段的 Diff 哈希确实变化，
+  且声明文件与当前 Worktree changed files 完全一致。
+- `outcome=no_change` 只允许用于 `change_required=false`，并要求提供
+  `metadata.no_change_reason`。
+- QA 的 `metadata.verdict=pass` 至少需要一次当前尝试中成功的 `run_tests` 或
+  `run_lint`，且不能同时存在失败、超时或工具错误，也不能在 QA 阶段改变 Patch。
+- 编排器把最终证据摘要注入 PM Acceptance，报告声明和运行事实冲突时以后者为准。
+
+示例 Artifact metadata：
+
+```json
+{"change_required": true}
+{"outcome": "changed", "changed_files": ["src/app.py", "tests/test_app.py"]}
+{"verdict": "pass"}
+```
+
+Diff 快照和验证结果会立即写入 phase checkpoint，因此中断恢复不依赖 Trace 或
+模型记忆。`shared` 模式没有独立 Diff 事实源，只保留原有 Artifact/verdict 门禁，
+主要用于非 Git 目录兼容；需要完整证据链时应使用默认 `worktree` 模式。
+
+CLI 命令：
+
+```text
+/workflow-list
+/workflow-show <workflow_id>
+/workflow-resume <workflow_id>
+```
+
+Artifacts 仍然是跨角色交接和恢复的主数据；Trace 负责审计和调试，workflow
+record 只保存编排状态。

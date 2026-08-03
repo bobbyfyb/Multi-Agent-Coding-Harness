@@ -93,6 +93,8 @@ Inspect the complete diff before reporting findings.
     )
 
     registry = SkillRegistry(skills_root)
+    tools = ToolRegistry()
+    register_skill_tools(tools, skill_registry=registry)
 
     metadata = registry.get("code-review")
     assert metadata.description == "Review code for behavioral defects."
@@ -107,6 +109,9 @@ Inspect the complete diff before reporting findings.
         "code-review",
         "references/checklist.md",
     ) == "Check failure paths."
+    skill_list = tools.call("skill_list", {})
+    assert skill_list["ok"] is True
+    assert skill_list["result"]["skills"][0]["name"] == "code-review"
 
 
 def test_skill_registry_supports_manifest_without_frontmatter(

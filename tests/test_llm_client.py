@@ -172,6 +172,70 @@ def test_anthropic_sdk_tool_call_params_and_parse() -> None:
     ]
 
 
+def test_anthropic_tool_call_single_item_array_input_is_unwrapped() -> None:
+    sdk = FakeAnthropicClient(
+        {
+            "id": "msg_1",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "add",
+                    "input": [{"a": 1, "b": 2}],
+                },
+            ],
+            "stop_reason": "tool_use",
+        }
+    )
+    client = LLMClient(provider="anthropic", model="claude-test", anthropic_client=sdk)
+
+    response = client.chat([{"role": "user", "content": "1 + 2?"}], tools=[add_tool()])
+
+    assert response.tool_calls[0].arguments == {"a": 1, "b": 2}
+    assert response.raw["content"][0]["input"] == {"a": 1, "b": 2}
+
+
+def test_anthropic_tool_call_array_input_is_returned_as_recoverable_batch() -> None:
+    sdk = FakeAnthropicClient(
+        {
+            "id": "msg_1",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "artifact_create",
+                    "input": [
+                        {"kind": "prd", "title": "PRD", "content": "Plan"},
+                        {
+                            "kind": "task_spec",
+                            "title": "Task",
+                            "content": "Build",
+                        },
+                    ],
+                },
+            ],
+            "stop_reason": "tool_use",
+        }
+    )
+    client = LLMClient(provider="anthropic", model="claude-test", anthropic_client=sdk)
+
+    response = client.chat(
+        [{"role": "user", "content": "create artifacts"}],
+        tools=[
+            {
+                "name": "artifact_create",
+                "description": "Create artifact.",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ],
+    )
+
+    arguments = response.tool_calls[0].arguments
+    assert list(arguments) == ["__batched_tool_inputs__"]
+    assert len(arguments["__batched_tool_inputs__"]) == 2
+    assert response.raw["content"][0]["input"] == arguments
+
+
 def test_provider_specific_tool_result_messages() -> None:
     tool_call = LLMToolCall(id="call_1", name="add", arguments={"a": 1, "b": 2})
 

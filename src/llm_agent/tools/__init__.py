@@ -57,6 +57,7 @@ def register_default_tools(
     registry: ToolRegistry,
     *,
     workdir: Path | str | None = None,
+    task_workdir: Path | str | None = None,
     subagent_runner: "SubagentRunner | None" = None,
     skill_registry: "SkillRegistry | None" = None,
     memory_manager: "MemoryManager | None" = None,
@@ -75,7 +76,10 @@ def register_default_tools(
         register_worktree_tools(registry, manager=worktree_manager)
     register_search_tools(registry, workdir=workdir)
     register_verification_tools(registry, workdir=workdir)
-    register_task_tools(registry, workdir=workdir)
+    register_task_tools(
+        registry,
+        workdir=workdir if task_workdir is None else task_workdir,
+    )
     register_artifact_tools(
         registry,
         manager=artifact_manager,
@@ -95,6 +99,7 @@ def register_default_tools(
 def build_default_registry(
     workdir: Path | str | None = None,
     *,
+    task_workdir: Path | str | None = None,
     subagent_runner: "SubagentRunner | None" = None,
     skill_registry: "SkillRegistry | None" = None,
     memory_manager: "MemoryManager | None" = None,
@@ -106,6 +111,7 @@ def build_default_registry(
     register_default_tools(
         registry,
         workdir=workdir,
+        task_workdir=task_workdir,
         subagent_runner=subagent_runner,
         skill_registry=skill_registry,
         memory_manager=memory_manager,

@@ -173,6 +173,7 @@ class HookManager:
 def build_default_hook_manager(
     *,
     workdir: Path | str | None = None,
+    task_workdir: Path | str | None = None,
     approval_provider: Any | None = None,
     llm: Any | None = None,
     memory_manager: "MemoryManager | None" = None,
@@ -192,14 +193,19 @@ def build_default_hook_manager(
     manager.register_hook(
         "BeforeLLM",
         TaskPlanningHook(
-            workdir=workdir,
+            workdir=workdir if task_workdir is None else task_workdir,
             intent_classifier=intent_classifier,
         ),
     )
     if artifact_manager is not None:
         manager.register_hook(
             "BeforeLLM",
-            ArtifactContextHook(artifact_manager),
+            ArtifactContextHook(
+                artifact_manager,
+                task_workdir=(
+                    workdir if task_workdir is None else task_workdir
+                ),
+            ),
         )
     if memory_manager is not None:
         manager.register_hook(

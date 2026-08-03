@@ -1,4 +1,5 @@
 from pathlib import Path
+from hashlib import sha256
 import json
 import subprocess
 from typing import Any
@@ -89,6 +90,9 @@ def test_worktree_lifecycle_keeps_main_clean_until_apply(
     assert (workdir / "app.py").read_text(encoding="utf-8") == ("value = 'original'\n")
     assert review["worktree"]["status"] == "ready"
     assert review["changed_files"] == ["app.py", "new.py"]
+    assert review["diff_sha256"] == sha256(
+        review["diff"].encode("utf-8")
+    ).hexdigest()
     assert Path(review["diff_path"]).exists()
 
     applied = manager.apply(info.id)
@@ -141,7 +145,28 @@ def test_worktree_without_changes_is_cleaned_automatically(
 
     assert review["worktree"]["status"] == "cleaned"
     assert review["change_count"] == 0
+    assert review["diff_sha256"] == sha256(b"").hexdigest()
     assert not Path(info.path).exists()
+
+
+def test_worktree_diff_excludes_runtime_state(tmp_path: Path) -> None:
+    workdir = _repository(tmp_path)
+    manager = WorktreeManager.for_workdir(workdir)
+    info = manager.create()
+    isolated = Path(info.path)
+    (isolated / "app.py").write_text(
+        "value = 'isolated'\n",
+        encoding="utf-8",
+    )
+    runtime_dir = isolated / ".llm_agent" / "tool-results"
+    runtime_dir.mkdir(parents=True)
+    (runtime_dir / "stdout.log").write_text("runtime only\n", encoding="utf-8")
+
+    review = manager.finish(info.id)
+
+    assert review["changed_files"] == ["app.py"]
+    assert ".llm_agent" not in review["diff"]
+    manager.remove(info.id, discard_changes=True)
 
 
 def test_worktree_apply_rejects_changed_main_head(tmp_path: Path) -> None:

@@ -63,7 +63,7 @@ Delegation:
 - Keep simple work in the current agent instead of delegating it.
 """.strip()
 
-SUBAGENT_SKILL_TOOLS = {"skill_load", "skill_read_resource"}
+SUBAGENT_SKILL_TOOLS = {"skill_list", "skill_load", "skill_read_resource"}
 
 SUBAGENT_TOOL_PROFILES: dict[SubagentMode, set[str]] = {
     "explore": {

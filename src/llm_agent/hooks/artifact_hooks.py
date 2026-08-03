@@ -18,6 +18,7 @@ class ArtifactContextHook:
     max_artifacts: int = 5
     max_content_chars: int = 3_000
     task_list_id: str = "default"
+    task_workdir: Path | str | None = None
 
     def __call__(self, context: HookContext) -> HookResult | None:
         artifacts = self._select_artifacts(context)
@@ -50,7 +51,9 @@ class ArtifactContextHook:
         return ranked[: self.max_artifacts]
 
     def _open_task_ids(self, context: HookContext) -> set[str]:
-        workdir = Path(context.workdir)
+        workdir = Path(
+            context.workdir if self.task_workdir is None else self.task_workdir
+        )
         manager = TaskManager.for_workdir(workdir, task_list_id=self.task_list_id)
         return {
             task.id

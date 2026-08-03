@@ -180,6 +180,7 @@
 - [x] 支持无 frontmatter 时从目录名和首个标题生成基础元数据
 - [x] 启动时扫描 Skill 并检测非法 YAML、非法名称和重复名称
 - [x] 将有字符预算限制的 Skill Catalog 注入 system prompt
+- [x] 实现 `skill_list`，支持运行时重新发现可用 Skill
 - [x] 实现 `skill_load`，按需将完整正文作为 tool result 注入 messages
 - [x] 实现 `skill_read_resource`
 - [x] 防止 Skill 资源路径穿越
@@ -187,6 +188,7 @@
 - [x] Skill 内容不能绕过 system/user 指令、workspace 和权限策略
 - [x] 主 Agent 和 Subagent 共用 Skill 索引
 - [x] Subagent 在独立上下文中重新按需加载 Skill
+- [x] Workflow role agent 可发现、动态加载和读取 Skill 资源
 - [x] 添加 `code-review` 示例 Skill
 - [x] 覆盖解析、索引、预算、资源安全、Agent 加载和 Subagent 加载测试
 
@@ -375,6 +377,57 @@ Web UI 可以继续复用同一个 Agent、Hook 和 Event 边界。
 - 暂未实现 artifact diff、依赖图、文件锁和自动 LLM 总结。
 - Subagent 暂不直接获得 artifact 工具，后续 PM/Engineer/QA 编排时再按角色分配。
 
+### 2.17 Serial Orchestrator-Worker Workflow MVP
+
+- [x] 实现 `SerialCodingWorkflow`
+- [x] 实现轻量 `RoleSpec`
+- [x] 实现 `WorkflowPhaseResult / WorkflowResult`
+- [x] 使用代码层状态机控制 PM -> Engineer -> QA -> Engineer Fix -> QA -> PM Acceptance
+- [x] PM worker 负责生成 `prd` 和 `task_spec`
+- [x] Engineer worker 负责实现并生成/更新 `implementation_report`
+- [x] QA worker 负责验证并生成 `test_report`
+- [x] PM Acceptance worker 负责生成 `acceptance_report`
+- [x] 每个 worker 使用独立 `ContextManager`、system prompt 和工具白名单
+- [x] 每个 worker 复用同一个 `LLMClient / ArtifactManager`
+- [x] Workflow 默认创建一个共享 Worktree 作为代码执行空间
+- [x] PM Planning 使用主工作区，Engineer / QA / Fix / Acceptance 复用同一 Worktree
+- [x] 将代码工具与权限绑定到 Worktree，将 Task / Artifact / Skill 状态保留在主工作区
+- [x] Workflow Record 持久化 `worktree_id / worktree_base_commit`
+- [x] Resume 复用原 Worktree，隔离目录丢失时明确失败
+- [x] Workflow 结果返回 changed files、Diff 路径和待 Apply 状态
+- [x] 最终 Apply 保持显式权限确认，不由 Workflow 自动执行
+- [x] 每个 worker 可通过 `RoleSpec` 绑定 required/optional Skill
+- [x] Required Skill 自动注入 role context，Optional Skill 保持按需加载
+- [x] 支持 `.llm_agent/workflow.yaml` 配置 workflow 预算和 role skill
+- [x] 配置层只开放 `required_skills / optional_skills / max_steps`，不开放工具权限
+- [x] Required Skill 缺失时 fail fast，Optional Skill 缺失时忽略并 warning
+- [x] Artifact gate 检查每个阶段是否新建或更新了必需 artifact
+- [x] QA gate 要求 `metadata.verdict` 明确为 `pass` 或 `fail`
+- [x] TaskSpec 要求声明布尔值 `metadata.change_required`
+- [x] Worktree phase 记录前后 Diff SHA、changed files，并持久化到 checkpoint
+- [x] ImplementationReport 的 `outcome / changed_files` 与真实 Worktree Diff 对账
+- [x] QA 验证工具结果在调用完成后立即持久化，不依赖 Trace 回放
+- [x] QA pass 要求真实成功的 `run_tests/run_lint`，且无失败证据和 QA 代码修改
+- [x] Acceptance prompt 注入由 Orchestrator 汇总的实现与验证证据
+- [x] 阶段 completion evidence gate 失败时自动给同一 worker 一次纠正机会
+- [x] QA verdict 为 `fail` 时触发一次 Engineer fix cycle 和 QA regression
+- [x] Workflow 生命周期和 phase 事件写入 Trace
+- [x] CLI 支持显式 `/workflow <request>` 入口
+- [x] Workflow run record 持久化到 `.llm_agent/workflows/<workflow_id>/run.json`
+- [x] 支持 `/workflow-list`、`/workflow-show <id>`、`/workflow-resume <id>`
+- [x] Resume 基于 phase checkpoint 和 completion gate，不做完整 message replay
+- [x] 覆盖成功、no-change、虚假实现声明、无验证 QA pass、gate retry 和 fix cycle
+
+当前边界：
+
+- 目前是同步串行 Orchestrator-Worker，不支持并行 Agent Team。
+- Workflow 已支持 checkpoint resume，但暂不支持跨机器锁、并发 resume 或 phase 内精确断点。
+- Role 目前使用 `RoleSpec` 配置，没有单独抽象 `PMAgent / EngineerAgent / QAAgent` 类。
+- Artifact metadata 仍是轻量字典校验，尚未为各类 Artifact 引入独立强 schema。
+- Workflow 已默认使用 Git Worktree；非 Git 场景可配置 `isolation=shared`。
+- Evidence Gate 已校验 ImplementationReport、Worktree Diff 与验证工具结果；
+  `shared` 兼容模式没有独立 Diff 事实源，因此只执行较弱的 Artifact gate。
+
 ## 3. 接下来优先补全的单 Agent Harness 能力
 
 ### 3.1 Trace / Observability
@@ -457,14 +510,15 @@ Web UI 可以继续复用同一个 Agent、Hook 和 Event 边界。
 - [x] 支持读取 `skills/<name>/SKILL.md`
 - [x] 支持 Skill metadata
 - [x] 由模型根据精简 Catalog 进行语义选择
+- [x] 支持通过 `skill_list()` 运行时发现 Skill
 - [x] 支持通过 `skill_load(name)` 手动指定 Skill
 - [x] 将 Skill Catalog 注入 `ContextManager`
 - [x] 将完整 Skill 内容通过 tool result 按需注入 messages
+- [x] 支持 Orchestrator 通过 `RoleSpec` 程序化指定或预加载 Skill
 - [x] 提供 `code-review` 默认示例 Skill
 - [ ] 为 test/debug task 准备默认 skill
 - [ ] 为 frontend/backend task 准备默认 skill
 - [ ] 支持用户级和额外目录 Skill 来源
-- [ ] 支持 Orchestrator 程序化指定或预加载 Skill
 - [ ] 与 Context Compression 协作保留或摘要已加载 Skill
 
 当前实现：
@@ -553,12 +607,12 @@ User Requirement
 - [x] Artifact store / manager / tools
 - [x] Artifact runtime context 注入
 - [x] Artifact Trace 记录
-- [ ] PM 生成 PRD
-- [ ] PM 生成 TaskSpec
-- [ ] Engineer 根据 TaskSpec 修改代码
+- [x] PM 生成 PRD
+- [x] PM 生成 TaskSpec
+- [x] Engineer 根据 TaskSpec 修改代码或确认无需修改
 - [ ] QA 生成 TestPlan
-- [ ] QA 执行测试并生成 TestReport
-- [ ] PM 根据 TestReport 生成 AcceptanceReport
+- [x] QA 执行测试并生成 TestReport
+- [x] PM 根据 TestReport 生成 AcceptanceReport
 
 ## 5. 多 Agent 编排系统
 
@@ -566,19 +620,23 @@ User Requirement
 
 目标：把当前单 Agent 包装成可复用角色 agent。
 
-- [ ] 设计 `RoleAgent`
-- [ ] 每个 RoleAgent 有独立 name
-- [ ] 每个 RoleAgent 有独立 system prompt
-- [ ] 每个 RoleAgent 有独立 tools
-- [ ] 每个 RoleAgent 有独立 context builder
-- [ ] 每个 RoleAgent 可以读写 artifact
-- [ ] 每个 RoleAgent 可以输出结构化 result
+- [x] 设计轻量 `RoleSpec`
+- [x] 每个 Worker 有独立 name / agent_id
+- [x] 每个 Worker 有独立 system prompt
+- [x] 每个 Worker 有独立 tools 白名单
+- [x] 每个 Worker 可配置 required/optional Skill
+- [x] 每个 Worker 的 Skill 和步数预算可通过 `.llm_agent/workflow.yaml` 配置
+- [x] 每个 Worker 有独立 ContextManager
+- [x] 每个 Worker 可以读写 artifact
+- [x] 每个 Worker 可以输出 phase result
+- [ ] 提炼正式 `RoleAgent` 抽象
 
 候选角色：
 
-- [ ] `PMAgent`
-- [ ] `EngineerAgent`
-- [ ] `QAAgent`
+- [x] `PM` worker
+- [x] `Engineer` worker
+- [x] `QA` worker
+- [ ] 独立 `PMAgent / EngineerAgent / QAAgent` 类
 
 不要一开始强行区分 FE/BE：
 
@@ -589,16 +647,17 @@ User Requirement
 
 目标：用代码层状态机控制多 agent 流程，而不是完全交给 LLM 自由发挥。
 
-- [ ] 设计 `Orchestrator`
-- [ ] 设计任务状态枚举
-- [ ] 支持 planning 状态
-- [ ] 支持 implementation 状态
-- [ ] 支持 qa 状态
-- [ ] 支持 fix 状态
-- [ ] 支持 acceptance 状态
-- [ ] 支持 failed / aborted 状态
-- [ ] 支持最大迭代次数
-- [ ] 支持 trace 每个状态转移
+- [x] 设计 `SerialCodingWorkflow` 作为轻量 Orchestrator
+- [x] 设计 phase 状态和 result
+- [x] 支持 planning 状态
+- [x] 支持 implementation 状态
+- [x] 支持 qa 状态
+- [x] 支持 fix 状态
+- [x] 支持 acceptance 状态
+- [x] 支持 failed 状态
+- [ ] 支持 aborted 状态
+- [x] 支持最大迭代次数
+- [x] 支持 trace 每个状态转移
 
 状态流：
 
@@ -718,7 +777,7 @@ pytest / ruff / build / API test / UI test
 - [x] Skill loader
 - [x] Catalog 驱动的模型语义选择
 - [ ] 多来源 Skill loader
-- [ ] Orchestrator 显式 Skill 路由
+- [x] Orchestrator 显式 Skill 路由
 
 验收标准：
 
@@ -740,15 +799,15 @@ pytest / ruff / build / API test / UI test
 验收标准：
 
 - [x] 开发和测试过程可以沉淀为 artifact。
-- [ ] 一个需求可以由 PM Agent 自动转换为 PRD 和 TaskSpec。
+- [x] 一个需求可以由 PM Agent 自动转换为 PRD 和 TaskSpec。
 
 ### Milestone 5：多 Agent MVP
 
-- [ ] PM Agent
-- [ ] Engineer Agent
-- [ ] QA Agent
-- [ ] Orchestrator 状态机
-- [ ] QA feedback loop
+- [x] PM worker
+- [x] Engineer worker
+- [x] QA worker
+- [x] Orchestrator 状态机
+- [x] QA feedback loop
 
 验收标准：
 

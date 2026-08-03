@@ -262,6 +262,7 @@ def test_default_registry_loads_basic_tools(tmp_path: Path) -> None:
         "artifact_update",
         "artifact_get",
         "artifact_list",
+        "skill_list",
         "skill_load",
         "skill_read_resource",
         "memory_remember",

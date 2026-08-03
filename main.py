@@ -33,6 +33,11 @@ from llm_agent.memory_system import (
     build_memory_policy_section,
 )
 from llm_agent.recovery import RecoveryPolicy
+from llm_agent.serial_workflow import (
+    SerialCodingWorkflow,
+    WorkflowResult,
+    parse_workflow_command,
+)
 from llm_agent.skill_system import SkillRegistry, build_skill_catalog_section
 from llm_agent.subagent import SUBAGENT_PARENT_INSTRUCTIONS, SubagentRunner
 from llm_agent.tools import build_default_registry
@@ -42,6 +47,8 @@ from llm_agent.trace_system import (
     summarize_text,
     trace_scope,
 )
+from llm_agent.workflow_config import load_workflow_config
+from llm_agent.workflow_store import WorkflowRunRecord
 from llm_agent.worktree import WorktreeManager
 
 
@@ -50,7 +57,11 @@ def build_agent(
     approval_provider: ApprovalProvider | None = None,
 ) -> Agent:
     workdir = Path.cwd()
-    llm = LLMClient(provider="anthropic")
+    llm = LLMClient(
+        provider=os.getenv("LLM_PROVIDER", "anthropic"),
+        max_tokens=int(os.getenv("LLM_MAX_TOKENS", "4096")),
+        timeout=float(os.getenv("LLM_TIMEOUT", "240")),
+    )
     llm.recovery_policy = RecoveryPolicy(
         max_retries=int(os.getenv("LLM_MAX_RETRIES", "4")),
         max_retry_elapsed_seconds=float(
@@ -143,10 +154,31 @@ def main() -> None:
     workdir = Path.cwd()
     prompt_session = build_user_prompt_session(workdir)
     approval_session = build_approval_prompt_session()
+    approval_provider = CliApprovalProvider(
+        input_func=approval_session.prompt,
+    )
     agent = build_agent(
-        approval_provider=CliApprovalProvider(
-            input_func=approval_session.prompt,
-        )
+        approval_provider=approval_provider,
+    )
+    workflow_skill_registry = SkillRegistry.for_workdir(workdir)
+    workflow_config = load_workflow_config(
+        workdir,
+        skill_registry=workflow_skill_registry,
+    )
+    for warning in workflow_config.warnings:
+        print(f"\033[33m[workflow config]\033[0m {warning}")
+    workflow = SerialCodingWorkflow(
+        llm=agent.llm,
+        workdir=workdir,
+        artifact_manager=ArtifactManager.for_workdir(workdir),
+        approval_provider=approval_provider,
+        skill_registry=workflow_skill_registry,
+        worktree_manager=WorktreeManager.for_workdir(workdir),
+        isolation=workflow_config.isolation,
+        role_specs=workflow_config.role_specs,
+        max_fix_cycles=workflow_config.max_fix_cycles,
+        max_phase_retries=workflow_config.max_phase_retries,
+        max_context_tokens=workflow_config.max_context_tokens,
     )
     messages = agent.new_messages()
 
@@ -172,6 +204,60 @@ def main() -> None:
                             phase="received",
                             data={"content": summarize_text(query)},
                         )
+                        workflow_command = _parse_workflow_cli_command(query)
+                        if workflow_command is not None:
+                            command, argument = workflow_command
+                            if command == "list":
+                                print(
+                                    _format_workflow_runs(
+                                        workflow.workflow_store.list_runs()
+                                        if workflow.workflow_store is not None
+                                        else []
+                                    )
+                                )
+                                continue
+                            if command == "show":
+                                if not argument:
+                                    print(
+                                        "\033[33m[workflow]\033[0m "
+                                        "usage: /workflow-show <workflow_id>"
+                                    )
+                                    continue
+                                record = workflow.workflow_store.load_run(argument)
+                                print(_format_workflow_record(record))
+                                continue
+                            if command == "resume":
+                                if not argument:
+                                    print(
+                                        "\033[33m[workflow]\033[0m "
+                                        "usage: /workflow-resume <workflow_id>"
+                                    )
+                                    continue
+                                result = workflow.resume(
+                                    argument,
+                                    on_event=print_agent_event,
+                                    trace=trace,
+                                )
+                                print(_format_workflow_result(result))
+                                continue
+
+                        workflow_request = parse_workflow_command(query)
+                        if workflow_request is not None:
+                            if not workflow_request:
+                                print(
+                                    "\033[33m[workflow]\033[0m "
+                                    "usage: /workflow <request>"
+                                )
+                                continue
+                            result = workflow.run(
+                                workflow_request,
+                                on_event=print_agent_event,
+                                run_id=run_id,
+                                trace=trace,
+                            )
+                            print(_format_workflow_result(result))
+                            continue
+
                         agent.hooks.trigger_hooks(
                             "UserPromptSubmit",
                             query,
@@ -196,6 +282,94 @@ def main() -> None:
     finally:
         if agent.background_jobs is not None:
             agent.background_jobs.shutdown()
+
+
+def _format_workflow_result(result: WorkflowResult) -> str:
+    color = "\033[32m" if result.status == "completed" else "\033[31m"
+    reset = "\033[0m"
+    artifacts = ", ".join(result.artifact_ids) or "none"
+    verdict = result.qa_verdict or "unknown"
+    lines = [
+        f"\n{color}[workflow {result.status}]{reset} {result.workflow_id}",
+        f"qa_verdict={verdict} fix_cycles={result.fix_cycles}",
+        f"artifacts={artifacts}",
+    ]
+    if result.error:
+        lines.append(f"error={result.error}")
+    if result.worktree is not None:
+        worktree = result.worktree.get("worktree", {})
+        changed_files = result.worktree.get("changed_files", [])
+        status = worktree.get("status", "unknown")
+        delivery = (
+            "applied"
+            if status == "applied"
+            else "blocked"
+            if result.status != "completed"
+            else "ready_to_apply"
+            if changed_files
+            else "no_changes"
+        )
+        lines.append(
+            f"delivery={delivery} worktree={worktree.get('id', 'unknown')}"
+        )
+        if changed_files:
+            lines.append(f"changed_files={', '.join(changed_files)}")
+        if result.worktree.get("diff_path"):
+            lines.append(f"diff_path={result.worktree['diff_path']}")
+        if result.worktree.get("error"):
+            lines.append(f"worktree_error={result.worktree['error']}")
+    return "\n".join(lines)
+
+
+def _parse_workflow_cli_command(query: str) -> tuple[str, str] | None:
+    stripped = query.strip()
+    commands = {
+        "/workflow-list": "list",
+        "/workflow-show": "show",
+        "/workflow-resume": "resume",
+    }
+    for prefix, command in commands.items():
+        if stripped == prefix:
+            return command, ""
+        if stripped.startswith(prefix + " "):
+            return command, stripped.removeprefix(prefix).strip()
+    return None
+
+
+def _format_workflow_runs(records: list[WorkflowRunRecord]) -> str:
+    if not records:
+        return "\033[33m[workflow]\033[0m no workflow runs found"
+    lines = ["\n\033[36m[workflow runs]\033[0m"]
+    for record in records[:20]:
+        phase = record.current_phase_key or "-"
+        verdict = record.qa_verdict or "-"
+        lines.append(
+            f"- {record.workflow_id} status={record.status} "
+            f"phase={phase} verdict={verdict} updated={record.updated_at}"
+        )
+    return "\n".join(lines)
+
+
+def _format_workflow_record(record: WorkflowRunRecord) -> str:
+    lines = [
+        f"\n\033[36m[workflow]\033[0m {record.workflow_id}",
+        f"status={record.status} current_phase={record.current_phase_key or '-'}",
+        f"qa_verdict={record.qa_verdict or '-'} fix_cycles={record.fix_cycles}",
+        f"artifacts={', '.join(record.artifact_ids) or 'none'}",
+        f"worktree={record.worktree_id or '-'}",
+        f"base_commit={record.worktree_base_commit or '-'}",
+        f"request={record.request}",
+    ]
+    if record.error:
+        lines.append(f"error={record.error}")
+    if record.phases:
+        lines.append("phases:")
+        for phase in record.phases:
+            lines.append(
+                f"- {phase.get('phase_key')} status={phase.get('status')} "
+                f"role={phase.get('role')} attempts={phase.get('attempts')}"
+            )
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
