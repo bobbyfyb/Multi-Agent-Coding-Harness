@@ -13,6 +13,7 @@ def test_load_workflow_config_returns_defaults_when_file_missing(
     config = load_workflow_config(tmp_path)
 
     assert config.role_specs == ROLE_SPECS
+    assert config.isolation == "worktree"
     assert config.max_fix_cycles == 1
     assert config.max_phase_retries == 1
     assert config.max_context_tokens == 100_000
@@ -30,6 +31,7 @@ def test_load_workflow_config_merges_role_skills_and_budgets(
         """
 version: 1
 workflow:
+  isolation: shared
   max_fix_cycles: 2
   max_phase_retries: 3
   max_context_tokens: 120000
@@ -54,6 +56,7 @@ roles:
     )
 
     assert config.max_fix_cycles == 2
+    assert config.isolation == "shared"
     assert config.max_phase_retries == 3
     assert config.max_context_tokens == 120_000
     assert config.role_specs["pm"].required_skills == ("prd-writer",)
@@ -154,6 +157,17 @@ roles:
     )
 
     with pytest.raises(WorkflowConfigError, match="list of strings"):
+        load_workflow_config(tmp_path)
+
+    _write_config(
+        tmp_path,
+        """
+workflow:
+  isolation: container
+""",
+    )
+
+    with pytest.raises(WorkflowConfigError, match="workflow.isolation"):
         load_workflow_config(tmp_path)
 
 

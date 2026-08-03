@@ -12,6 +12,9 @@ def test_workflow_store_persists_run_and_phase_checkpoints(
         request="Build a workflow.",
         initial_artifact_ids=["artifact_old"],
     )
+    record.worktree_id = "wt_123456789abc"
+    record.worktree_base_commit = "abc123"
+    store.save_run(record)
 
     store.mark_phase_started(
         record,
@@ -51,6 +54,8 @@ def test_workflow_store_persists_run_and_phase_checkpoints(
     assert loaded.status == "completed"
     assert loaded.initial_artifact_ids == ["artifact_old"]
     assert loaded.artifact_ids == ["artifact_0001"]
+    assert loaded.worktree_id == "wt_123456789abc"
+    assert loaded.worktree_base_commit == "abc123"
     assert loaded.checkpoints["pm_plan"].before_versions == {"artifact_old": 1}
     assert loaded.phases[0]["phase_key"] == "pm_plan"
     assert store.list_runs()[0].workflow_id == "wf-store"

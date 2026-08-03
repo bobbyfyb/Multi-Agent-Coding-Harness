@@ -75,6 +75,8 @@ class WorkflowRunRecord:
     checkpoints: dict[str, WorkflowPhaseCheckpoint]
     artifact_ids: list[str]
     initial_artifact_ids: list[str]
+    worktree_id: str | None
+    worktree_base_commit: str | None
     qa_verdict: str | None
     fix_cycles: int
     created_at: str
@@ -100,6 +102,8 @@ class WorkflowRunRecord:
             checkpoints={},
             artifact_ids=[],
             initial_artifact_ids=initial_artifact_ids,
+            worktree_id=None,
+            worktree_base_commit=None,
             qa_verdict=None,
             fix_cycles=0,
             created_at=now,
@@ -133,6 +137,16 @@ class WorkflowRunRecord:
             initial_artifact_ids=[
                 str(value) for value in data.get("initial_artifact_ids") or []
             ],
+            worktree_id=(
+                str(data["worktree_id"])
+                if data.get("worktree_id") is not None
+                else None
+            ),
+            worktree_base_commit=(
+                str(data["worktree_base_commit"])
+                if data.get("worktree_base_commit") is not None
+                else None
+            ),
             qa_verdict=(
                 str(data["qa_verdict"])
                 if data.get("qa_verdict") is not None
@@ -158,6 +172,8 @@ class WorkflowRunRecord:
             },
             "artifact_ids": self.artifact_ids,
             "initial_artifact_ids": self.initial_artifact_ids,
+            "worktree_id": self.worktree_id,
+            "worktree_base_commit": self.worktree_base_commit,
             "qa_verdict": self.qa_verdict,
             "fix_cycles": self.fix_cycles,
             "created_at": self.created_at,

@@ -173,6 +173,8 @@ def main() -> None:
         artifact_manager=ArtifactManager.for_workdir(workdir),
         approval_provider=approval_provider,
         skill_registry=workflow_skill_registry,
+        worktree_manager=WorktreeManager.for_workdir(workdir),
+        isolation=workflow_config.isolation,
         role_specs=workflow_config.role_specs,
         max_fix_cycles=workflow_config.max_fix_cycles,
         max_phase_retries=workflow_config.max_phase_retries,
@@ -294,6 +296,28 @@ def _format_workflow_result(result: WorkflowResult) -> str:
     ]
     if result.error:
         lines.append(f"error={result.error}")
+    if result.worktree is not None:
+        worktree = result.worktree.get("worktree", {})
+        changed_files = result.worktree.get("changed_files", [])
+        status = worktree.get("status", "unknown")
+        delivery = (
+            "applied"
+            if status == "applied"
+            else "blocked"
+            if result.status != "completed"
+            else "ready_to_apply"
+            if changed_files
+            else "no_changes"
+        )
+        lines.append(
+            f"delivery={delivery} worktree={worktree.get('id', 'unknown')}"
+        )
+        if changed_files:
+            lines.append(f"changed_files={', '.join(changed_files)}")
+        if result.worktree.get("diff_path"):
+            lines.append(f"diff_path={result.worktree['diff_path']}")
+        if result.worktree.get("error"):
+            lines.append(f"worktree_error={result.worktree['error']}")
     return "\n".join(lines)
 
 
@@ -332,6 +356,8 @@ def _format_workflow_record(record: WorkflowRunRecord) -> str:
         f"status={record.status} current_phase={record.current_phase_key or '-'}",
         f"qa_verdict={record.qa_verdict or '-'} fix_cycles={record.fix_cycles}",
         f"artifacts={', '.join(record.artifact_ids) or 'none'}",
+        f"worktree={record.worktree_id or '-'}",
+        f"base_commit={record.worktree_base_commit or '-'}",
         f"request={record.request}",
     ]
     if record.error:

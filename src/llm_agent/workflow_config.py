@@ -6,7 +6,7 @@ from typing import Any, Mapping
 
 import yaml
 
-from llm_agent.serial_workflow import ROLE_SPECS, RoleSpec
+from llm_agent.serial_workflow import ROLE_SPECS, RoleSpec, WorkflowIsolation
 from llm_agent.skill_system import SkillNotFoundError, SkillRegistry
 
 
@@ -20,6 +20,7 @@ class WorkflowConfigError(RuntimeError):
 @dataclass(frozen=True)
 class WorkflowConfig:
     role_specs: dict[str, RoleSpec] = field(default_factory=lambda: dict(ROLE_SPECS))
+    isolation: WorkflowIsolation = "worktree"
     max_fix_cycles: int = 1
     max_phase_retries: int = 1
     max_context_tokens: int = 100_000
@@ -71,6 +72,7 @@ def load_workflow_config(
         workflow.get("max_context_tokens", 100_000),
         "workflow.max_context_tokens",
     )
+    isolation = _workflow_isolation(workflow.get("isolation", "worktree"))
 
     role_specs, warnings = _apply_role_config(
         base_roles,
@@ -79,6 +81,7 @@ def load_workflow_config(
     )
     return WorkflowConfig(
         role_specs=role_specs,
+        isolation=isolation,
         max_fix_cycles=max_fix_cycles,
         max_phase_retries=max_phase_retries,
         max_context_tokens=max_context_tokens,
@@ -241,6 +244,14 @@ def _positive_int(value: Any, label: str) -> int:
 def _non_negative_int(value: Any, label: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise WorkflowConfigError(f"{label} must be a non-negative integer.")
+    return value
+
+
+def _workflow_isolation(value: Any) -> WorkflowIsolation:
+    if value not in {"shared", "worktree"}:
+        raise WorkflowConfigError(
+            "workflow.isolation must be 'shared' or 'worktree'."
+        )
     return value
 
 

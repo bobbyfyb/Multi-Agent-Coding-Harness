@@ -225,6 +225,20 @@ worktree_remove
 MVP 要求创建时主 Git 工作区干净，不自动 Stash、Commit、Merge 或解决冲突。
 Worktree 只提供代码目录隔离，不是运行不可信代码的安全沙箱。
 
+串行 Workflow 默认也使用 Worktree 隔离，但生命周期按整个 Workflow 管理：
+
+```text
+PM planning（主工作区）
+  -> 创建一个 Workflow Worktree
+  -> Engineer / QA / Fix / Regression / Acceptance 共用该 Worktree
+  -> 输出 changed_files 和 Patch
+  -> 用户显式调用 worktree_apply
+```
+
+Artifact、Task、Skill、Workflow Record 和 Trace 保留在主工作区；代码工具、权限
+边界和验证工具绑定到隔离目录。Workflow 不自动 Apply，失败时也会保留 Worktree，
+以便检查或 `/workflow-resume` 继续执行。运行时 `.llm_agent` 目录不会进入 Patch。
+
 ## Background Jobs
 
 主 Agent 的 `bash` 默认同步执行。模型只有显式传入
@@ -534,13 +548,14 @@ skill_read_resource(
 .llm_agent/workflow.yaml
 ```
 
-MVP 只开放 role skill 和运行预算配置，不开放工具权限、phase 顺序或模型覆盖。
+MVP 只开放隔离模式、role skill 和运行预算配置，不开放工具权限、phase 顺序或模型覆盖。
 这样可以保持 PM / Engineer / QA 的安全边界稳定。
 
 ```yaml
 version: 1
 
 workflow:
+  isolation: worktree
   max_fix_cycles: 1
   max_phase_retries: 1
   max_context_tokens: 100000
@@ -565,6 +580,9 @@ roles:
 `optional_skills` 只是候选增强能力，缺失时会被忽略并打印 warning，实际加载仍
 通过 `skill_load` 工具调用发生。
 
+`isolation` 支持 `worktree` 和 `shared`。CLI 默认使用 `worktree`；非 Git 目录或
+兼容场景可以显式选择 `shared`。创建 Worktree 前要求主 Git 工作区干净。
+
 ## Workflow Persistence
 
 每次 `/workflow <request>` 会写入一个可恢复 run record：
@@ -576,6 +594,8 @@ roles:
 Workflow 恢复采用 checkpoint 策略，而不是完整 message replay。系统保存每个
 phase 开始前的 artifact versions；如果进程中断后 artifact gate 已经满足，resume
 会补写该 phase completed 并继续后续阶段。否则会从该 phase 重新运行。
+Run Record 同时保存 `worktree_id` 和 `worktree_base_commit`；Resume 会复用原
+Worktree，若隔离目录已经丢失则明确失败，不会静默创建新目录并丢弃中间修改。
 
 CLI 命令：
 

@@ -388,7 +388,14 @@ Web UI 可以继续复用同一个 Agent、Hook 和 Event 边界。
 - [x] QA worker 负责验证并生成 `test_report`
 - [x] PM Acceptance worker 负责生成 `acceptance_report`
 - [x] 每个 worker 使用独立 `ContextManager`、system prompt 和工具白名单
-- [x] 每个 worker 复用同一个 `LLMClient / ArtifactManager / workspace`
+- [x] 每个 worker 复用同一个 `LLMClient / ArtifactManager`
+- [x] Workflow 默认创建一个共享 Worktree 作为代码执行空间
+- [x] PM Planning 使用主工作区，Engineer / QA / Fix / Acceptance 复用同一 Worktree
+- [x] 将代码工具与权限绑定到 Worktree，将 Task / Artifact / Skill 状态保留在主工作区
+- [x] Workflow Record 持久化 `worktree_id / worktree_base_commit`
+- [x] Resume 复用原 Worktree，隔离目录丢失时明确失败
+- [x] Workflow 结果返回 changed files、Diff 路径和待 Apply 状态
+- [x] 最终 Apply 保持显式权限确认，不由 Workflow 自动执行
 - [x] 每个 worker 可通过 `RoleSpec` 绑定 required/optional Skill
 - [x] Required Skill 自动注入 role context，Optional Skill 保持按需加载
 - [x] 支持 `.llm_agent/workflow.yaml` 配置 workflow 预算和 role skill
@@ -411,7 +418,9 @@ Web UI 可以继续复用同一个 Agent、Hook 和 Event 边界。
 - Workflow 已支持 checkpoint resume，但暂不支持跨机器锁、并发 resume 或 phase 内精确断点。
 - Role 目前使用 `RoleSpec` 配置，没有单独抽象 `PMAgent / EngineerAgent / QAAgent` 类。
 - Artifact gate 仍基于 artifact kind/status/metadata，尚未接入强 schema 校验。
-- Engineer 默认在主 workspace 执行，尚未默认启用 Worktree isolation。
+- Workflow 已默认使用 Git Worktree；非 Git 场景可配置 `isolation=shared`。
+- 当前 Gate 能验证 Artifact 交付和 Worktree Diff，但尚未校验 ImplementationReport
+  声明与真实 changed files、测试调用证据是否一致。
 
 ## 3. 接下来优先补全的单 Agent Harness 能力
 
@@ -762,7 +771,7 @@ pytest / ruff / build / API test / UI test
 - [x] Skill loader
 - [x] Catalog 驱动的模型语义选择
 - [ ] 多来源 Skill loader
-- [ ] Orchestrator 显式 Skill 路由
+- [x] Orchestrator 显式 Skill 路由
 
 验收标准：
 
@@ -784,15 +793,15 @@ pytest / ruff / build / API test / UI test
 验收标准：
 
 - [x] 开发和测试过程可以沉淀为 artifact。
-- [ ] 一个需求可以由 PM Agent 自动转换为 PRD 和 TaskSpec。
+- [x] 一个需求可以由 PM Agent 自动转换为 PRD 和 TaskSpec。
 
 ### Milestone 5：多 Agent MVP
 
-- [ ] PM Agent
-- [ ] Engineer Agent
-- [ ] QA Agent
-- [ ] Orchestrator 状态机
-- [ ] QA feedback loop
+- [x] PM worker
+- [x] Engineer worker
+- [x] QA worker
+- [x] Orchestrator 状态机
+- [x] QA feedback loop
 
 验收标准：
 

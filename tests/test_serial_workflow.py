@@ -1,6 +1,7 @@
 import json
 from dataclasses import replace
 from pathlib import Path
+import subprocess
 from typing import Any
 
 from llm_agent.artifact_system import ArtifactManager
@@ -13,6 +14,7 @@ from llm_agent.serial_workflow import (
 )
 from llm_agent.skill_system import SkillRegistry
 from llm_agent.trace_system import TraceRecorder
+from llm_agent.worktree import WorktreeManager
 
 
 class FakeLLM:
@@ -169,6 +171,218 @@ def test_serial_workflow_runs_pm_engineer_qa_acceptance(
         "qa_verify",
         "pm_acceptance",
     ]
+
+
+def test_serial_workflow_runs_code_phases_in_one_worktree(
+    tmp_path: Path,
+) -> None:
+    workdir = _repository(tmp_path)
+    manager = WorktreeManager.for_workdir(workdir)
+    llm = FakeLLM(
+        [
+            _response(
+                _create_call(
+                    "call-prd",
+                    kind="prd",
+                    title="PRD",
+                    content="Change the application value.",
+                    status="ready",
+                ),
+                _create_call(
+                    "call-task",
+                    kind="task_spec",
+                    title="Task Spec",
+                    content="Update app.py and verify it.",
+                    status="ready",
+                ),
+            ),
+            LLMResponse(content="planning done", tool_calls=[], raw={}),
+            _response(
+                _edit_call(
+                    "call-edit",
+                    path="app.py",
+                    old_text="value = 'original'",
+                    new_text="value = 'workflow'",
+                ),
+                _create_call(
+                    "call-impl",
+                    kind="implementation_report",
+                    title="Implementation Report",
+                    content="Updated app.py in the isolated workspace.",
+                ),
+            ),
+            LLMResponse(content="implementation done", tool_calls=[], raw={}),
+            _response(
+                _create_call(
+                    "call-test",
+                    kind="test_report",
+                    title="Test Report",
+                    content="Verified the isolated implementation.",
+                    metadata={"verdict": "pass"},
+                )
+            ),
+            LLMResponse(content="qa pass", tool_calls=[], raw={}),
+            _response(
+                _create_call(
+                    "call-accept",
+                    kind="acceptance_report",
+                    title="Acceptance Report",
+                    content="Accepted and ready to apply.",
+                )
+            ),
+            LLMResponse(content="accepted", tool_calls=[], raw={}),
+        ]
+    )
+    workflow = SerialCodingWorkflow(
+        llm=llm,  # type: ignore[arg-type]
+        workdir=workdir,
+        artifact_manager=ArtifactManager.for_workdir(workdir),
+        approval_provider=AutoApprovalProvider(approved=True),
+        worktree_manager=manager,
+        isolation="worktree",
+    )
+
+    result = workflow.run("Change the application value.", run_id="wf-worktree")
+
+    assert result.status == "completed"
+    assert result.worktree is not None
+    assert result.worktree["changed_files"] == ["app.py"]
+    assert (workdir / "app.py").read_text(encoding="utf-8") == (
+        "value = 'original'\n"
+    )
+    worktree_id = result.worktree["worktree"]["id"]
+    info = manager.get(worktree_id)
+    isolated = Path(info.path)
+    assert (isolated / "app.py").read_text(encoding="utf-8") == (
+        "value = 'workflow'\n"
+    )
+    assert not (isolated / ".llm_agent").exists()
+    record = workflow.workflow_store.load_run("wf-worktree")
+    assert record.worktree_id == worktree_id
+    assert record.worktree_base_commit == info.base_commit
+    assert info.path in llm.messages[2][0]["content"]
+    assert info.path in llm.messages[4][0]["content"]
+    assert info.path in llm.messages[6][0]["content"]
+    message_count = len(llm.messages)
+    resumed = workflow.resume("wf-worktree")
+    assert resumed.worktree is not None
+    assert resumed.worktree["worktree"]["id"] == worktree_id
+    assert len(llm.messages) == message_count
+    assert [item.id for item in manager.list()] == [worktree_id]
+
+    manager.apply(worktree_id)
+    assert (workdir / "app.py").read_text(encoding="utf-8") == (
+        "value = 'workflow'\n"
+    )
+    manager.remove(worktree_id)
+
+
+def test_serial_workflow_resume_reuses_persisted_worktree(
+    tmp_path: Path,
+) -> None:
+    workdir = _repository(tmp_path)
+    manager = WorktreeManager.for_workdir(workdir)
+    llm = FakeLLM(_successful_outputs("wf-reuse", include_pm=False))
+    workflow = SerialCodingWorkflow(
+        llm=llm,  # type: ignore[arg-type]
+        workdir=workdir,
+        artifact_manager=ArtifactManager.for_workdir(workdir),
+        approval_provider=AutoApprovalProvider(approved=True),
+        worktree_manager=manager,
+        isolation="worktree",
+    )
+    assert workflow.workflow_store is not None
+    record = workflow.workflow_store.create_run(
+        workflow_id="wf-reuse",
+        request="Resume in the existing worktree.",
+        initial_artifact_ids=[],
+    )
+    workflow.workflow_store.mark_phase_started(
+        record,
+        phase_key="pm_plan",
+        phase="pm_plan",
+        role="PM",
+        before_versions={},
+    )
+    artifacts = ArtifactManager.for_workdir(workdir)
+    artifacts.create_artifact(
+        kind="prd",
+        title="PRD",
+        content="Recovered plan.",
+        status="ready",
+    )
+    artifacts.create_artifact(
+        kind="task_spec",
+        title="Task Spec",
+        content="Recovered task.",
+        status="ready",
+    )
+    info = manager.create(agent_id="workflow", run_id="wf-reuse")
+    record.worktree_id = info.id
+    record.worktree_base_commit = info.base_commit
+    workflow.workflow_store.save_run(record)
+
+    result = workflow.resume("wf-reuse")
+
+    assert result.status == "completed"
+    assert result.worktree is not None
+    assert result.worktree["worktree"]["id"] == info.id
+    assert [item.id for item in manager.list()] == [info.id]
+    manager.remove(info.id)
+
+
+def test_serial_workflow_resume_fails_when_worktree_is_missing(
+    tmp_path: Path,
+) -> None:
+    workdir = _repository(tmp_path)
+    manager = WorktreeManager.for_workdir(workdir)
+    workflow = SerialCodingWorkflow(
+        llm=FakeLLM([]),  # type: ignore[arg-type]
+        workdir=workdir,
+        artifact_manager=ArtifactManager.for_workdir(workdir),
+        approval_provider=AutoApprovalProvider(approved=True),
+        worktree_manager=manager,
+        isolation="worktree",
+    )
+    assert workflow.workflow_store is not None
+    record = workflow.workflow_store.create_run(
+        workflow_id="wf-missing",
+        request="Resume a missing worktree.",
+        initial_artifact_ids=[],
+    )
+    workflow.workflow_store.mark_phase_started(
+        record,
+        phase_key="pm_plan",
+        phase="pm_plan",
+        role="PM",
+        before_versions={},
+    )
+    artifacts = ArtifactManager.for_workdir(workdir)
+    artifacts.create_artifact(
+        kind="prd",
+        title="PRD",
+        content="Recovered plan.",
+        status="ready",
+    )
+    artifacts.create_artifact(
+        kind="task_spec",
+        title="Task Spec",
+        content="Recovered task.",
+        status="ready",
+    )
+    info = manager.create(agent_id="workflow", run_id="wf-missing")
+    record.worktree_id = info.id
+    record.worktree_base_commit = info.base_commit
+    workflow.workflow_store.save_run(record)
+    _git(workdir, "worktree", "remove", "--force", info.path)
+
+    result = workflow.resume("wf-missing")
+
+    assert result.status == "failed"
+    assert result.error is not None
+    assert "worktree setup failed" in result.error.lower()
+    assert "missing" in result.error.lower()
+    manager.remove(info.id)
 
 
 def test_serial_workflow_resume_completed_run_does_not_call_llm(
@@ -527,6 +741,7 @@ Map each requirement to evidence.
         approval_provider=AutoApprovalProvider(approved=True),
         skill_registry=SkillRegistry.for_workdir(tmp_path),
         role_specs=role_specs,
+        isolation="shared",
     )
 
     result = workflow.run("Build a feature with role skills.", run_id="wf-skills")
@@ -565,7 +780,30 @@ def _workflow(tmp_path: Path, llm: FakeLLM) -> SerialCodingWorkflow:
         workdir=tmp_path,
         artifact_manager=ArtifactManager.for_workdir(tmp_path),
         approval_provider=AutoApprovalProvider(approved=True),
+        isolation="shared",
     )
+
+
+def _git(workdir: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=workdir,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout
+
+
+def _repository(tmp_path: Path) -> Path:
+    _git(tmp_path, "init", "-b", "main")
+    _git(tmp_path, "config", "user.email", "agent@example.com")
+    _git(tmp_path, "config", "user.name", "Agent Test")
+    (tmp_path / ".gitignore").write_text(".llm_agent/\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("value = 'original'\n", encoding="utf-8")
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "commit", "-m", "initial")
+    return tmp_path
 
 
 def _successful_outputs(
@@ -671,6 +909,25 @@ def _create_call(
         name="artifact_create",
         arguments=arguments,
         raw={"id": call_id, "name": "artifact_create"},
+    )
+
+
+def _edit_call(
+    call_id: str,
+    *,
+    path: str,
+    old_text: str,
+    new_text: str,
+) -> LLMToolCall:
+    return LLMToolCall(
+        id=call_id,
+        name="edit_file",
+        arguments={
+            "path": path,
+            "old_text": old_text,
+            "new_text": new_text,
+        },
+        raw={"id": call_id, "name": "edit_file"},
     )
 
 

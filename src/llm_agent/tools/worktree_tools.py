@@ -37,20 +37,20 @@ def worktree_tool_definitions(
     tools = WorktreeTools(manager)
     worktree_id = {
         "type": "string",
-        "description": "Managed worktree id returned by subagent_run.",
+        "description": "Managed worktree id returned by a Subagent or Workflow.",
     }
     return [
         ToolDefinition(
             name="worktree_list",
-            description="List managed isolated Subagent worktrees.",
+            description="List managed isolated worktrees.",
             parameters={"type": "object", "properties": {}},
             func=tools.list_worktrees,
         ),
         ToolDefinition(
             name="worktree_diff",
             description=(
-                "Inspect changed files and a bounded diff for an isolated "
-                "Subagent worktree."
+                "Inspect changed files and a bounded diff for a managed "
+                "isolated worktree."
             ),
             parameters={
                 "type": "object",

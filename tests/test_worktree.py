@@ -144,6 +144,26 @@ def test_worktree_without_changes_is_cleaned_automatically(
     assert not Path(info.path).exists()
 
 
+def test_worktree_diff_excludes_runtime_state(tmp_path: Path) -> None:
+    workdir = _repository(tmp_path)
+    manager = WorktreeManager.for_workdir(workdir)
+    info = manager.create()
+    isolated = Path(info.path)
+    (isolated / "app.py").write_text(
+        "value = 'isolated'\n",
+        encoding="utf-8",
+    )
+    runtime_dir = isolated / ".llm_agent" / "tool-results"
+    runtime_dir.mkdir(parents=True)
+    (runtime_dir / "stdout.log").write_text("runtime only\n", encoding="utf-8")
+
+    review = manager.finish(info.id)
+
+    assert review["changed_files"] == ["app.py"]
+    assert ".llm_agent" not in review["diff"]
+    manager.remove(info.id, discard_changes=True)
+
+
 def test_worktree_apply_rejects_changed_main_head(tmp_path: Path) -> None:
     workdir = _repository(tmp_path)
     manager = WorktreeManager.for_workdir(workdir)

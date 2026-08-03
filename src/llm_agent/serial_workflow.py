@@ -35,10 +35,15 @@ from llm_agent.workflow_store import (
     WorkflowRunRecord,
     WorkflowStore,
 )
+from llm_agent.worktree import (
+    WorktreeError,
+    WorktreeManager,
+)
 
 
 WorkflowStatus = Literal["completed", "failed"]
 WorkflowPhaseStatus = Literal["completed", "failed"]
+WorkflowIsolation = Literal["shared", "worktree"]
 WorkflowPhase = Literal[
     "pm_plan",
     "engineer_implement",
@@ -145,6 +150,7 @@ class WorkflowResult:
     artifact_ids: list[str]
     qa_verdict: str | None = None
     fix_cycles: int = 0
+    worktree: dict[str, Any] | None = None
     error: str | None = None
 
 
@@ -164,6 +170,8 @@ class SerialCodingWorkflow:
     approval_provider: ApprovalProvider | None = None
     skill_registry: SkillRegistry | None = None
     workflow_store: WorkflowStore | None = None
+    worktree_manager: WorktreeManager | None = None
+    isolation: WorkflowIsolation = "worktree"
     role_specs: dict[str, RoleSpec] = field(
         default_factory=lambda: dict(ROLE_SPECS)
     )
@@ -175,6 +183,10 @@ class SerialCodingWorkflow:
         self.workdir = Path(self.workdir).resolve()
         if self.workflow_store is None:
             self.workflow_store = WorkflowStore.for_workdir(self.workdir)
+        if self.isolation not in {"shared", "worktree"}:
+            raise ValueError(f"Unsupported workflow isolation: {self.isolation}")
+        if self.isolation == "worktree" and self.worktree_manager is None:
+            self.worktree_manager = WorktreeManager.for_workdir(self.workdir)
         missing_roles = {"pm", "engineer", "qa", "pm_acceptance"} - set(
             self.role_specs
         )
@@ -187,6 +199,89 @@ class SerialCodingWorkflow:
             raise ValueError("max_fix_cycles cannot be negative.")
         if self.max_phase_retries < 0:
             raise ValueError("max_phase_retries cannot be negative.")
+
+    def _ensure_execution_workdir(self, record: WorkflowRunRecord) -> Path:
+        if self.isolation == "shared":
+            return self.workdir
+        if self.worktree_manager is None:
+            raise WorktreeError("Workflow worktree isolation is not configured.")
+
+        if record.worktree_id is None:
+            info = self.worktree_manager.create(
+                agent_id="workflow",
+                run_id=record.workflow_id,
+            )
+            record.worktree_id = info.id
+            record.worktree_base_commit = info.base_commit
+            self._save_record(record)
+            event_name = "workflow.worktree.created"
+        else:
+            self.worktree_manager.reconcile()
+            info = self.worktree_manager.get(record.worktree_id)
+            if info.status == "missing":
+                raise WorktreeError(
+                    f"Workflow worktree is missing: {record.worktree_id}"
+                )
+            if info.status == "applied":
+                raise WorktreeError(
+                    "Workflow worktree was already applied before the workflow "
+                    f"finished: {record.worktree_id}"
+                )
+            if info.run_id not in {None, record.workflow_id}:
+                raise WorktreeError(
+                    f"Worktree {info.id} belongs to another run: {info.run_id}"
+                )
+            if (
+                record.worktree_base_commit is not None
+                and record.worktree_base_commit != info.base_commit
+            ):
+                raise WorktreeError(
+                    f"Worktree base commit mismatch for {record.worktree_id}."
+                )
+            if record.worktree_base_commit is None:
+                record.worktree_base_commit = info.base_commit
+                self._save_record(record)
+            event_name = "workflow.worktree.reused"
+
+        self._record_workflow_trace(
+            event_name,
+            phase="ready",
+            data={
+                "workflow_id": record.workflow_id,
+                "worktree_id": info.id,
+                "base_commit": info.base_commit,
+                "path": info.path,
+            },
+        )
+        return Path(info.path).resolve()
+
+    def _worktree_review(
+        self,
+        record: WorkflowRunRecord | None,
+    ) -> dict[str, Any] | None:
+        if (
+            self.isolation != "worktree"
+            or record is None
+            or record.worktree_id is None
+            or self.worktree_manager is None
+        ):
+            return None
+        try:
+            return self.worktree_manager.diff(record.worktree_id)
+        except WorktreeError as exc:
+            return {
+                "worktree": {
+                    "id": record.worktree_id,
+                    "base_commit": record.worktree_base_commit,
+                    "status": "missing",
+                },
+                "changed_files": [],
+                "change_count": 0,
+                "diff": "",
+                "diff_path": None,
+                "diff_truncated": False,
+                "error": str(exc),
+            }
 
     def run(
         self,
@@ -251,6 +346,7 @@ class SerialCodingWorkflow:
                     "task_spec": {"ready", "accepted"},
                 },
             ),
+            execution_workdir=self.workdir,
             on_event=on_event,
             trace=trace,
         )
@@ -261,6 +357,18 @@ class SerialCodingWorkflow:
                 phases=self._record_phase_results(record),
                 initial_artifact_ids=initial_artifact_ids,
                 error=pm_result.error,
+                record=record,
+            )
+
+        try:
+            execution_workdir = self._ensure_execution_workdir(record)
+        except WorktreeError as exc:
+            return self._finish(
+                workflow_id,
+                status="failed",
+                phases=self._record_phase_results(record),
+                initial_artifact_ids=initial_artifact_ids,
+                error=f"Workflow worktree setup failed: {exc}",
                 record=record,
             )
 
@@ -276,6 +384,7 @@ class SerialCodingWorkflow:
                 before,
                 required={"implementation_report": None},
             ),
+            execution_workdir=execution_workdir,
             on_event=on_event,
             trace=trace,
         )
@@ -297,6 +406,7 @@ class SerialCodingWorkflow:
             request=request,
             prompt=self._qa_prompt(workflow_id, request, regression=False),
             gate=lambda before: self._gate_test_report(initial_artifact_ids, before),
+            execution_workdir=execution_workdir,
             on_event=on_event,
             trace=trace,
         )
@@ -336,6 +446,7 @@ class SerialCodingWorkflow:
                     before,
                     required={"implementation_report": None},
                 ),
+                execution_workdir=execution_workdir,
                 on_event=on_event,
                 trace=trace,
             )
@@ -367,6 +478,7 @@ class SerialCodingWorkflow:
                     initial_artifact_ids,
                     before,
                 ),
+                execution_workdir=execution_workdir,
                 on_event=on_event,
                 trace=trace,
             )
@@ -402,6 +514,7 @@ class SerialCodingWorkflow:
                 before,
                 required={"acceptance_report": None},
             ),
+            execution_workdir=execution_workdir,
             on_event=on_event,
             trace=trace,
         )
@@ -440,6 +553,7 @@ class SerialCodingWorkflow:
         request: str,
         prompt: str,
         gate: Callable[[dict[str, int]], _GateResult],
+        execution_workdir: Path,
         on_event: AgentCallback | None,
         trace: TraceRecorder | None,
     ) -> WorkflowPhaseResult:
@@ -485,6 +599,7 @@ class SerialCodingWorkflow:
             request=request,
             prompt=prompt,
             gate=gate,
+            execution_workdir=execution_workdir,
             on_event=on_event,
             trace=trace,
             record=record,
@@ -534,6 +649,7 @@ class SerialCodingWorkflow:
         request: str,
         prompt: str,
         gate: Callable[[dict[str, int]], _GateResult],
+        execution_workdir: Path,
         on_event: AgentCallback | None,
         trace: TraceRecorder | None,
         record: WorkflowRunRecord | None = None,
@@ -571,6 +687,7 @@ class SerialCodingWorkflow:
                 workflow_id=workflow_id,
                 phase=phase,
                 request=request,
+                execution_workdir=execution_workdir,
             )
             if messages is None:
                 messages = agent.new_messages()
@@ -663,16 +780,18 @@ class SerialCodingWorkflow:
         workflow_id: str,
         phase: WorkflowPhase,
         request: str,
+        execution_workdir: Path,
     ) -> Agent:
         registry = build_default_registry(
-            workdir=self.workdir,
+            workdir=execution_workdir,
+            task_workdir=self.workdir,
             artifact_manager=self.artifact_manager,
             skill_registry=self.skill_registry,
         ).subset(role.tool_names)
         sections = [
             PromptSection(
                 name="workspace",
-                content=f"Working directory: {self.workdir}",
+                content=f"Working directory: {execution_workdir}",
                 priority=20,
             ),
             PromptSection(
@@ -698,6 +817,20 @@ class SerialCodingWorkflow:
             build_artifact_policy_section(priority=40),
             build_tool_summary_section(registry.tool_specs()),
         ]
+        if execution_workdir != self.workdir:
+            sections.insert(
+                1,
+                PromptSection(
+                    name="workspace_isolation",
+                    content=(
+                        "This workflow uses an isolated Git worktree. Read, edit, "
+                        "and verify project files only in the working directory "
+                        "above. Do not apply, merge, remove, or otherwise manage "
+                        "the worktree yourself."
+                    ),
+                    priority=22,
+                ),
+            )
         context = ContextManager(
             llm=self.llm,
             workdir=self.workdir,
@@ -709,11 +842,12 @@ class SerialCodingWorkflow:
             tools=registry,
             context_manager=context,
             hooks=build_default_hook_manager(
-                workdir=self.workdir,
+                workdir=execution_workdir,
+                task_workdir=self.workdir,
                 approval_provider=self.approval_provider,
                 artifact_manager=self.artifact_manager,
             ),
-            workdir=self.workdir,
+            workdir=execution_workdir,
             max_steps=role.max_steps,
             agent_id=role.agent_id,
             parent_run_id=workflow_id,
@@ -929,6 +1063,14 @@ class SerialCodingWorkflow:
         artifact_ids = [
             artifact.id for artifact in self._workflow_artifacts(initial_artifact_ids)
         ]
+        worktree = self._worktree_review(record)
+        if (
+            status == "completed"
+            and worktree is not None
+            and worktree.get("error")
+        ):
+            status = "failed"
+            error = f"Workflow worktree review failed: {worktree['error']}"
         result = WorkflowResult(
             workflow_id=workflow_id,
             status=status,
@@ -936,6 +1078,7 @@ class SerialCodingWorkflow:
             artifact_ids=artifact_ids,
             qa_verdict=qa_verdict,
             fix_cycles=fix_cycles,
+            worktree=worktree,
             error=error,
         )
         if record is not None and self.workflow_store is not None:
@@ -957,6 +1100,16 @@ class SerialCodingWorkflow:
                 "artifact_ids": artifact_ids,
                 "qa_verdict": qa_verdict,
                 "fix_cycles": fix_cycles,
+                "worktree_id": (
+                    worktree.get("worktree", {}).get("id")
+                    if worktree is not None
+                    else None
+                ),
+                "changed_files": (
+                    worktree.get("changed_files", [])
+                    if worktree is not None
+                    else []
+                ),
                 "error": error,
             },
         )
@@ -1030,6 +1183,7 @@ class SerialCodingWorkflow:
             artifact_ids=list(record.artifact_ids),
             qa_verdict=record.qa_verdict,
             fix_cycles=record.fix_cycles,
+            worktree=self._worktree_review(record),
             error=record.error,
         )
 
@@ -1272,6 +1426,7 @@ __all__ = [
     "SerialCodingWorkflow",
     "WorkflowPhase",
     "WorkflowPhaseResult",
+    "WorkflowIsolation",
     "WorkflowResult",
     "WorkflowStatus",
     "parse_workflow_command",

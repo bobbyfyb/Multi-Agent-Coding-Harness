@@ -16,7 +16,10 @@ from llm_agent.trace_system import record_trace
 
 WorktreeStatus = Literal["active", "ready", "applied", "missing"]
 WORKTREE_ID_PATTERN = re.compile(r"^wt_[0-9a-f]{12}$")
-RUNTIME_PATHSPEC = ":(exclude).llm_agent/**"
+RUNTIME_PATHSPECS = (
+    ":(exclude).llm_agent",
+    ":(exclude).llm_agent/**",
+)
 
 
 class WorktreeError(RuntimeError):
@@ -98,7 +101,7 @@ class WorktreeManager:
                     "--untracked-files=all",
                     "--",
                     ".",
-                    RUNTIME_PATHSPEC,
+                    *RUNTIME_PATHSPECS,
                 ]
             ).strip()
             if dirty:
@@ -172,7 +175,7 @@ class WorktreeManager:
                     info.base_commit,
                     "--",
                     ".",
-                    RUNTIME_PATHSPEC,
+                    *RUNTIME_PATHSPECS,
                 ],
                 cwd=path,
             )
@@ -186,7 +189,7 @@ class WorktreeManager:
                         info.base_commit,
                         "--",
                         ".",
-                        RUNTIME_PATHSPEC,
+                        *RUNTIME_PATHSPECS,
                     ],
                     cwd=path,
                 ).splitlines()
@@ -350,7 +353,7 @@ class WorktreeManager:
                 "--untracked-files=all",
                 "--",
                 ".",
-                RUNTIME_PATHSPEC,
+                *RUNTIME_PATHSPECS,
             ],
             cwd=path,
         ).strip()
@@ -365,7 +368,11 @@ class WorktreeManager:
 
     def _stage_worktree(self, path: Path) -> None:
         self._git(
-            ["add", "-A", "--", ".", RUNTIME_PATHSPEC],
+            ["add", "-A", "--", "."],
+            cwd=path,
+        )
+        self._git(
+            ["reset", "--quiet", "HEAD", "--", ".llm_agent"],
             cwd=path,
         )
 
