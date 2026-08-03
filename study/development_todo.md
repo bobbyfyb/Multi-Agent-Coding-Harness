@@ -403,24 +403,30 @@ Web UI 可以继续复用同一个 Agent、Hook 和 Event 边界。
 - [x] Required Skill 缺失时 fail fast，Optional Skill 缺失时忽略并 warning
 - [x] Artifact gate 检查每个阶段是否新建或更新了必需 artifact
 - [x] QA gate 要求 `metadata.verdict` 明确为 `pass` 或 `fail`
-- [x] 阶段 artifact gate 失败时自动给同一 worker 一次纠正机会
+- [x] TaskSpec 要求声明布尔值 `metadata.change_required`
+- [x] Worktree phase 记录前后 Diff SHA、changed files，并持久化到 checkpoint
+- [x] ImplementationReport 的 `outcome / changed_files` 与真实 Worktree Diff 对账
+- [x] QA 验证工具结果在调用完成后立即持久化，不依赖 Trace 回放
+- [x] QA pass 要求真实成功的 `run_tests/run_lint`，且无失败证据和 QA 代码修改
+- [x] Acceptance prompt 注入由 Orchestrator 汇总的实现与验证证据
+- [x] 阶段 completion evidence gate 失败时自动给同一 worker 一次纠正机会
 - [x] QA verdict 为 `fail` 时触发一次 Engineer fix cycle 和 QA regression
 - [x] Workflow 生命周期和 phase 事件写入 Trace
 - [x] CLI 支持显式 `/workflow <request>` 入口
 - [x] Workflow run record 持久化到 `.llm_agent/workflows/<workflow_id>/run.json`
 - [x] 支持 `/workflow-list`、`/workflow-show <id>`、`/workflow-resume <id>`
-- [x] Resume 基于 phase checkpoint 和 artifact gate，不做完整 message replay
-- [x] 覆盖成功流程、artifact gate retry、QA fail fix cycle 和命令解析测试
+- [x] Resume 基于 phase checkpoint 和 completion gate，不做完整 message replay
+- [x] 覆盖成功、no-change、虚假实现声明、无验证 QA pass、gate retry 和 fix cycle
 
 当前边界：
 
 - 目前是同步串行 Orchestrator-Worker，不支持并行 Agent Team。
 - Workflow 已支持 checkpoint resume，但暂不支持跨机器锁、并发 resume 或 phase 内精确断点。
 - Role 目前使用 `RoleSpec` 配置，没有单独抽象 `PMAgent / EngineerAgent / QAAgent` 类。
-- Artifact gate 仍基于 artifact kind/status/metadata，尚未接入强 schema 校验。
+- Artifact metadata 仍是轻量字典校验，尚未为各类 Artifact 引入独立强 schema。
 - Workflow 已默认使用 Git Worktree；非 Git 场景可配置 `isolation=shared`。
-- 当前 Gate 能验证 Artifact 交付和 Worktree Diff，但尚未校验 ImplementationReport
-  声明与真实 changed files、测试调用证据是否一致。
+- Evidence Gate 已校验 ImplementationReport、Worktree Diff 与验证工具结果；
+  `shared` 兼容模式没有独立 Diff 事实源，因此只执行较弱的 Artifact gate。
 
 ## 3. 接下来优先补全的单 Agent Harness 能力
 

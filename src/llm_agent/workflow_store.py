@@ -258,6 +258,7 @@ class WorkflowStore:
         phase: str,
         role: str,
         before_versions: dict[str, int],
+        data: dict[str, Any] | None = None,
     ) -> WorkflowPhaseCheckpoint:
         checkpoint = record.checkpoints.get(phase_key)
         if checkpoint is None:
@@ -268,6 +269,7 @@ class WorkflowStore:
                 status="running",
                 before_versions=dict(before_versions),
                 started_at=_utc_now(),
+                data=dict(data or {}),
             )
         else:
             checkpoint.status = "running"
@@ -276,7 +278,7 @@ class WorkflowStore:
             checkpoint.run_ids = []
             checkpoint.artifact_ids = []
             checkpoint.error = None
-            checkpoint.data = {}
+            checkpoint.data = dict(checkpoint.data if data is None else data)
         record.status = "running"
         record.current_phase = phase
         record.current_phase_key = phase_key
@@ -303,7 +305,7 @@ class WorkflowStore:
             checkpoint.run_ids = list(run_ids)
             checkpoint.artifact_ids = list(artifact_ids)
             checkpoint.error = None
-            checkpoint.data = dict(data or {})
+            checkpoint.data = dict(checkpoint.data if data is None else data)
         _upsert_phase_result(record, phase_key, phase_result)
         record.current_phase = None
         record.current_phase_key = None
@@ -330,7 +332,7 @@ class WorkflowStore:
             checkpoint.run_ids = list(run_ids)
             checkpoint.artifact_ids = list(artifact_ids)
             checkpoint.error = error
-            checkpoint.data = dict(data or {})
+            checkpoint.data = dict(checkpoint.data if data is None else data)
         if phase_result is not None:
             _upsert_phase_result(record, phase_key, phase_result)
         record.current_phase = None

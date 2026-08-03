@@ -194,6 +194,7 @@ def test_serial_workflow_runs_code_phases_in_one_worktree(
                     title="Task Spec",
                     content="Update app.py and verify it.",
                     status="ready",
+                    metadata={"change_required": True},
                 ),
             ),
             LLMResponse(content="planning done", tool_calls=[], raw={}),
@@ -209,10 +210,15 @@ def test_serial_workflow_runs_code_phases_in_one_worktree(
                     kind="implementation_report",
                     title="Implementation Report",
                     content="Updated app.py in the isolated workspace.",
+                    metadata={
+                        "outcome": "changed",
+                        "changed_files": ["app.py"],
+                    },
                 ),
             ),
             LLMResponse(content="implementation done", tool_calls=[], raw={}),
             _response(
+                _run_lint_call("call-lint"),
                 _create_call(
                     "call-test",
                     kind="test_report",
@@ -256,13 +262,23 @@ def test_serial_workflow_runs_code_phases_in_one_worktree(
     assert (isolated / "app.py").read_text(encoding="utf-8") == (
         "value = 'workflow'\n"
     )
-    assert not (isolated / ".llm_agent").exists()
+    assert (isolated / ".llm_agent" / "tool-results").is_dir()
+    assert ".llm_agent" not in result.worktree["diff"]
     record = workflow.workflow_store.load_run("wf-worktree")
     assert record.worktree_id == worktree_id
     assert record.worktree_base_commit == info.base_commit
+    engineer_evidence = record.checkpoints["engineer_implement"].data[
+        "implementation_evidence"
+    ]
+    assert engineer_evidence["changed_this_phase"] is True
+    assert engineer_evidence["actual_changed_files"] == ["app.py"]
+    qa_evidence = record.checkpoints["qa_verify"].data["qa_evidence"]
+    assert qa_evidence["successful_checks"] == 1
+    assert qa_evidence["verification"][0]["outcome"] == "clean"
     assert info.path in llm.messages[2][0]["content"]
     assert info.path in llm.messages[4][0]["content"]
     assert info.path in llm.messages[6][0]["content"]
+    assert "run_lint=clean" in llm.messages[6][-1]["content"]
     message_count = len(llm.messages)
     resumed = workflow.resume("wf-worktree")
     assert resumed.worktree is not None
@@ -282,7 +298,7 @@ def test_serial_workflow_resume_reuses_persisted_worktree(
 ) -> None:
     workdir = _repository(tmp_path)
     manager = WorktreeManager.for_workdir(workdir)
-    llm = FakeLLM(_successful_outputs("wf-reuse", include_pm=False))
+    llm = FakeLLM(_worktree_no_change_outputs("wf-reuse"))
     workflow = SerialCodingWorkflow(
         llm=llm,  # type: ignore[arg-type]
         workdir=workdir,
@@ -316,6 +332,7 @@ def test_serial_workflow_resume_reuses_persisted_worktree(
         title="Task Spec",
         content="Recovered task.",
         status="ready",
+        metadata={"change_required": False},
     )
     info = manager.create(agent_id="workflow", run_id="wf-reuse")
     record.worktree_id = info.id
@@ -327,6 +344,11 @@ def test_serial_workflow_resume_reuses_persisted_worktree(
     assert result.status == "completed"
     assert result.worktree is not None
     assert result.worktree["worktree"]["id"] == info.id
+    assert result.worktree["changed_files"] == []
+    assert result.phases[1].data["implementation_evidence"]["outcome"] == (
+        "no_change"
+    )
+    assert result.phases[2].data["qa_evidence"]["successful_checks"] == 1
     assert [item.id for item in manager.list()] == [info.id]
     manager.remove(info.id)
 
@@ -369,6 +391,7 @@ def test_serial_workflow_resume_fails_when_worktree_is_missing(
         title="Task Spec",
         content="Recovered task.",
         status="ready",
+        metadata={"change_required": True},
     )
     info = manager.create(agent_id="workflow", run_id="wf-missing")
     record.worktree_id = info.id
@@ -383,6 +406,267 @@ def test_serial_workflow_resume_fails_when_worktree_is_missing(
     assert "worktree setup failed" in result.error.lower()
     assert "missing" in result.error.lower()
     manager.remove(info.id)
+
+
+def test_worktree_evidence_gate_rejects_report_without_code_change(
+    tmp_path: Path,
+) -> None:
+    workdir = _repository(tmp_path)
+    manager = WorktreeManager.for_workdir(workdir)
+    llm = FakeLLM(
+        [
+            _response(
+                _create_call(
+                    "call-prd",
+                    kind="prd",
+                    title="PRD",
+                    content="Change app.py.",
+                    status="ready",
+                ),
+                _create_call(
+                    "call-task",
+                    kind="task_spec",
+                    title="Task Spec",
+                    content="Change app.py.",
+                    status="ready",
+                    metadata={"change_required": True},
+                ),
+            ),
+            LLMResponse(content="planning done", tool_calls=[], raw={}),
+            _response(
+                _create_call(
+                    "call-impl",
+                    kind="implementation_report",
+                    title="Implementation Report",
+                    content="Claimed app.py was changed.",
+                    metadata={
+                        "outcome": "changed",
+                        "changed_files": ["app.py"],
+                    },
+                )
+            ),
+            LLMResponse(content="implementation done", tool_calls=[], raw={}),
+        ]
+    )
+    workflow = SerialCodingWorkflow(
+        llm=llm,  # type: ignore[arg-type]
+        workdir=workdir,
+        artifact_manager=ArtifactManager.for_workdir(workdir),
+        approval_provider=AutoApprovalProvider(approved=True),
+        worktree_manager=manager,
+        isolation="worktree",
+        max_phase_retries=0,
+    )
+
+    result = workflow.run("Change app.py.", run_id="wf-no-diff")
+
+    assert result.status == "failed"
+    assert result.error is not None
+    assert "Worktree Diff did not change" in result.error
+    assert result.phases[-1].phase == "engineer_implement"
+    assert result.worktree is not None
+    manager.remove(result.worktree["worktree"]["id"], discard_changes=True)
+
+
+def test_worktree_evidence_gate_rejects_qa_pass_without_verification(
+    tmp_path: Path,
+) -> None:
+    workdir = _repository(tmp_path)
+    manager = WorktreeManager.for_workdir(workdir)
+    llm = FakeLLM(
+        [
+            _response(
+                _create_call(
+                    "call-prd",
+                    kind="prd",
+                    title="PRD",
+                    content="Change app.py.",
+                    status="ready",
+                ),
+                _create_call(
+                    "call-task",
+                    kind="task_spec",
+                    title="Task Spec",
+                    content="Change app.py.",
+                    status="ready",
+                    metadata={"change_required": True},
+                ),
+            ),
+            LLMResponse(content="planning done", tool_calls=[], raw={}),
+            _response(
+                _edit_call(
+                    "call-edit",
+                    path="app.py",
+                    old_text="value = 'original'",
+                    new_text="value = 'workflow'",
+                ),
+                _create_call(
+                    "call-impl",
+                    kind="implementation_report",
+                    title="Implementation Report",
+                    content="Changed app.py.",
+                    metadata={
+                        "outcome": "changed",
+                        "changed_files": ["app.py"],
+                    },
+                ),
+            ),
+            LLMResponse(content="implementation done", tool_calls=[], raw={}),
+            _response(
+                _create_call(
+                    "call-test",
+                    kind="test_report",
+                    title="Test Report",
+                    content="Claimed pass without running checks.",
+                    metadata={"verdict": "pass"},
+                )
+            ),
+            LLMResponse(content="qa pass", tool_calls=[], raw={}),
+        ]
+    )
+    workflow = SerialCodingWorkflow(
+        llm=llm,  # type: ignore[arg-type]
+        workdir=workdir,
+        artifact_manager=ArtifactManager.for_workdir(workdir),
+        approval_provider=AutoApprovalProvider(approved=True),
+        worktree_manager=manager,
+        isolation="worktree",
+        max_phase_retries=0,
+    )
+
+    result = workflow.run("Change app.py.", run_id="wf-no-check")
+
+    assert result.status == "failed"
+    assert result.error is not None
+    assert "no successful run_tests or run_lint" in result.error
+    assert result.phases[-1].phase == "qa_verify"
+    assert result.worktree is not None
+    manager.remove(result.worktree["worktree"]["id"], discard_changes=True)
+
+
+def test_worktree_fix_cycle_requires_a_new_diff_and_regression_evidence(
+    tmp_path: Path,
+) -> None:
+    workdir = _repository(tmp_path)
+    manager = WorktreeManager.for_workdir(workdir)
+    llm = FakeLLM(
+        [
+            _response(
+                _create_call(
+                    "call-prd",
+                    kind="prd",
+                    title="PRD",
+                    content="Change app.py and fix defects.",
+                    status="ready",
+                ),
+                _create_call(
+                    "call-task",
+                    kind="task_spec",
+                    title="Task Spec",
+                    content="Change app.py and verify it.",
+                    status="ready",
+                    metadata={"change_required": True},
+                ),
+            ),
+            LLMResponse(content="planning done", tool_calls=[], raw={}),
+            _response(
+                _edit_call(
+                    "call-edit-initial",
+                    path="app.py",
+                    old_text="value = 'original'",
+                    new_text="value = 'initial'",
+                ),
+                _create_call(
+                    "call-impl-initial",
+                    kind="implementation_report",
+                    title="Implementation Report",
+                    content="Initial implementation.",
+                    metadata={
+                        "outcome": "changed",
+                        "changed_files": ["app.py"],
+                    },
+                ),
+            ),
+            LLMResponse(content="implementation done", tool_calls=[], raw={}),
+            _response(
+                _create_call(
+                    "call-test-fail",
+                    kind="test_report",
+                    title="Test Report",
+                    content="A defect remains.",
+                    metadata={"verdict": "fail"},
+                )
+            ),
+            LLMResponse(content="qa fail", tool_calls=[], raw={}),
+            _response(
+                _edit_call(
+                    "call-edit-fix",
+                    path="app.py",
+                    old_text="value = 'initial'",
+                    new_text="value = 'fixed'",
+                ),
+                _create_call(
+                    "call-impl-fix",
+                    kind="implementation_report",
+                    title="Fix Implementation Report",
+                    content="Fixed the reported defect.",
+                    metadata={
+                        "outcome": "changed",
+                        "changed_files": ["app.py"],
+                    },
+                ),
+            ),
+            LLMResponse(content="fix done", tool_calls=[], raw={}),
+            _response(
+                _run_lint_call("call-regression-lint"),
+                _create_call(
+                    "call-regression",
+                    kind="test_report",
+                    title="Regression Test Report",
+                    content="Regression lint passes.",
+                    metadata={"verdict": "pass"},
+                ),
+            ),
+            LLMResponse(content="regression pass", tool_calls=[], raw={}),
+            _response(
+                _create_call(
+                    "call-accept",
+                    kind="acceptance_report",
+                    title="Acceptance Report",
+                    content="Accepted after the verified fix.",
+                )
+            ),
+            LLMResponse(content="accepted", tool_calls=[], raw={}),
+        ]
+    )
+    workflow = SerialCodingWorkflow(
+        llm=llm,  # type: ignore[arg-type]
+        workdir=workdir,
+        artifact_manager=ArtifactManager.for_workdir(workdir),
+        approval_provider=AutoApprovalProvider(approved=True),
+        worktree_manager=manager,
+        isolation="worktree",
+    )
+
+    result = workflow.run("Change app.py and fix defects.", run_id="wf-fix-evidence")
+
+    assert result.status == "completed"
+    assert result.fix_cycles == 1
+    fix_phase = next(phase for phase in result.phases if phase.phase == "engineer_fix")
+    fix_evidence = fix_phase.data["implementation_evidence"]
+    assert fix_evidence["changed_this_phase"] is True
+    assert (
+        fix_evidence["worktree_before"]["diff_sha256"]
+        != fix_evidence["worktree_after"]["diff_sha256"]
+    )
+    regression = next(
+        phase for phase in result.phases if phase.phase == "qa_regression"
+    )
+    assert regression.data["qa_evidence"]["successful_checks"] == 1
+    assert result.worktree is not None
+    isolated = Path(result.worktree["worktree"]["path"])
+    assert (isolated / "app.py").read_text(encoding="utf-8") == "value = 'fixed'\n"
+    manager.remove(result.worktree["worktree"]["id"], discard_changes=True)
 
 
 def test_serial_workflow_resume_completed_run_does_not_call_llm(
@@ -535,7 +819,8 @@ def test_serial_workflow_retries_missing_artifact_gate(
     assert result.phases[0].phase == "pm_plan"
     assert result.phases[0].attempts == 2
     assert any(
-        "did not satisfy its artifact gate" in str(message.get("content", ""))
+        "did not satisfy its completion evidence gate"
+        in str(message.get("content", ""))
         for call_messages in llm.messages
         for message in call_messages
     )
@@ -877,6 +1162,52 @@ def _successful_outputs(
     return outputs
 
 
+def _worktree_no_change_outputs(workflow_id: str) -> list[LLMResponse]:
+    return [
+        _response(
+            _create_call(
+                f"{workflow_id}-impl",
+                kind="implementation_report",
+                title="Implementation Report",
+                content="No project file changes were required.",
+                metadata={
+                    "workflow_id": workflow_id,
+                    "role": "engineer",
+                    "outcome": "no_change",
+                    "changed_files": [],
+                    "no_change_reason": "The recovered task is verify-only.",
+                },
+            )
+        ),
+        LLMResponse(content="implementation done", tool_calls=[], raw={}),
+        _response(
+            _run_lint_call(f"{workflow_id}-lint"),
+            _create_call(
+                f"{workflow_id}-test",
+                kind="test_report",
+                title="Test Report",
+                content="Lint passes.",
+                metadata={
+                    "workflow_id": workflow_id,
+                    "role": "qa",
+                    "verdict": "pass",
+                },
+            ),
+        ),
+        LLMResponse(content="qa pass", tool_calls=[], raw={}),
+        _response(
+            _create_call(
+                f"{workflow_id}-accept",
+                kind="acceptance_report",
+                title="Acceptance Report",
+                content="Accepted.",
+                metadata={"workflow_id": workflow_id, "role": "pm"},
+            )
+        ),
+        LLMResponse(content="accepted", tool_calls=[], raw={}),
+    ]
+
+
 def _write_skill(tmp_path: Path, directory: str, manifest: str) -> None:
     skill_dir = tmp_path / ".llm_agent" / "skills" / directory
     skill_dir.mkdir(parents=True)
@@ -928,6 +1259,15 @@ def _edit_call(
             "new_text": new_text,
         },
         raw={"id": call_id, "name": "edit_file"},
+    )
+
+
+def _run_lint_call(call_id: str) -> LLMToolCall:
+    return LLMToolCall(
+        id=call_id,
+        name="run_lint",
+        arguments={},
+        raw={"id": call_id, "name": "run_lint"},
     )
 
 

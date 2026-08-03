@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 from uuid import uuid4
 
-from llm_agent.agent import Agent, AgentCallback
+from llm_agent.agent import Agent, AgentCallback, AgentEvent
 from llm_agent.artifact_system import (
     Artifact,
     ArtifactManager,
@@ -115,6 +115,14 @@ QA_TOOLS = {
     "run_tests",
     "run_lint",
     *SKILL_TOOLS,
+}
+
+VERIFICATION_TOOLS = {"run_tests", "run_lint"}
+EVIDENCE_PHASES = {
+    "engineer_implement",
+    "engineer_fix",
+    "qa_verify",
+    "qa_regression",
 }
 
 
@@ -277,6 +285,7 @@ class SerialCodingWorkflow:
                 },
                 "changed_files": [],
                 "change_count": 0,
+                "diff_sha256": None,
                 "diff": "",
                 "diff_path": None,
                 "diff_truncated": False,
@@ -338,13 +347,9 @@ class SerialCodingWorkflow:
             role=self.role_specs["pm"],
             request=request,
             prompt=self._pm_prompt(workflow_id, request),
-            gate=lambda before: self._gate_required_artifacts(
+            gate=lambda before, _: self._gate_planning_artifacts(
                 initial_artifact_ids,
                 before,
-                required={
-                    "prd": {"ready", "accepted"},
-                    "task_spec": {"ready", "accepted"},
-                },
             ),
             execution_workdir=self.workdir,
             on_event=on_event,
@@ -379,10 +384,11 @@ class SerialCodingWorkflow:
             role=self.role_specs["engineer"],
             request=request,
             prompt=self._engineer_prompt(workflow_id, request, fix=False),
-            gate=lambda before: self._gate_required_artifacts(
+            gate=lambda before, data: self._gate_implementation_report(
+                record,
                 initial_artifact_ids,
                 before,
-                required={"implementation_report": None},
+                data,
             ),
             execution_workdir=execution_workdir,
             on_event=on_event,
@@ -405,7 +411,12 @@ class SerialCodingWorkflow:
             role=self.role_specs["qa"],
             request=request,
             prompt=self._qa_prompt(workflow_id, request, regression=False),
-            gate=lambda before: self._gate_test_report(initial_artifact_ids, before),
+            gate=lambda before, data: self._gate_test_report(
+                record,
+                initial_artifact_ids,
+                before,
+                data,
+            ),
             execution_workdir=execution_workdir,
             on_event=on_event,
             trace=trace,
@@ -441,10 +452,11 @@ class SerialCodingWorkflow:
                     fix=True,
                     fix_cycle=fix_cycles,
                 ),
-                gate=lambda before: self._gate_required_artifacts(
+                gate=lambda before, data: self._gate_implementation_report(
+                    record,
                     initial_artifact_ids,
                     before,
-                    required={"implementation_report": None},
+                    data,
                 ),
                 execution_workdir=execution_workdir,
                 on_event=on_event,
@@ -474,9 +486,11 @@ class SerialCodingWorkflow:
                     regression=True,
                     fix_cycle=fix_cycles,
                 ),
-                gate=lambda before: self._gate_test_report(
+                gate=lambda before, data: self._gate_test_report(
+                    record,
                     initial_artifact_ids,
                     before,
+                    data,
                 ),
                 execution_workdir=execution_workdir,
                 on_event=on_event,
@@ -508,8 +522,9 @@ class SerialCodingWorkflow:
                 workflow_id,
                 request,
                 qa_verdict=qa_verdict,
+                evidence_summary=self._format_evidence_summary(record),
             ),
-            gate=lambda before: self._gate_required_artifacts(
+            gate=lambda before, _: self._gate_required_artifacts(
                 initial_artifact_ids,
                 before,
                 required={"acceptance_report": None},
@@ -552,7 +567,7 @@ class SerialCodingWorkflow:
         role: RoleSpec,
         request: str,
         prompt: str,
-        gate: Callable[[dict[str, int]], _GateResult],
+        gate: Callable[[dict[str, int], dict[str, Any]], _GateResult],
         execution_workdir: Path,
         on_event: AgentCallback | None,
         trace: TraceRecorder | None,
@@ -564,8 +579,15 @@ class SerialCodingWorkflow:
         checkpoint = record.checkpoints.get(phase_key)
         before_versions = checkpoint.before_versions if checkpoint else None
         if checkpoint is not None:
-            gate_result = gate(checkpoint.before_versions)
+            gate_result = gate(
+                checkpoint.before_versions,
+                dict(checkpoint.data),
+            )
             if gate_result.ok:
+                recovered_data = {
+                    **checkpoint.data,
+                    **gate_result.data,
+                }
                 recovered = WorkflowPhaseResult(
                     phase=phase,
                     role=role.name,
@@ -574,7 +596,7 @@ class SerialCodingWorkflow:
                     artifact_ids=gate_result.artifact_ids,
                     summary="Recovered completed phase from persisted checkpoint.",
                     attempts=max(1, checkpoint.attempts),
-                    data=gate_result.data,
+                    data=recovered_data,
                 )
                 self._record_workflow_trace(
                     "workflow.phase.recovered",
@@ -585,7 +607,7 @@ class SerialCodingWorkflow:
                         "phase": phase,
                         "role": role.name,
                         "artifact_ids": gate_result.artifact_ids,
-                        **gate_result.data,
+                        **recovered_data,
                     },
                 )
                 self._persist_phase_completed(record, phase_key, recovered)
@@ -648,7 +670,7 @@ class SerialCodingWorkflow:
         workflow_id: str,
         request: str,
         prompt: str,
-        gate: Callable[[dict[str, int]], _GateResult],
+        gate: Callable[[dict[str, int], dict[str, Any]], _GateResult],
         execution_workdir: Path,
         on_event: AgentCallback | None,
         trace: TraceRecorder | None,
@@ -661,6 +683,13 @@ class SerialCodingWorkflow:
         messages: list[dict[str, Any]] | None = None
         last_summary = ""
         last_gate = _GateResult(ok=False, message="Phase did not run.")
+        phase_data = self._phase_checkpoint_data(record, phase_key)
+        if (
+            self.isolation == "worktree"
+            and phase in EVIDENCE_PHASES
+            and "worktree_before" not in phase_data
+        ):
+            phase_data["worktree_before"] = self._worktree_snapshot(record)
         if record is not None and self.workflow_store is not None:
             self.workflow_store.mark_phase_started(
                 record,
@@ -668,6 +697,7 @@ class SerialCodingWorkflow:
                 phase=phase,
                 role=role.name,
                 before_versions=before_versions,
+                data=phase_data,
             )
 
         self._record_workflow_trace(
@@ -697,20 +727,48 @@ class SerialCodingWorkflow:
 
             phase_run_id = f"{workflow_id}-{phase}-{attempt}"
             run_ids.append(phase_run_id)
+            self._update_phase_checkpoint_data(
+                record,
+                phase_key,
+                {
+                    "current_attempt": attempt,
+                    "current_run_id": phase_run_id,
+                },
+            )
+
+            def phase_on_event(event: AgentEvent) -> None:
+                self._capture_verification_event(
+                    record,
+                    phase_key,
+                    attempt,
+                    event,
+                )
+                if on_event is not None:
+                    on_event(event)
+
             result = agent.run(
                 messages,
-                on_event=on_event,
+                on_event=phase_on_event,
                 run_id=phase_run_id,
                 trace=trace,
             )
             last_summary = result.content
+            phase_data = self._phase_checkpoint_data(record, phase_key)
             if result.status != "completed":
-                last_gate = _GateResult(
+                gate_result = _GateResult(
                     ok=False,
                     message=f"Role agent ended with status={result.status}.",
                 )
             else:
-                last_gate = gate(before_versions)
+                gate_result = gate(before_versions, phase_data)
+            phase_data = {**phase_data, **gate_result.data}
+            self._replace_phase_checkpoint_data(record, phase_key, phase_data)
+            last_gate = _GateResult(
+                ok=gate_result.ok,
+                message=gate_result.message,
+                artifact_ids=gate_result.artifact_ids,
+                data=phase_data,
+            )
             if last_gate.ok:
                 self._record_workflow_trace(
                     "workflow.phase.completed",
@@ -772,6 +830,109 @@ class SerialCodingWorkflow:
         )
         self._persist_phase_failed(record, phase_key, failed_result)
         return failed_result
+
+    def _worktree_snapshot(
+        self,
+        record: WorkflowRunRecord | None,
+    ) -> dict[str, Any]:
+        if (
+            record is None
+            or record.worktree_id is None
+            or self.worktree_manager is None
+        ):
+            raise WorktreeError("Workflow worktree evidence is unavailable.")
+        review = self.worktree_manager.diff(record.worktree_id)
+        worktree = review["worktree"]
+        return {
+            "worktree_id": worktree["id"],
+            "base_commit": worktree["base_commit"],
+            "diff_sha256": review["diff_sha256"],
+            "changed_files": list(review["changed_files"]),
+            "change_count": review["change_count"],
+        }
+
+    @staticmethod
+    def _phase_checkpoint_data(
+        record: WorkflowRunRecord | None,
+        phase_key: str,
+    ) -> dict[str, Any]:
+        if record is None:
+            return {}
+        checkpoint = record.checkpoints.get(phase_key)
+        return dict(checkpoint.data) if checkpoint is not None else {}
+
+    def _update_phase_checkpoint_data(
+        self,
+        record: WorkflowRunRecord | None,
+        phase_key: str,
+        updates: dict[str, Any],
+    ) -> None:
+        data = self._phase_checkpoint_data(record, phase_key)
+        data.update(updates)
+        self._replace_phase_checkpoint_data(record, phase_key, data)
+
+    def _replace_phase_checkpoint_data(
+        self,
+        record: WorkflowRunRecord | None,
+        phase_key: str,
+        data: dict[str, Any],
+    ) -> None:
+        if record is None or self.workflow_store is None:
+            return
+        checkpoint = record.checkpoints.get(phase_key)
+        if checkpoint is None:
+            return
+        checkpoint.data = dict(data)
+        self.workflow_store.save_run(record)
+
+    def _capture_verification_event(
+        self,
+        record: WorkflowRunRecord | None,
+        phase_key: str,
+        attempt: int,
+        event: AgentEvent,
+    ) -> None:
+        if event.type != "tool_result":
+            return
+        tool_name = str(event.data.get("name", ""))
+        if tool_name not in VERIFICATION_TOOLS:
+            return
+
+        result = event.data.get("result")
+        outer = result if isinstance(result, dict) else {}
+        inner = outer.get("result") if outer.get("ok") is True else None
+        payload = inner if isinstance(inner, dict) else {}
+        evidence: dict[str, Any] = {
+            "tool": tool_name,
+            "attempt": attempt,
+            "run_id": event.run_id,
+            "step": event.step,
+            "outcome": (
+                str(payload.get("outcome", "unknown"))
+                if outer.get("ok") is True
+                else "tool_error"
+            ),
+        }
+        for key in (
+            "exit_code",
+            "timed_out",
+            "duration_ms",
+            "report_path",
+        ):
+            if payload.get(key) is not None:
+                evidence[key] = payload[key]
+        if payload.get("summary") is not None:
+            evidence["summary"] = str(payload["summary"])[:1_000]
+        if outer.get("ok") is not True and outer.get("error") is not None:
+            evidence["error"] = str(outer["error"])[:1_000]
+        if event.duration_ms is not None:
+            evidence["event_duration_ms"] = event.duration_ms
+
+        data = self._phase_checkpoint_data(record, phase_key)
+        verification = list(data.get("verification") or [])
+        verification.append(evidence)
+        data["verification"] = verification
+        self._replace_phase_checkpoint_data(record, phase_key, data)
 
     def _build_role_agent(
         self,
@@ -939,6 +1100,166 @@ class SerialCodingWorkflow:
             + "\n".join(lines)
         )
 
+    def _gate_planning_artifacts(
+        self,
+        initial_artifact_ids: set[str],
+        before_versions: dict[str, int],
+    ) -> _GateResult:
+        gate = self._gate_required_artifacts(
+            initial_artifact_ids,
+            before_versions,
+            required={
+                "prd": {"ready", "accepted"},
+                "task_spec": {"ready", "accepted"},
+            },
+        )
+        if not gate.ok or self.isolation != "worktree":
+            return gate
+
+        task_spec = self._artifact_from_ids(gate.artifact_ids, "task_spec")
+        change_required = task_spec.metadata.get("change_required")
+        if not isinstance(change_required, bool):
+            return _GateResult(
+                ok=False,
+                message=(
+                    "task_spec metadata.change_required must be a boolean. Set "
+                    "it to true for file-changing work or false for verify-only "
+                    "work."
+                ),
+                artifact_ids=gate.artifact_ids,
+            )
+        return _GateResult(
+            ok=True,
+            message="ok",
+            artifact_ids=gate.artifact_ids,
+            data={"change_required": change_required},
+        )
+
+    def _gate_implementation_report(
+        self,
+        record: WorkflowRunRecord,
+        initial_artifact_ids: set[str],
+        before_versions: dict[str, int],
+        phase_data: dict[str, Any],
+    ) -> _GateResult:
+        gate = self._gate_required_artifacts(
+            initial_artifact_ids,
+            before_versions,
+            required={"implementation_report": None},
+        )
+        if not gate.ok or self.isolation != "worktree":
+            return gate
+
+        report = self.artifact_manager.get_artifact(gate.artifact_ids[0])
+        task_spec = self._latest_workflow_artifact(
+            initial_artifact_ids,
+            "task_spec",
+        )
+        change_required = task_spec.metadata.get("change_required")
+        if not isinstance(change_required, bool):
+            return _GateResult(
+                ok=False,
+                message="The active task_spec has no boolean change_required value.",
+                artifact_ids=gate.artifact_ids,
+            )
+
+        before = phase_data.get("worktree_before")
+        if not isinstance(before, dict) or not before.get("diff_sha256"):
+            return _GateResult(
+                ok=False,
+                message="The phase has no persisted Worktree baseline evidence.",
+                artifact_ids=gate.artifact_ids,
+            )
+        try:
+            after = self._worktree_snapshot(record)
+        except WorktreeError as exc:
+            return _GateResult(
+                ok=False,
+                message=f"Unable to collect Worktree evidence: {exc}",
+                artifact_ids=gate.artifact_ids,
+            )
+
+        outcome = str(report.metadata.get("outcome", "")).strip().lower()
+        raw_declared_files = report.metadata.get("changed_files")
+        declared_files = self._metadata_file_list(raw_declared_files)
+        actual_files = sorted(str(path) for path in after["changed_files"])
+        changed_this_phase = before.get("diff_sha256") != after.get("diff_sha256")
+        evidence = {
+            "report_id": report.id,
+            "change_required": change_required,
+            "outcome": outcome or None,
+            "changed_this_phase": changed_this_phase,
+            "declared_changed_files": declared_files,
+            "actual_changed_files": actual_files,
+            "worktree_before": before,
+            "worktree_after": after,
+        }
+
+        def failed(message: str) -> _GateResult:
+            return _GateResult(
+                ok=False,
+                message=message,
+                artifact_ids=gate.artifact_ids,
+                data={"implementation_evidence": evidence},
+            )
+
+        if outcome not in {"changed", "no_change", "blocked"}:
+            return failed(
+                "implementation_report metadata.outcome must be 'changed', "
+                "'no_change', or 'blocked'."
+            )
+        if declared_files is None:
+            return failed(
+                "implementation_report metadata.changed_files must be a list "
+                "of relative file paths."
+            )
+        if outcome == "blocked":
+            return failed("Engineer reported outcome=blocked.")
+        if outcome == "no_change":
+            reason = str(report.metadata.get("no_change_reason", "")).strip()
+            if change_required:
+                return failed(
+                    "TaskSpec requires file changes, but Engineer reported "
+                    "outcome=no_change."
+                )
+            if changed_this_phase:
+                return failed(
+                    "Engineer reported outcome=no_change, but the Worktree Diff "
+                    "changed during this phase."
+                )
+            if not reason:
+                return failed(
+                    "outcome=no_change requires metadata.no_change_reason."
+                )
+            if declared_files != actual_files:
+                return failed(
+                    "ImplementationReport changed_files does not match the "
+                    "current Worktree Diff."
+                )
+        else:
+            if not changed_this_phase:
+                return failed(
+                    "ImplementationReport declares outcome=changed, but the "
+                    "Worktree Diff did not change during this phase."
+                )
+            if not actual_files:
+                return failed(
+                    "ImplementationReport declares outcome=changed, but the "
+                    "Worktree contains no project file changes."
+                )
+            if declared_files != actual_files:
+                return failed(
+                    "ImplementationReport changed_files does not match the "
+                    "actual Worktree changed files."
+                )
+
+        return _GateResult(
+            ok=True,
+            message="ok",
+            artifact_ids=gate.artifact_ids,
+            data={"implementation_evidence": evidence},
+        )
+
     def _gate_required_artifacts(
         self,
         initial_artifact_ids: set[str],
@@ -984,8 +1305,10 @@ class SerialCodingWorkflow:
 
     def _gate_test_report(
         self,
+        record: WorkflowRunRecord,
         initial_artifact_ids: set[str],
         before_versions: dict[str, int],
+        phase_data: dict[str, Any],
     ) -> _GateResult:
         gate = self._gate_required_artifacts(
             initial_artifact_ids,
@@ -1004,12 +1327,172 @@ class SerialCodingWorkflow:
                 ),
                 artifact_ids=[artifact.id],
             )
+
+        if self.isolation != "worktree":
+            return _GateResult(
+                ok=True,
+                message="ok",
+                artifact_ids=[artifact.id],
+                data={"qa_verdict": verdict},
+            )
+
+        before = phase_data.get("worktree_before")
+        try:
+            after = self._worktree_snapshot(record)
+        except WorktreeError as exc:
+            return _GateResult(
+                ok=False,
+                message=f"Unable to collect QA Worktree evidence: {exc}",
+                artifact_ids=[artifact.id],
+            )
+        current_run_id = phase_data.get("current_run_id")
+        verification = [
+            dict(item)
+            for item in phase_data.get("verification") or []
+            if isinstance(item, dict)
+            and (
+                current_run_id is None
+                or item.get("run_id") == current_run_id
+            )
+        ]
+        successful = [
+            item
+            for item in verification
+            if item.get("outcome") in {"passed", "clean"}
+        ]
+        failed = [
+            item
+            for item in verification
+            if item.get("outcome")
+            in {"failed", "issues_found", "error", "timed_out", "tool_error"}
+        ]
+        worktree_changed = (
+            isinstance(before, dict)
+            and before.get("diff_sha256") != after.get("diff_sha256")
+        )
+        evidence = {
+            "report_id": artifact.id,
+            "verdict": verdict,
+            "verification": verification,
+            "successful_checks": len(successful),
+            "failed_checks": len(failed),
+            "worktree_changed_during_qa": worktree_changed,
+            "worktree_before": before,
+            "worktree_after": after,
+        }
+        if verdict == "pass" and not successful:
+            return _GateResult(
+                ok=False,
+                message=(
+                    "test_report declares verdict=pass, but no successful "
+                    "run_tests or run_lint result was recorded in this attempt."
+                ),
+                artifact_ids=[artifact.id],
+                data={"qa_verdict": verdict, "qa_evidence": evidence},
+            )
+        if verdict == "pass" and failed:
+            return _GateResult(
+                ok=False,
+                message=(
+                    "test_report declares verdict=pass, but a verification tool "
+                    "reported failure, issues, timeout, or error."
+                ),
+                artifact_ids=[artifact.id],
+                data={"qa_verdict": verdict, "qa_evidence": evidence},
+            )
+        if verdict == "pass" and worktree_changed:
+            return _GateResult(
+                ok=False,
+                message=(
+                    "QA verification changed tracked project files. A pass verdict "
+                    "requires the Worktree to remain unchanged during QA."
+                ),
+                artifact_ids=[artifact.id],
+                data={"qa_verdict": verdict, "qa_evidence": evidence},
+            )
         return _GateResult(
             ok=True,
             message="ok",
             artifact_ids=[artifact.id],
-            data={"qa_verdict": verdict},
+            data={"qa_verdict": verdict, "qa_evidence": evidence},
         )
+
+    def _artifact_from_ids(
+        self,
+        artifact_ids: list[str],
+        kind: str,
+    ) -> Artifact:
+        matches = [
+            self.artifact_manager.get_artifact(artifact_id)
+            for artifact_id in artifact_ids
+        ]
+        return self._latest(
+            [artifact for artifact in matches if artifact.kind == kind]
+        )
+
+    def _latest_workflow_artifact(
+        self,
+        initial_artifact_ids: set[str],
+        kind: str,
+    ) -> Artifact:
+        matches = [
+            artifact
+            for artifact in self._workflow_artifacts(initial_artifact_ids)
+            if artifact.kind == kind
+        ]
+        if not matches:
+            raise ValueError(f"Workflow artifact not found: {kind}")
+        return self._latest(matches)
+
+    @staticmethod
+    def _metadata_file_list(value: Any) -> list[str] | None:
+        if not isinstance(value, list):
+            return None
+        files = []
+        for item in value:
+            if not isinstance(item, str) or not item.strip():
+                return None
+            files.append(item.strip())
+        return sorted(set(files))
+
+    @staticmethod
+    def _format_evidence_summary(record: WorkflowRunRecord) -> str:
+        lines: list[str] = []
+        for phase_result in record.phases:
+            phase = str(phase_result.get("phase", "unknown"))
+            data = phase_result.get("data")
+            if not isinstance(data, dict):
+                continue
+
+            implementation = data.get("implementation_evidence")
+            if isinstance(implementation, dict):
+                files = implementation.get("actual_changed_files") or []
+                rendered_files = ", ".join(str(path) for path in files) or "none"
+                lines.append(
+                    f"- {phase}: engineer outcome="
+                    f"{implementation.get('outcome') or 'unknown'}, "
+                    f"diff_changed={bool(implementation.get('changed_this_phase'))}, "
+                    f"worktree_files={rendered_files}"
+                )
+
+            qa = data.get("qa_evidence")
+            if isinstance(qa, dict):
+                checks = []
+                for item in qa.get("verification") or []:
+                    if isinstance(item, dict):
+                        checks.append(
+                            f"{item.get('tool', 'unknown')}="
+                            f"{item.get('outcome', 'unknown')}"
+                        )
+                rendered_checks = ", ".join(checks) or "none"
+                lines.append(
+                    f"- {phase}: QA verdict={qa.get('verdict') or 'unknown'}, "
+                    f"checks={rendered_checks}, "
+                    "worktree_changed_during_qa="
+                    f"{bool(qa.get('worktree_changed_during_qa'))}"
+                )
+
+        return "\n".join(lines) or "- No structured evidence was recorded."
 
     def _changed_workflow_artifacts(
         self,
@@ -1248,11 +1731,12 @@ class SerialCodingWorkflow:
     @staticmethod
     def _corrective_prompt(phase: WorkflowPhase, issue: str) -> str:
         return (
-            f"The {phase} phase did not satisfy its artifact gate.\n"
+            f"The {phase} phase did not satisfy its completion evidence gate.\n"
             f"Issue: {issue}\n\n"
-            "Create or update only the missing required artifact(s) now. Do not "
-            "redo unrelated work. Use expected_version when updating an existing "
-            "artifact."
+            "Resolve this specific issue with the available tools, then create or "
+            "update the required phase artifact so its metadata matches the actual "
+            "code and verification evidence. Do not redo unrelated work. Use "
+            "expected_version when updating an existing artifact."
         )
 
     @staticmethod
@@ -1268,6 +1752,8 @@ class SerialCodingWorkflow:
         - Create one artifact with kind="prd" and status="ready".
         - Create one artifact with kind="task_spec" and status="ready".
         - Include metadata.workflow_id="{workflow_id}" and metadata.role="pm".
+        - On TaskSpec, set metadata.change_required to true when tracked project
+          files must change, or false only for verify-only/no-code work.
         - You may create project tasks if useful, but the artifact gate requires the PRD
         and TaskSpec artifacts.
         - Do not modify source files.
@@ -1305,6 +1791,12 @@ Required actions:
 - Run focused verification when appropriate.
 - Create or update one artifact with kind="implementation_report".
 - Include metadata.workflow_id="{workflow_id}" and metadata.role="engineer".
+- Set metadata.outcome exactly to "changed", "no_change", or "blocked".
+- Set metadata.changed_files to every relative project path currently changed in
+  the workflow Worktree, including changes from earlier workflow phases.
+- Use outcome="changed" only after making a real Worktree change. Use
+  outcome="no_change" only when TaskSpec change_required=false and include a
+  non-empty metadata.no_change_reason. Describe blockers for outcome="blocked".
 - Summarize changed files, verification evidence, and remaining risks.
 """.strip()
 
@@ -1331,7 +1823,8 @@ User request:
 Required actions:
 - Read the latest PRD, TaskSpec, and ImplementationReport artifacts.
 - Do not modify source files.
-- Run focused verification using run_tests/run_lint when appropriate.
+- Run focused verification using run_tests and/or run_lint. A pass verdict requires
+  at least one successful result from one of these tools in this phase.
 - Create one artifact with kind="test_report".
 - Set metadata.workflow_id="{workflow_id}".
 - Set metadata.role="qa".
@@ -1345,6 +1838,7 @@ Required actions:
         request: str,
         *,
         qa_verdict: str | None,
+        evidence_summary: str,
     ) -> str:
         return f"""
 Create the final PM acceptance artifact for this workflow.
@@ -1353,6 +1847,9 @@ Workflow id: {workflow_id}
 QA verdict: {qa_verdict or "unknown"}
 User request:
 {request}
+
+Orchestrator-collected evidence (source of truth when artifact claims conflict):
+{evidence_summary}
 
 Required actions:
 - Read the relevant PRD, TaskSpec, ImplementationReport, and TestReport artifacts.

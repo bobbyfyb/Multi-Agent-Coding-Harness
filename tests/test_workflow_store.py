@@ -22,6 +22,7 @@ def test_workflow_store_persists_run_and_phase_checkpoints(
         phase="pm_plan",
         role="PM",
         before_versions={"artifact_old": 1},
+        data={"evidence": {"diff_sha256": "abc123"}},
     )
     store.mark_phase_completed(
         record,
@@ -35,11 +36,12 @@ def test_workflow_store_persists_run_and_phase_checkpoints(
             "summary": "done",
             "attempts": 1,
             "error": None,
-            "data": {},
+            "data": {"evidence": {"diff_sha256": "abc123"}},
         },
         attempts=1,
         run_ids=["wf-store-pm_plan-1"],
         artifact_ids=["artifact_0001"],
+        data={"evidence": {"diff_sha256": "abc123"}},
     )
     store.mark_finished(
         record,
@@ -57,5 +59,8 @@ def test_workflow_store_persists_run_and_phase_checkpoints(
     assert loaded.worktree_id == "wt_123456789abc"
     assert loaded.worktree_base_commit == "abc123"
     assert loaded.checkpoints["pm_plan"].before_versions == {"artifact_old": 1}
+    assert loaded.checkpoints["pm_plan"].data == {
+        "evidence": {"diff_sha256": "abc123"}
+    }
     assert loaded.phases[0]["phase_key"] == "pm_plan"
     assert store.list_runs()[0].workflow_id == "wf-store"

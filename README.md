@@ -592,10 +592,39 @@ roles:
 ```
 
 Workflow 恢复采用 checkpoint 策略，而不是完整 message replay。系统保存每个
-phase 开始前的 artifact versions；如果进程中断后 artifact gate 已经满足，resume
-会补写该 phase completed 并继续后续阶段。否则会从该 phase 重新运行。
+phase 开始前的 artifact versions、Worktree Diff 基线和验证工具结果；如果进程
+中断后 completion gate 已经满足，resume 会补写该 phase completed 并继续后续
+阶段。否则会从该 phase 重新运行。
 Run Record 同时保存 `worktree_id` 和 `worktree_base_commit`；Resume 会复用原
 Worktree，若隔离目录已经丢失则明确失败，不会静默创建新目录并丢弃中间修改。
+
+## Workflow Evidence Gates
+
+默认 `worktree` 模式不会只相信角色生成的报告。Workflow 将三类信息组合为
+阶段完成证据：Artifact 是角色声明，Worktree Diff 是代码事实，`run_tests` /
+`run_lint` 的结构化结果是验证事实。
+
+- PM 的 TaskSpec 必须设置布尔值 `metadata.change_required`。
+- Engineer 的 ImplementationReport 必须设置 `metadata.outcome` 和
+  `metadata.changed_files`；`outcome=changed` 要求该阶段的 Diff 哈希确实变化，
+  且声明文件与当前 Worktree changed files 完全一致。
+- `outcome=no_change` 只允许用于 `change_required=false`，并要求提供
+  `metadata.no_change_reason`。
+- QA 的 `metadata.verdict=pass` 至少需要一次当前尝试中成功的 `run_tests` 或
+  `run_lint`，且不能同时存在失败、超时或工具错误，也不能在 QA 阶段改变 Patch。
+- 编排器把最终证据摘要注入 PM Acceptance，报告声明和运行事实冲突时以后者为准。
+
+示例 Artifact metadata：
+
+```json
+{"change_required": true}
+{"outcome": "changed", "changed_files": ["src/app.py", "tests/test_app.py"]}
+{"verdict": "pass"}
+```
+
+Diff 快照和验证结果会立即写入 phase checkpoint，因此中断恢复不依赖 Trace 或
+模型记忆。`shared` 模式没有独立 Diff 事实源，只保留原有 Artifact/verdict 门禁，
+主要用于非 Git 目录兼容；需要完整证据链时应使用默认 `worktree` 模式。
 
 CLI 命令：
 

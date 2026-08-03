@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from hashlib import sha256
 import json
 from pathlib import Path
 import re
@@ -210,6 +211,7 @@ class WorktreeManager:
                 "worktree": info.to_dict(),
                 "changed_files": changed_files,
                 "change_count": len(changed_files),
+                "diff_sha256": sha256(patch.encode("utf-8")).hexdigest(),
                 "diff": _preview(patch, self.diff_preview_chars),
                 "diff_path": str(patch_path) if patch else None,
                 "diff_truncated": len(patch) > self.diff_preview_chars,
@@ -240,6 +242,7 @@ class WorktreeManager:
                 },
                 "changed_files": [],
                 "change_count": 0,
+                "diff_sha256": sha256(b"").hexdigest(),
                 "diff": "",
                 "diff_path": None,
                 "diff_truncated": False,

@@ -1,4 +1,5 @@
 from pathlib import Path
+from hashlib import sha256
 import json
 import subprocess
 from typing import Any
@@ -89,6 +90,9 @@ def test_worktree_lifecycle_keeps_main_clean_until_apply(
     assert (workdir / "app.py").read_text(encoding="utf-8") == ("value = 'original'\n")
     assert review["worktree"]["status"] == "ready"
     assert review["changed_files"] == ["app.py", "new.py"]
+    assert review["diff_sha256"] == sha256(
+        review["diff"].encode("utf-8")
+    ).hexdigest()
     assert Path(review["diff_path"]).exists()
 
     applied = manager.apply(info.id)
@@ -141,6 +145,7 @@ def test_worktree_without_changes_is_cleaned_automatically(
 
     assert review["worktree"]["status"] == "cleaned"
     assert review["change_count"] == 0
+    assert review["diff_sha256"] == sha256(b"").hexdigest()
     assert not Path(info.path).exists()
 
 
