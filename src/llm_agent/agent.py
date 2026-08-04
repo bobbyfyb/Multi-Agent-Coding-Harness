@@ -51,6 +51,7 @@ AgentEventType = Literal[
     "memory_context",
     "memory_extracted",
     "memory_extract_failed",
+    "progress",
     "tool_call",
     "permission_granted",
     "permission_denied",
@@ -563,6 +564,16 @@ class Agent:
                     agent_id=self.agent_id,
                 )
 
+            progress = response.content.strip()
+            if progress:
+                self._emit(
+                    on_event,
+                    "progress",
+                    step,
+                    {"content": progress},
+                    resolved_run_id,
+                )
+
             messages.append(self.llm.assistant_message(response))
 
             tool_results = []
@@ -950,6 +961,13 @@ def print_agent_event(event: AgentEvent) -> None:
 
     if event.type == "recovery":
         _print_recovery_event(prefix, event.data)
+        return
+
+    if event.type == "progress":
+        print(
+            f"{prefix}{ANSI_MAGENTA}[progress]{ANSI_RESET} "
+            f"{event.data['content']}"
+        )
         return
 
     if event.type == "tool_call":

@@ -43,6 +43,14 @@ Tool use:
 - If a tool fails, use the error to choose the next reasonable step.
 """.strip()
 
+PROGRESS_INSTRUCTIONS = """
+Progress updates:
+- Before meaningful tool use, include a brief user-visible progress update.
+- State what you learned, what you are checking, or what you will do next.
+- Keep it to one or two concise sentences.
+- Do not expose private chain-of-thought or repeat obvious tool arguments.
+""".strip()
+
 FINAL_ANSWER_INSTRUCTIONS = """
 Final answer:
 - Answer in natural language.
@@ -57,6 +65,7 @@ DEFAULT_BASE_INSTRUCTIONS = "\n\n".join(
         IDENTITY_INSTRUCTIONS,
         CONTEXT_INSTRUCTIONS,
         TOOL_INSTRUCTIONS,
+        PROGRESS_INSTRUCTIONS,
         FINAL_ANSWER_INSTRUCTIONS,
     ]
 )

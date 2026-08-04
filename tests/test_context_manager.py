@@ -52,6 +52,12 @@ def test_context_manager_returns_system_message() -> None:
     assert manager.new_messages() == [{"role": "system", "content": "system"}]
 
 
+def test_default_instructions_request_concise_progress_updates() -> None:
+    assert "Progress updates:" in DEFAULT_BASE_INSTRUCTIONS
+    assert "one or two concise sentences" in DEFAULT_BASE_INSTRUCTIONS
+    assert "Do not expose private chain-of-thought" in DEFAULT_BASE_INSTRUCTIONS
+
+
 def test_context_manager_orders_sections_by_priority() -> None:
     manager = ContextManager(
         base_instructions="base",

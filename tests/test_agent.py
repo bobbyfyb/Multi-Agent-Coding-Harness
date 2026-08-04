@@ -249,8 +249,53 @@ def test_agent_emits_key_step_events() -> None:
     assert events[-1].data == {"content": "done"}
 
 
+def test_agent_emits_progress_before_tool_calls() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        name="add",
+        description="Add two numbers.",
+        parameters={},
+        func=lambda a, b: a + b,
+    )
+    tool_call = LLMToolCall(
+        id="call_1",
+        name="add",
+        arguments={"a": 1, "b": 2},
+        raw={"id": "call_1", "name": "add"},
+    )
+    llm = FakeLLM(
+        [
+            LLMResponse(
+                content="  I will calculate the result first.  ",
+                tool_calls=[tool_call],
+                raw={},
+            ),
+            LLMResponse(content="done", tool_calls=[], raw={}),
+        ]
+    )
+    agent = Agent(llm=llm, tools=registry, context_manager="system")
+    messages = agent.new_messages()
+    messages.append({"role": "user", "content": "calculate"})
+    events: list[AgentEvent] = []
+
+    agent.run(messages, on_event=events.append)
+
+    assert [event.type for event in events] == [
+        "step",
+        "progress",
+        "tool_call",
+        "tool_result",
+        "step",
+        "final",
+    ]
+    assert events[1].data == {"content": "I will calculate the result first."}
+
+
 def test_print_agent_event_outputs_human_readable_trace(capsys: Any) -> None:
     print_agent_event(AgentEvent("step", 1, {"message": "calling llm"}))
+    print_agent_event(
+        AgentEvent("progress", 1, {"content": "I will inspect the inputs first."})
+    )
     print_agent_event(
         AgentEvent("tool_call", 1, {"name": "add", "arguments": {"a": 1, "b": 2}})
     )
@@ -279,6 +324,8 @@ def test_print_agent_event_outputs_human_readable_trace(capsys: Any) -> None:
     output = capsys.readouterr().out
 
     assert "[step 1] calling llm" in output
+    assert "\033[35m[progress]" in output
+    assert "I will inspect the inputs first." in output
     assert "[tool call] add" in output
     assert '{"a": 1, "b": 2}' in output
     assert "[tool result] add ->" in output
