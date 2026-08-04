@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import shlex
 from typing import Iterable
 
 
@@ -129,13 +130,65 @@ def safe_subprocess_env(cwd: Path | str | None = None) -> dict[str, str]:
     return env
 
 
-def validate_shell_command(command: str, *, fragments: Iterable[str] | None = None) -> None:
+def validate_shell_command(
+    command: str,
+    *,
+    fragments: Iterable[str] | None = None,
+    workdir: Path | str | None = None,
+) -> None:
     if not command.strip():
         raise ValueError("Command is required.")
     command_for_match = command.casefold()
     for fragment in fragments or HARD_DENY_COMMAND_FRAGMENTS:
         if fragment.casefold() in command_for_match:
             raise ValueError(f"Shell command contains blocked fragment: {fragment}")
+    if workdir is not None:
+        _validate_shell_cd_targets(command, Path(workdir).resolve())
+
+
+def _validate_shell_cd_targets(command: str, workspace: Path) -> None:
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()")
+        tokens = list(lexer)
+    except ValueError as exc:
+        raise ValueError(f"Invalid shell command quoting: {exc}") from exc
+
+    controls = {";", ";;", "&", "&&", "|", "||", "(", ")"}
+    current = workspace
+    for index, token in enumerate(tokens):
+        if token not in {"cd", "pushd"}:
+            continue
+        target_index = index + 1
+        if target_index < len(tokens) and tokens[target_index] == "--":
+            target_index += 1
+        if target_index >= len(tokens) or tokens[target_index] in controls:
+            current = workspace
+            continue
+
+        target = tokens[target_index]
+        if target == "-":
+            raise ValueError("Shell directory switching with '-' is blocked.")
+        if target in {"$HOME", "${HOME}", "~"}:
+            candidate = workspace
+        elif target.startswith("~/"):
+            candidate = (workspace / target[2:]).resolve()
+        else:
+            if "$" in target or "`" in target:
+                raise ValueError("Dynamic shell working directories are blocked.")
+            path = Path(target)
+            candidate = (
+                path.resolve() if path.is_absolute() else (current / path).resolve()
+            )
+
+        if not candidate.is_relative_to(workspace):
+            raise ValueError(
+                f"Shell command changes directory outside workspace: {target}"
+            )
+        if is_sensitive_workspace_path(workspace, candidate):
+            raise ValueError(
+                f"Shell command changes directory into sensitive path: {target}"
+            )
+        current = candidate
 
 
 def _is_safe_env_key(key: str) -> bool:

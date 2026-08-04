@@ -62,6 +62,19 @@ class FakeLLM:
         ]
 
 
+class FailingLLM(FakeLLM):
+    def chat(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]],
+        tool_choice: str,
+    ) -> LLMResponse:
+        self.messages.append([dict(message) for message in messages])
+        self.tools.append(tools)
+        raise RuntimeError("provider failed")
+
+
 def test_serial_workflow_runs_pm_engineer_qa_acceptance(
     tmp_path: Path,
 ) -> None:
@@ -685,6 +698,26 @@ def test_serial_workflow_resume_completed_run_does_not_call_llm(
     assert len(llm.messages) == message_count
 
 
+def test_serial_workflow_persists_role_agent_failure(tmp_path: Path) -> None:
+    workflow = _workflow(tmp_path, FailingLLM([]))
+
+    result = workflow.run("Build a feature.", run_id="wf-provider-failure")
+
+    assert result.status == "failed"
+    assert result.error is not None
+    assert "provider failed" in result.error
+    assert workflow.workflow_store is not None
+    record = workflow.workflow_store.load_run("wf-provider-failure")
+    assert record.status == "failed"
+    assert record.current_phase is None
+    assert record.current_phase_key is None
+    assert record.checkpoints["pm_plan"].status == "failed"
+    assert record.checkpoints["pm_plan"].attempts == 1
+    assert record.checkpoints["pm_plan"].run_ids == [
+        "wf-provider-failure-pm_plan-1"
+    ]
+
+
 def test_serial_workflow_resume_recovers_running_phase_when_gate_is_satisfied(
     tmp_path: Path,
 ) -> None:
@@ -824,6 +857,9 @@ def test_serial_workflow_retries_missing_artifact_gate(
         for call_messages in llm.messages
         for message in call_messages
     )
+    retry_messages = llm.messages[2]
+    assert "forgot task spec" not in str(retry_messages)
+    assert "Create the planning handoff artifacts" in str(retry_messages)
 
 
 def test_serial_workflow_runs_fix_cycle_after_qa_fail(
@@ -1049,6 +1085,8 @@ Map each requirement to evidence.
         skill_tools <= {tool["name"] for tool in tool_specs}
         for tool_specs in llm.tools
     )
+    engineer_tools = {tool["name"] for tool in llm.tools[2]}
+    assert {"task_create", "task_claim", "task_complete"} <= engineer_tools
 
 
 def test_parse_workflow_command() -> None:

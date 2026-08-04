@@ -43,6 +43,7 @@ BATCHED_TOOL_INPUTS_KEY = "__batched_tool_inputs__"
 INVALID_TOOL_INPUT_KEY = "__invalid_tool_input__"
 BATCHABLE_ARRAY_INPUT_TOOLS = {"artifact_create"}
 
+
 class ChatMessage(TypedDict):
     role: Literal["system", "user", "assistant"]
     content: str
@@ -670,6 +671,11 @@ def _load_dotenv(env_file: str | Path | None) -> None:
     ):
         if candidate.exists():
             load_dotenv(candidate, override=False)
+
+
+def load_llm_environment(env_file: str | Path | None = None) -> None:
+    """Load the supported project environment file before reading settings."""
+    _load_dotenv(env_file)
 
 
 def _first_env(*names: str) -> str | None:

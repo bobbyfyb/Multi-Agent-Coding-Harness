@@ -47,7 +47,7 @@ def run_command(
     if shell:
         if not isinstance(command, str):
             raise ValueError("shell=True requires command to be a string.")
-        validate_shell_command(command)
+        validate_shell_command(command, workdir=cwd)
 
     artifact_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = artifact_dir / "stdout.log"

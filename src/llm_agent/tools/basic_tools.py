@@ -46,7 +46,7 @@ class BasicTools:
         *,
         context: Any = None,
     ) -> dict[str, Any]:
-        validate_shell_command(command)
+        validate_shell_command(command, workdir=self.workdir)
 
         if run_in_background:
             if self.background_manager is None:

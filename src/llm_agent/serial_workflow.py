@@ -91,7 +91,10 @@ ENGINEER_TOOLS = {
     "artifact_update",
     "artifact_get",
     "artifact_list",
+    "task_create",
     "task_get",
+    "task_claim",
+    "task_complete",
     "task_update",
     "task_list",
     "bash",
@@ -110,7 +113,10 @@ QA_TOOLS = {
     "artifact_update",
     "artifact_get",
     "artifact_list",
+    "task_create",
     "task_get",
+    "task_claim",
+    "task_complete",
     "task_update",
     "task_list",
     "read_file",
@@ -693,7 +699,7 @@ class SerialCodingWorkflow:
         if before_versions is None:
             before_versions = self._artifact_versions()
         run_ids: list[str] = []
-        messages: list[dict[str, Any]] | None = None
+        retry_issue: str | None = None
         last_summary = ""
         last_gate = _GateResult(ok=False, message="Phase did not run.")
         phase_data = self._phase_checkpoint_data(record, phase_key)
@@ -732,11 +738,14 @@ class SerialCodingWorkflow:
                 request=request,
                 execution_workdir=execution_workdir,
             )
-            if messages is None:
-                messages = agent.new_messages()
-                messages.append({"role": "user", "content": prompt})
-            else:
-                messages[0] = agent.new_messages()[0]
+            messages = agent.new_messages()
+            attempt_prompt = prompt
+            if retry_issue is not None:
+                attempt_prompt = (
+                    f"{prompt}\n\n"
+                    f"{self._corrective_prompt(phase, retry_issue)}"
+                )
+            messages.append({"role": "user", "content": attempt_prompt})
 
             phase_run_id = f"{workflow_id}-{phase}-{attempt}"
             run_ids.append(phase_run_id)
@@ -759,12 +768,25 @@ class SerialCodingWorkflow:
                 if on_event is not None:
                     on_event(event)
 
-            result = agent.run(
-                messages,
-                on_event=phase_on_event,
-                run_id=phase_run_id,
-                trace=trace,
-            )
+            try:
+                result = agent.run(
+                    messages,
+                    on_event=phase_on_event,
+                    run_id=phase_run_id,
+                    trace=trace,
+                )
+            except Exception as exc:
+                return self._fail_phase_after_agent_error(
+                    record=record,
+                    phase=phase,
+                    phase_key=phase_key,
+                    role=role,
+                    workflow_id=workflow_id,
+                    attempt=attempt,
+                    run_ids=run_ids,
+                    summary=last_summary,
+                    error=exc,
+                )
             last_summary = result.content
             phase_data = self._phase_checkpoint_data(record, phase_key)
             if result.status != "completed":
@@ -810,12 +832,7 @@ class SerialCodingWorkflow:
                 return phase_result
 
             if attempt <= self.max_phase_retries:
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": self._corrective_prompt(phase, last_gate.message),
-                    }
-                )
+                retry_issue = last_gate.message
 
         self._record_workflow_trace(
             "workflow.phase.failed",
@@ -843,6 +860,53 @@ class SerialCodingWorkflow:
         )
         self._persist_phase_failed(record, phase_key, failed_result)
         return failed_result
+
+    def _fail_phase_after_agent_error(
+        self,
+        *,
+        record: WorkflowRunRecord | None,
+        phase: WorkflowPhase,
+        phase_key: str,
+        role: RoleSpec,
+        workflow_id: str,
+        attempt: int,
+        run_ids: list[str],
+        summary: str,
+        error: Exception,
+    ) -> WorkflowPhaseResult:
+        message = f"Role agent failed: {type(error).__name__}: {error}"
+        if error.__cause__ is not None:
+            message += (
+                f"; caused by {type(error.__cause__).__name__}: "
+                f"{error.__cause__}"
+            )
+        phase_data = self._phase_checkpoint_data(record, phase_key)
+        self._record_workflow_trace(
+            "workflow.phase.failed",
+            phase="failed",
+            status="error",
+            data={
+                "workflow_id": workflow_id,
+                "phase_key": phase_key,
+                "phase": phase,
+                "role": role.name,
+                "attempts": attempt,
+                "error": error,
+            },
+        )
+        result = WorkflowPhaseResult(
+            phase=phase,
+            role=role.name,
+            status="failed",
+            run_ids=list(run_ids),
+            artifact_ids=[],
+            summary=summary,
+            attempts=attempt,
+            error=message,
+            data=phase_data,
+        )
+        self._persist_phase_failed(record, phase_key, result)
+        return result
 
     def _worktree_snapshot(
         self,
@@ -1899,8 +1963,11 @@ ROLE_SPECS: dict[str, RoleSpec] = {
         name="Engineer",
         agent_id="engineer",
         instructions=(
-            "You are the Engineer worker. Implement the requested scope, keep "
-            "changes focused, verify when possible, and report evidence."
+            "You are the Engineer worker. Plan multi-step work with the task tools, "
+            "inspect exact local APIs before editing, and never invent modules or "
+            "constructors. Work directly in the configured workspace without "
+            "changing to another directory. Keep changes focused, reserve time for "
+            "verification, and create the required implementation evidence."
         ),
         tool_names=ENGINEER_TOOLS,
         max_steps=24,

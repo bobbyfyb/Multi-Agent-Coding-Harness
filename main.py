@@ -27,7 +27,7 @@ from llm_agent.hooks.permission_hooks import (
     ApprovalProvider,
     CliApprovalProvider,
 )
-from llm_agent.llm_client import LLMClient
+from llm_agent.llm_client import LLMClient, load_llm_environment
 from llm_agent.memory_system import (
     MemoryManager,
     build_memory_policy_section,
@@ -142,6 +142,7 @@ def build_agent(
 
 
 def _build_llm() -> LLMClient:
+    load_llm_environment()
     llm = LLMClient(
         provider=os.getenv("LLM_PROVIDER", "anthropic"),
         max_tokens=int(os.getenv("LLM_MAX_TOKENS", "4096")),
@@ -150,7 +151,7 @@ def _build_llm() -> LLMClient:
     llm.recovery_policy = RecoveryPolicy(
         max_retries=int(os.getenv("LLM_MAX_RETRIES", "4")),
         max_retry_elapsed_seconds=float(
-            os.getenv("LLM_MAX_RETRY_ELAPSED_SECONDS", "30")
+            os.getenv("LLM_MAX_RETRY_ELAPSED_SECONDS", "300")
         ),
         fallback_model=(
             os.getenv("LLM_FALLBACK_MODEL")

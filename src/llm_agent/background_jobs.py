@@ -310,7 +310,7 @@ class BackgroundJobManager:
     ) -> BackgroundJob:
         command = command.strip()
         try:
-            validate_shell_command(command)
+            validate_shell_command(command, workdir=self.store.workdir)
         except ValueError as exc:
             raise BackgroundJobError(str(exc)) from exc
 

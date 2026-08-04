@@ -423,6 +423,49 @@ def test_agent_returns_structured_result_when_max_steps_are_exhausted() -> None:
     assert result.tool_calls == 2
 
 
+def test_agent_injects_step_budget_wrap_up_instructions() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        name="ping",
+        description="Return pong.",
+        parameters={},
+        func=lambda: "pong",
+    )
+    tool_call = LLMToolCall(
+        id="call_ping",
+        name="ping",
+        arguments={},
+        raw={"id": "call_ping", "name": "ping"},
+    )
+    llm = FakeLLM(
+        [
+            *[
+                LLMResponse(content="", tool_calls=[tool_call], raw={})
+                for _ in range(5)
+            ],
+            LLMResponse(content="done", tool_calls=[], raw={}),
+        ]
+    )
+    events: list[AgentEvent] = []
+    agent = Agent(
+        llm=llm,
+        tools=registry,
+        context_manager="system",
+        max_steps=6,
+    )
+    messages = agent.new_messages()
+    messages.append({"role": "user", "content": "do the work"})
+
+    result = agent.run(messages, on_event=events.append)
+
+    assert result.status == "completed"
+    assert "Six model turns remain" in llm.messages[0][0]["content"]
+    assert "final model turn" in llm.messages[5][0]["content"]
+    progress = [event.data["content"] for event in events if event.type == "progress"]
+    assert any("Six model turns remain" in message for message in progress)
+    assert any("final model turn" in message for message in progress)
+
+
 def test_agent_reactively_compacts_and_retries_context_length_error(
     tmp_path: Path,
 ) -> None:

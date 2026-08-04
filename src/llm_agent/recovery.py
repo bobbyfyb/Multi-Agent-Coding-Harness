@@ -47,7 +47,7 @@ class RecoveryPolicy:
     base_delay_seconds: float = 0.5
     max_delay_seconds: float = 8.0
     jitter_ratio: float = 0.25
-    max_retry_elapsed_seconds: float = 30.0
+    max_retry_elapsed_seconds: float = 300.0
     fallback_model: str | None = None
     fallback_after_overloads: int = 3
     escalated_max_tokens: int = 8_192

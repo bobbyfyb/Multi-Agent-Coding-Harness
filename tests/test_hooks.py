@@ -103,6 +103,24 @@ def test_permission_hook_denies_sensitive_paths(tmp_path: Path) -> None:
     assert result.reason == "Sensitive path is blocked: .env"
 
 
+def test_permission_hook_denies_bash_cd_outside_workspace(tmp_path: Path) -> None:
+    hook = PermissionHook(
+        workdir=tmp_path,
+        approval_provider=AutoApprovalProvider(approved=True),
+    )
+    tool_call = LLMToolCall(
+        id="call_bash",
+        name="bash",
+        arguments={"command": "cd .. && pwd"},
+    )
+
+    result = hook(tool_call, HookContext(messages=[], workdir=tmp_path))
+
+    assert result is not None
+    assert result.denied
+    assert "outside workspace" in str(result.reason)
+
+
 def test_permission_hook_uses_approval_provider_for_file_mutations(
     tmp_path: Path,
 ) -> None:

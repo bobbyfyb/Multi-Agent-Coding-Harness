@@ -78,7 +78,7 @@ class PermissionHook:
             return HookResult.deny(path_denial)
 
         if tool_call.name == "bash":
-            return self._check_bash(tool_call, arguments)
+            return self._check_bash(tool_call, arguments, workdir)
 
         if tool_call.name in EXECUTION_TOOL_REASONS:
             return self._ask_for_approval(
@@ -144,10 +144,11 @@ class PermissionHook:
         self,
         tool_call: LLMToolCall,
         arguments: dict[str, Any],
+        workdir: Path,
     ) -> HookResult | None:
         command = str(arguments.get("command", ""))
         try:
-            validate_shell_command(command)
+            validate_shell_command(command, workdir=workdir)
         except ValueError as exc:
             return HookResult.deny(str(exc))
 

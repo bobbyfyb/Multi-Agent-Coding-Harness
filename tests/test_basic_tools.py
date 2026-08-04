@@ -105,6 +105,27 @@ def test_basic_tools_blocks_dangerous_bash(tmp_path: Path) -> None:
     assert "blocked fragment" in result["error"]
 
 
+def test_basic_tools_blocks_bash_cd_outside_workspace(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+    register_tools(registry, workdir=tmp_path)
+
+    result = registry.call("bash", {"command": "cd .. && pwd"})
+
+    assert result["ok"] is False
+    assert "outside workspace" in result["error"]
+
+
+def test_basic_tools_allows_bash_cd_within_workspace(tmp_path: Path) -> None:
+    (tmp_path / "child").mkdir()
+    registry = ToolRegistry()
+    register_tools(registry, workdir=tmp_path)
+
+    result = registry.call("bash", {"command": "cd child && pwd"})
+
+    assert result["ok"] is True
+    assert result["result"]["stdout"].strip() == str(tmp_path / "child")
+
+
 def test_basic_tools_do_not_expose_parent_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

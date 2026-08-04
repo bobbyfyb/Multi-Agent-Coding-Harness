@@ -363,6 +363,16 @@ class Agent:
                 messages,
                 runtime_messages=runtime_messages,
             )
+            step_budget = _step_budget_instruction(step, self.max_steps)
+            if step_budget is not None:
+                _append_system_instruction(request_messages, step_budget)
+                self._emit(
+                    on_event,
+                    "progress",
+                    step,
+                    {"content": step_budget},
+                    resolved_run_id,
+                )
             self._emit(
                 on_event,
                 "step",
@@ -1265,6 +1275,40 @@ def _event_prefix(event: AgentEvent) -> str:
     if event.depth <= 0:
         return ""
     return f"{ANSI_DIM}[{event.agent_id}] {ANSI_RESET}"
+
+
+def _step_budget_instruction(step: int, max_steps: int | None) -> str | None:
+    if max_steps is None:
+        return None
+    remaining = max_steps - step + 1
+    if remaining == 1:
+        return (
+            "This is the final model turn in the current run. Do not call another "
+            "tool because there is no later turn to inspect its result. Return a "
+            "concise final response and state any incomplete work honestly."
+        )
+    if remaining == 6:
+        return (
+            "Six model turns remain. Stop broad exploration and finish the focused "
+            "implementation. Run the relevant verification, update any required "
+            "handoff artifact, and reserve the final turn for a response without "
+            "tool calls. Continue in the configured working directory."
+        )
+    return None
+
+
+def _append_system_instruction(
+    messages: list[dict[str, Any]],
+    instruction: str,
+) -> None:
+    block = f"<step_budget>\n{instruction}\n</step_budget>"
+    for message in messages:
+        if message.get("role") != "system":
+            continue
+        content = str(message.get("content", "")).rstrip()
+        message["content"] = f"{content}\n\n{block}" if content else block
+        return
+    messages.insert(0, {"role": "system", "content": block})
 
 
 def _tool_result_color(result: Any) -> str:
