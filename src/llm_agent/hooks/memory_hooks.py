@@ -25,7 +25,10 @@ class MemoryContextHook:
         user_text = _latest_external_user_message(context.messages)
         if not user_text:
             return None
-        memories = self.manager.retrieve_relevant(user_text)
+        memories = self.manager.retrieve_relevant(
+            user_text,
+            recall_key=str(context.metadata.get("run_id", "")).strip() or None,
+        )
         content = format_memory_context(memories)
         if not content:
             return None

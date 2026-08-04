@@ -240,11 +240,13 @@ OAuth、并行 Agent Team、复杂 Web UI、向量数据库记忆和完整 MCP �
 - [x] 自动重建可读的 `MEMORY.md` 索引
 - [x] 支持 `user / feedback / project / reference` 四种记忆
 - [x] 支持 pinned Memory 和按请求选择的 relevant Memory
+- [x] 增加 `active / stale / archived` 生命周期和可恢复遗忘
+- [x] 保存 `confidence / evidence / last_used_at / use_count` 元数据
 - [x] 使用轻量 LLM side-query 选择相关 Memory
 - [x] 选择失败时降级到 name/description 关键词匹配
 - [x] 按用户请求和索引版本缓存选择结果
 - [x] 限制召回条数、单条大小和总字符预算
-- [x] 实现 `memory_remember / memory_search / memory_get / memory_forget`
+- [x] 实现 remember/search/get、stale/archive/restore 和永久 forget 工具
 - [x] `memory_forget` 接入权限确认
 - [x] 实现保守的 Stop Hook 自动提取
 - [x] 拒绝保存疑似密钥、Task 状态、临时日志和猜测
@@ -252,6 +254,10 @@ OAuth、并行 Agent Team、复杂 Web UI、向量数据库记忆和完整 MCP �
 - [x] 将 runtime context 和工具 schema 纳入压缩预留预算
 - [x] 压缩后从持久化存储重新召回 Memory
 - [x] Subagent 只读接收相关 Memory，不获得 Memory 工具
+- [x] Workflow 角色共享项目 Memory，并只开放 search/get
+- [x] QA pass 后基于 Artifact、验证证据和 changed files 执行长期记忆反思
+- [x] 反思仅接受高置信度稳定事实，并按 name/memory_id 合并已有 Memory
+- [x] 按 Agent run 对召回统计去重，stale/archived Memory 不参与自动召回
 - [x] 增加召回、提取成功和提取失败 AgentEvent
 - [x] 覆盖持久化、更新、检索、降级、提取、工具和 Agent 集成测试
 
@@ -260,9 +266,10 @@ OAuth、并行 Agent Team、复杂 Web UI、向量数据库记忆和完整 MCP �
 - Memory 当前按项目存储，不提供用户级全局 Memory。
 - Markdown 文件是事实来源，暂不使用 embedding 或向量数据库。
 - 自动提取只在检测到明确长期信号时运行，避免每轮额外 LLM 调用。
-- 暂未实现低频语义合并（Dream）、跨进程写锁和 Memory 版本历史。
-- 当前 conversation summary 负责会话内 compact 连续性；可恢复 Session
-  Memory 等 `AgentSession` 落地后再实现。
+- 暂未实现自动语义冲突消解（Dream）、跨进程写锁、Memory 版本历史和按时间
+  自动归档；当前 stale/archive 由明确的新证据或用户操作触发。
+- Conversation summary 负责单次 Agent run 内的 compact 连续性；Workflow
+  attempt handoff 负责跨 retry/resume 的短期进展，二者不写入长期 Memory。
 
 ### 2.12 Error Recovery
 
@@ -428,12 +435,18 @@ Web UI 可以继续复用同一个 Agent、Hook 和 Event 边界。
 - [x] Workflow run record 持久化到 `.llm_agent/workflows/<workflow_id>/run.json`
 - [x] 支持 `/workflow-list`、`/workflow-show <id>`、`/workflow-resume <id>`
 - [x] Resume 基于 phase checkpoint 和 completion gate，不做完整 message replay
+- [x] 每次 attempt 持久化有界 handoff，记录动作、失败、验证和 Worktree 事实
+- [x] attempt 内滚动保存近期状态，强制中断后恢复为 interrupted handoff
+- [x] Gate retry 与进程重启后的 Resume 都注入最新 handoff，并续用 attempt 编号
+- [x] Workflow worker 保留最近 8 个完整工具结果，更早结果执行结构化微压缩
+- [x] Workflow 角色共享长期 Memory，完成且 QA pass 后触发证据约束反思
 - [x] 覆盖成功、no-change、虚假实现声明、无验证 QA pass、gate retry 和 fix cycle
 
 当前边界：
 
 - 目前是同步串行 Orchestrator-Worker，不支持并行 Agent Team。
-- Workflow 已支持 checkpoint resume，但暂不支持跨机器锁、并发 resume 或 phase 内精确断点。
+- Workflow 已支持 checkpoint + attempt handoff resume，但暂不支持跨机器锁、并发
+  resume 或单个 tool call 级精确断点。
 - Role 目前使用 `RoleSpec` 配置，没有单独抽象 `PMAgent / EngineerAgent / QAAgent` 类。
 - Artifact metadata 仍是轻量字典校验，尚未为各类 Artifact 引入独立强 schema。
 - Workflow 已默认使用 Git Worktree；非 Git 场景可配置 `isolation=shared`。
@@ -871,10 +884,10 @@ pytest / ruff / build / API test / UI test
 5. Error Recovery：继续补充流式中断和可取消 backoff。
 6. Background Tasks：已实现托管后台 Bash，后续再考虑只读后台 Subagent。
 7. Context：优化 token 估算、摘要质量和后压缩恢复。
-8. Memory：实现 session summary 和长期记忆。
-9. Skills：实现本地 skill 加载。
+8. Memory：已实现 run 内摘要、Workflow attempt handoff 和长期记忆生命周期。
+9. Skills：已实现本地 Skill 发现、加载和 Workflow role Skill。
 10. MCP：已将 MCP tools 接入 ToolRegistry；后续按业务场景扩充 server。
-11. Multi-agent：最后再做 PM/Engineer/QA 编排。
+11. Multi-agent：已实现串行 PM/Engineer/QA 编排，并行 Agent Team 延后。
 
 原则：
 

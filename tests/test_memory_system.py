@@ -88,6 +88,36 @@ def test_memory_manager_persists_updates_and_rebuilds_index(
     ).read_text(encoding="utf-8")
 
 
+def test_memory_manager_reads_legacy_files_with_lifecycle_defaults(
+    tmp_path: Path,
+) -> None:
+    memory_dir = tmp_path / ".llm_agent/memory"
+    memory_dir.mkdir(parents=True)
+    (memory_dir / "mem_deadbeef.md").write_text(
+        """---
+id: mem_deadbeef
+name: Legacy convention
+description: Existing project convention.
+type: project
+pinned: false
+source: explicit
+created_at: 2026-01-01T00:00:00Z
+updated_at: 2026-01-01T00:00:00Z
+---
+
+Keep the existing public API stable.
+""",
+        encoding="utf-8",
+    )
+
+    memory = MemoryManager.for_workdir(tmp_path).get("mem_deadbeef")
+
+    assert memory.status == "active"
+    assert memory.confidence == 1.0
+    assert memory.evidence == ()
+    assert memory.use_count == 0
+
+
 def test_memory_manager_rejects_invalid_types_and_possible_secrets(
     tmp_path: Path,
 ) -> None:
@@ -233,6 +263,88 @@ def test_memory_tools_support_explicit_lifecycle(tmp_path: Path) -> None:
     assert "uv run pytest" in loaded["result"]
     assert forgotten["ok"] is True
     assert manager.list() == []
+
+
+def test_memory_lifecycle_excludes_inactive_items_and_tracks_recall(
+    tmp_path: Path,
+) -> None:
+    manager = MemoryManager.for_workdir(tmp_path)
+    memory = manager.remember(
+        name="Test command",
+        description="Project test command.",
+        body="Run uv run pytest.",
+        memory_type="reference",
+        pinned=True,
+        confidence=0.9,
+        evidence=["workflow:wf-1"],
+    )
+
+    manager.retrieve_relevant("Run project tests.", recall_key="run-1")
+    manager.retrieve_relevant("Run project tests.", recall_key="run-1")
+    recalled = manager.get(memory.id)
+
+    assert recalled.use_count == 1
+    assert recalled.last_used_at is not None
+    assert recalled.evidence == ("workflow:wf-1",)
+
+    stale = manager.mark_stale(memory.id, reason="The test command changed.")
+    assert stale.status == "stale"
+    assert stale.status_reason == "The test command changed."
+    assert manager.retrieve_relevant("Run project tests.") == []
+    assert manager.search("test command") == []
+    assert manager.search("test command", include_inactive=True)[0].id == memory.id
+
+    restored = manager.restore(memory.id)
+    assert restored.status == "active"
+    archived = manager.archive(memory.id, reason="No longer used.")
+    assert archived.status == "archived"
+    assert archived.status_reason == "No longer used."
+    assert manager.retrieve_relevant("Run project tests.") == []
+
+
+def test_memory_reflection_keeps_only_verified_high_confidence_facts(
+    tmp_path: Path,
+) -> None:
+    llm = FakeLLM(
+        [
+            _response(
+                """[
+                  {
+                    "name": "Project test command",
+                    "type": "reference",
+                    "description": "Reliable command for the project test suite.",
+                    "body": "Run `uv run pytest` from the repository root.",
+                    "confidence": 0.92
+                  },
+                  {
+                    "name": "Temporary failure",
+                    "type": "project",
+                    "description": "A transient failure.",
+                    "body": "One request timed out.",
+                    "confidence": 0.4
+                  }
+                ]"""
+            )
+        ]
+    )
+    manager = MemoryManager.for_workdir(tmp_path, llm=llm)
+
+    reflected = manager.reflect_from_workflow(
+        workflow_id="wf-reflect",
+        request="Implement and verify the feature.",
+        evidence_summary="- QA verdict=pass, checks=run_tests=passed",
+        artifact_context="Test report: uv run pytest passed.",
+        changed_files=["src/app.py"],
+    )
+
+    assert len(reflected) == 1
+    assert reflected[0].source == "workflow_reflection"
+    assert reflected[0].confidence == 0.92
+    assert reflected[0].evidence == (
+        "workflow:wf-reflect",
+        "file:src/app.py",
+    )
+    assert "Temporary failure" not in [memory.name for memory in manager.list()]
 
 
 def test_agent_recalled_memory_is_ephemeral_request_context(

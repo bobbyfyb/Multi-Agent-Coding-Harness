@@ -7,6 +7,7 @@ from typing import Any
 from llm_agent.artifact_system import ArtifactManager
 from llm_agent.hooks.permission_hooks import AutoApprovalProvider
 from llm_agent.llm_client import LLMResponse, LLMToolCall
+from llm_agent.memory_system import MemoryManager
 from llm_agent.serial_workflow import (
     ROLE_SPECS,
     SerialCodingWorkflow,
@@ -73,6 +74,20 @@ class FailingLLM(FakeLLM):
         self.messages.append([dict(message) for message in messages])
         self.tools.append(tools)
         raise RuntimeError("provider failed")
+
+
+class SideQueryLLM:
+    def __init__(self, content: str) -> None:
+        self.content = content
+        self.messages: list[list[dict[str, Any]]] = []
+
+    def chat(
+        self,
+        messages: list[dict[str, Any]],
+        **_: Any,
+    ) -> LLMResponse:
+        self.messages.append([dict(message) for message in messages])
+        return LLMResponse(content=self.content, tool_calls=[], raw={})
 
 
 def test_serial_workflow_runs_pm_engineer_qa_acceptance(
@@ -238,7 +253,7 @@ def test_serial_workflow_runs_code_phases_in_one_worktree(
                     title="Test Report",
                     content="Verified the isolated implementation.",
                     metadata={"verdict": "pass"},
-                )
+                ),
             ),
             LLMResponse(content="qa pass", tool_calls=[], raw={}),
             _response(
@@ -266,15 +281,11 @@ def test_serial_workflow_runs_code_phases_in_one_worktree(
     assert result.status == "completed"
     assert result.worktree is not None
     assert result.worktree["changed_files"] == ["app.py"]
-    assert (workdir / "app.py").read_text(encoding="utf-8") == (
-        "value = 'original'\n"
-    )
+    assert (workdir / "app.py").read_text(encoding="utf-8") == ("value = 'original'\n")
     worktree_id = result.worktree["worktree"]["id"]
     info = manager.get(worktree_id)
     isolated = Path(info.path)
-    assert (isolated / "app.py").read_text(encoding="utf-8") == (
-        "value = 'workflow'\n"
-    )
+    assert (isolated / "app.py").read_text(encoding="utf-8") == ("value = 'workflow'\n")
     assert (isolated / ".llm_agent" / "tool-results").is_dir()
     assert ".llm_agent" not in result.worktree["diff"]
     record = workflow.workflow_store.load_run("wf-worktree")
@@ -300,9 +311,7 @@ def test_serial_workflow_runs_code_phases_in_one_worktree(
     assert [item.id for item in manager.list()] == [worktree_id]
 
     manager.apply(worktree_id)
-    assert (workdir / "app.py").read_text(encoding="utf-8") == (
-        "value = 'workflow'\n"
-    )
+    assert (workdir / "app.py").read_text(encoding="utf-8") == ("value = 'workflow'\n")
     manager.remove(worktree_id)
 
 
@@ -358,9 +367,7 @@ def test_serial_workflow_resume_reuses_persisted_worktree(
     assert result.worktree is not None
     assert result.worktree["worktree"]["id"] == info.id
     assert result.worktree["changed_files"] == []
-    assert result.phases[1].data["implementation_evidence"]["outcome"] == (
-        "no_change"
-    )
+    assert result.phases[1].data["implementation_evidence"]["outcome"] == ("no_change")
     assert result.phases[2].data["qa_evidence"]["successful_checks"] == 1
     assert [item.id for item in manager.list()] == [info.id]
     manager.remove(info.id)
@@ -713,9 +720,19 @@ def test_serial_workflow_persists_role_agent_failure(tmp_path: Path) -> None:
     assert record.current_phase_key is None
     assert record.checkpoints["pm_plan"].status == "failed"
     assert record.checkpoints["pm_plan"].attempts == 1
-    assert record.checkpoints["pm_plan"].run_ids == [
-        "wf-provider-failure-pm_plan-1"
-    ]
+    assert record.checkpoints["pm_plan"].run_ids == ["wf-provider-failure-pm_plan-1"]
+    handoff = record.checkpoints["pm_plan"].data["attempt_handoffs"][0]
+    assert handoff["attempt"] == 1
+    assert "provider failed" in handoff["gate_issue"]
+
+    recovering_llm = FakeLLM(_successful_outputs("wf-provider-failure"))
+    resumed = _workflow(tmp_path, recovering_llm).resume("wf-provider-failure")
+
+    assert resumed.status == "completed"
+    assert resumed.phases[0].attempts == 2
+    assert "<attempt_handoff>" in str(recovering_llm.messages[0])
+    assert "provider failed" in str(recovering_llm.messages[0])
+    assert resumed.phases[0].run_ids == ["wf-provider-failure-pm_plan-2"]
 
 
 def test_serial_workflow_resume_recovers_running_phase_when_gate_is_satisfied(
@@ -785,6 +802,52 @@ def test_serial_workflow_resume_reruns_running_phase_when_gate_is_missing(
     assert result.phases[0].phase == "pm_plan"
     assert result.phases[0].summary == "planning done"
     assert len(llm.messages) == 8
+
+
+def test_serial_workflow_resume_uses_rolling_interrupted_attempt_state(
+    tmp_path: Path,
+) -> None:
+    llm = FakeLLM(_successful_outputs("wf-interrupted"))
+    workflow = _workflow(tmp_path, llm)
+    assert workflow.workflow_store is not None
+    record = workflow.workflow_store.create_run(
+        workflow_id="wf-interrupted",
+        request="Build from an interrupted planning attempt.",
+        initial_artifact_ids=[],
+    )
+    workflow.workflow_store.mark_phase_started(
+        record,
+        phase_key="pm_plan",
+        phase="pm_plan",
+        role="PM",
+        before_versions={},
+        data={
+            "current_attempt": 1,
+            "current_run_id": "wf-interrupted-pm_plan-1",
+            "current_attempt_state": {
+                "tool_counts": {"read_file": 1},
+                "recent_actions": [
+                    {
+                        "step": 1,
+                        "tool": "read_file",
+                        "target": {"path": "README.md"},
+                    }
+                ],
+                "recent_failures": [],
+                "progress": ["Inspected the existing project structure."],
+            },
+        },
+    )
+
+    result = workflow.resume("wf-interrupted")
+
+    assert result.status == "completed"
+    assert result.phases[0].attempts == 2
+    assert result.phases[0].run_ids == ["wf-interrupted-pm_plan-2"]
+    first_request = str(llm.messages[0])
+    assert "<attempt_handoff>" in first_request
+    assert '"agent_status": "interrupted"' in first_request
+    assert "README.md" in first_request
 
 
 def test_serial_workflow_accepts_max_steps_when_evidence_gate_passes(
@@ -950,8 +1013,18 @@ def test_serial_workflow_retries_missing_artifact_gate(
         for message in call_messages
     )
     retry_messages = llm.messages[2]
-    assert "forgot task spec" not in str(retry_messages)
+    assert "forgot task spec" in str(retry_messages)
+    assert "<attempt_handoff>" in str(retry_messages)
     assert "Create the planning handoff artifacts" in str(retry_messages)
+    run_data = json.loads(
+        (tmp_path / ".llm_agent/workflows/wf-retry/run.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    handoffs = run_data["checkpoints"]["pm_plan"]["data"]["attempt_handoffs"]
+    assert [handoff["attempt"] for handoff in handoffs] == [1, 2]
+    assert handoffs[0]["tool_counts"] == {"artifact_create": 1}
+    assert "task_spec" in handoffs[0]["gate_issue"]
 
 
 def test_serial_workflow_runs_fix_cycle_after_qa_fail(
@@ -960,7 +1033,13 @@ def test_serial_workflow_runs_fix_cycle_after_qa_fail(
     llm = FakeLLM(
         [
             _response(
-                _create_call("call-prd", kind="prd", title="PRD", content="Need fix.", status="ready"),
+                _create_call(
+                    "call-prd",
+                    kind="prd",
+                    title="PRD",
+                    content="Need fix.",
+                    status="ready",
+                ),
                 _create_call(
                     "call-task",
                     kind="task_spec",
@@ -1166,19 +1245,83 @@ Map each requirement to evidence.
     assert "prd-writer: Write implementation-ready PRDs." in pm_system_prompt
     assert "PRD Method" in pm_system_prompt
     assert (
-        "code-review: Review patches for behavioral defects."
-        in engineer_system_prompt
+        "code-review: Review patches for behavioral defects." in engineer_system_prompt
     )
     assert "Code Review Method" not in engineer_system_prompt
     assert "qa-checklist: Verify behavior against requirements." in qa_system_prompt
     assert "QA Method" not in qa_system_prompt
     skill_tools = {"skill_list", "skill_load", "skill_read_resource"}
     assert all(
-        skill_tools <= {tool["name"] for tool in tool_specs}
-        for tool_specs in llm.tools
+        skill_tools <= {tool["name"] for tool in tool_specs} for tool_specs in llm.tools
     )
     engineer_tools = {tool["name"] for tool in llm.tools[2]}
     assert {"task_create", "task_claim", "task_complete"} <= engineer_tools
+
+
+def test_workflow_roles_recall_shared_project_memory(tmp_path: Path) -> None:
+    memory_manager = MemoryManager.for_workdir(tmp_path)
+    memory = memory_manager.remember(
+        name="Project test command",
+        memory_type="reference",
+        description="How to run the project tests.",
+        body="Run `uv run pytest` from the project root.",
+        pinned=True,
+    )
+    llm = FakeLLM(_successful_outputs("wf-memory"))
+    workflow = SerialCodingWorkflow(
+        llm=llm,  # type: ignore[arg-type]
+        workdir=tmp_path,
+        artifact_manager=ArtifactManager.for_workdir(tmp_path),
+        approval_provider=AutoApprovalProvider(approved=True),
+        memory_manager=memory_manager,
+        isolation="shared",
+    )
+
+    result = workflow.run("Build with project conventions.", run_id="wf-memory")
+
+    assert result.status == "completed"
+    assert any(memory.id in str(messages) for messages in llm.messages)
+    assert {"memory_search", "memory_get"} <= {tool["name"] for tool in llm.tools[0]}
+    assert "memory_remember" not in {tool["name"] for tool in llm.tools[0]}
+    assert memory_manager.get(memory.id).use_count == 4
+
+
+def test_completed_workflow_reflects_verified_long_term_memory(
+    tmp_path: Path,
+) -> None:
+    reflection_llm = SideQueryLLM(
+        """[{
+          "name": "Project test command",
+          "type": "reference",
+          "description": "Verified project test command.",
+          "body": "Run `uv run pytest` from the repository root.",
+          "confidence": 0.9
+        }]"""
+    )
+    memory_manager = MemoryManager.for_workdir(
+        tmp_path,
+        llm=reflection_llm,  # type: ignore[arg-type]
+    )
+    workflow = SerialCodingWorkflow(
+        llm=FakeLLM(_successful_outputs("wf-reflection")),  # type: ignore[arg-type]
+        workdir=tmp_path,
+        artifact_manager=ArtifactManager.for_workdir(tmp_path),
+        approval_provider=AutoApprovalProvider(approved=True),
+        memory_manager=memory_manager,
+        isolation="shared",
+    )
+
+    result = workflow.run(
+        "Remember this convention while building and verifying a feature.",
+        run_id="wf-reflection",
+    )
+
+    assert result.status == "completed"
+    assert len(reflection_llm.messages) == 1
+    memories = memory_manager.list()
+    assert len(memories) == 1
+    assert memories[0].source == "workflow_reflection"
+    assert memories[0].source_run_id == "wf-reflection"
 
 
 def test_parse_workflow_command() -> None:

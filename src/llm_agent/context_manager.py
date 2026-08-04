@@ -91,6 +91,7 @@ PERSISTED_RESULT_PREFIX = "<persisted_tool_result>"
 COMPACTED_TOOL_RESULT = (
     "[Earlier tool result compacted. Re-run the tool if its full output is needed.]"
 )
+COMPACTED_TOOL_RESULT_PREFIX = "<compacted_tool_result>"
 
 Message = dict[str, Any]
 
@@ -198,7 +199,9 @@ class ContextManager:
 
     def build_system_prompt(self) -> str:
         parts = [self.base_instructions.strip()]
-        for section in sorted(self.sections, key=lambda item: (item.priority, item.name)):
+        for section in sorted(
+            self.sections, key=lambda item: (item.priority, item.name)
+        ):
             content = section.content.strip()
             if not content:
                 continue
@@ -514,7 +517,7 @@ class ContextManager:
         marker = {
             "role": "user",
             "content": (
-                "<context_compacted mode=\"hard\">\n"
+                '<context_compacted mode="hard">\n'
                 "Earlier conversation was removed after a context-length failure. "
                 "Use persistent tasks, transcripts, and workspace state to recover "
                 "details when needed.\n"
@@ -534,9 +537,8 @@ class ContextManager:
             _tool_result_slots(messages)
         ):
             content = _content_text(container.get(key))
-            if (
-                len(content) <= self.max_tool_result_chars
-                or content.startswith(PERSISTED_RESULT_PREFIX)
+            if len(content) <= self.max_tool_result_chars or content.startswith(
+                PERSISTED_RESULT_PREFIX
             ):
                 continue
 
@@ -594,8 +596,7 @@ class ContextManager:
             f"{uuid4().hex[:8]}.jsonl"
         )
         lines = [
-            json.dumps(message, ensure_ascii=False, default=str)
-            for message in messages
+            json.dumps(message, ensure_ascii=False, default=str) for message in messages
         ]
         _atomic_write(path, "\n".join(lines) + "\n")
         return path
@@ -729,7 +730,11 @@ def _content_text(content: Any) -> str:
 
 
 def _compacted_tool_content(content: str) -> str:
-    if len(content) <= 120 or content == COMPACTED_TOOL_RESULT:
+    if (
+        len(content) <= 120
+        or content == COMPACTED_TOOL_RESULT
+        or content.startswith(COMPACTED_TOOL_RESULT_PREFIX)
+    ):
         return content
     if content.startswith(PERSISTED_RESULT_PREFIX):
         path_match = re.search(r"<path>(.*?)</path>", content, re.DOTALL)
@@ -746,7 +751,60 @@ def _compacted_tool_content(content: str) -> str:
                 f"<tool_call_id>{tool_id}</tool_call_id>\n"
                 "</persisted_tool_result>"
             )
+    structured = _structured_tool_result_summary(content)
+    if structured is not None:
+        return (
+            f"{COMPACTED_TOOL_RESULT_PREFIX}\n"
+            f"{json.dumps(structured, ensure_ascii=False, default=str)}\n"
+            "</compacted_tool_result>"
+        )
     return COMPACTED_TOOL_RESULT
+
+
+def _structured_tool_result_summary(content: str) -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+
+    summary: dict[str, Any] = {"compacted": True}
+    if "ok" in parsed:
+        summary["ok"] = bool(parsed["ok"])
+    if parsed.get("error") is not None:
+        summary["error"] = str(parsed["error"])[:500]
+
+    result = parsed.get("result")
+    if isinstance(result, dict):
+        for key in (
+            "path",
+            "sha256",
+            "outcome",
+            "exit_code",
+            "timed_out",
+            "duration_ms",
+            "report_path",
+            "summary",
+            "changed_files",
+            "change_count",
+        ):
+            if result.get(key) is not None:
+                summary[key] = _bounded_json_value(result[key])
+        if len(summary) == 1 or (len(summary) == 2 and "ok" in summary):
+            summary["result_preview"] = _json_preview(result)
+    elif result is not None:
+        summary["result_preview"] = str(result)[:400]
+    return summary
+
+
+def _bounded_json_value(value: Any, *, limit: int = 500) -> Any:
+    serialized = json.dumps(value, ensure_ascii=False, default=str)
+    return value if len(serialized) <= limit else serialized[:limit] + "..."
+
+
+def _json_preview(value: Any, *, limit: int = 400) -> str:
+    return json.dumps(value, ensure_ascii=False, default=str)[:limit]
 
 
 def _safe_component(value: str) -> str:
@@ -775,9 +833,8 @@ def _latest_external_user_index(messages: list[Message]) -> int | None:
         if message.get("role") != "user":
             continue
         content = message.get("content")
-        if (
-            isinstance(content, str)
-            and not content.lstrip().startswith(internal_prefixes)
+        if isinstance(content, str) and not content.lstrip().startswith(
+            internal_prefixes
         ):
             return index
     return None

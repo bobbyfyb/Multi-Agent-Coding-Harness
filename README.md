@@ -446,7 +446,9 @@ Memory 使用两级加载：
 
 最多加载 5 条，单条默认限制为 4096 字符，总召回预算为 12000 字符。召回
 内容以 `<relevant_memories>` 临时上下文加入请求，不会反复积累进历史，也
-不会随 conversation compact 永久丢失。
+不会随 conversation compact 永久丢失。每条 Memory 还保存 `status`、
+`confidence`、`evidence`、`last_used_at` 和 `use_count`；只自动召回 `active`
+Memory，召回统计按 run 去重。
 
 主 Agent 提供：
 
@@ -454,16 +456,26 @@ Memory 使用两级加载：
 memory_remember
 memory_search
 memory_get
+memory_mark_stale
+memory_archive
+memory_restore
 memory_forget
 ```
 
-`memory_forget` 需要用户确认。Stop Hook 只在用户表达“记住”“以后都”“我偏好”
-等明确长期信号时尝试自动提取，并拒绝保存疑似密钥、临时日志、Task 状态和
-未经验证的猜测。Subagent 只能读取与委派任务相关的 Memory，不具备 Memory
-写入或删除工具。
+`memory_mark_stale` 用于有新证据推翻旧事实，`memory_archive` 是可恢复遗忘，
+两者都会退出自动召回；`memory_restore` 可重新启用。`memory_forget` 是永久删除，
+仍需用户确认。Stop Hook 只在用户表达“记住”“以后都”“我偏好”等明确长期
+信号时尝试自动提取，并拒绝保存疑似密钥、临时日志、Task 状态和未经验证的
+猜测。
+
+主 Agent、Subagent 和 Workflow 角色共享项目级 Memory。Subagent 与 Workflow
+角色只获得召回和 `memory_search / memory_get`；Workflow 仅在最终状态为
+`completed` 且 QA verdict 为 `pass` 时执行一次反思，从 Artifact、结构化验证
+证据和 changed files 中提取高置信度稳定事实。当前 attempt 进展不会写入长期
+Memory，避免失败过程污染跨会话知识。
 
 当前 Memory 是项目级文件存储。暂未实现用户级全局 Memory、向量索引、自动
-语义合并和可恢复 Session Memory。
+语义冲突消解、跨进程写锁和基于时间自动归档。
 
 ## Task Intent Classification
 
@@ -691,6 +703,14 @@ phase 开始前的 artifact versions、Worktree Diff 基线和验证工具结果
 阶段。否则会从该 phase 重新运行。
 Run Record 同时保存 `worktree_id` 和 `worktree_base_commit`；Resume 会复用原
 Worktree，若隔离目录已经丢失则明确失败，不会静默创建新目录并丢弃中间修改。
+
+近期动作会滚动写入 checkpoint 的 `current_attempt_state`；attempt 正常结束或失败
+时再固化为有界的 `data.attempt_handoffs`，记录最后状态摘要、门禁失败原因、工具
+计数、近期动作与失败、结构化验证结果及 Worktree changed files。下一次 Retry
+或 `/workflow-resume` 会将最新 handoff 注入角色 prompt，并要求从现有工作区继续；
+进程被强制中断时也会先把滚动状态恢复成 interrupted handoff。该机制不会回放
+完整历史，也不会把临时进展混入长期 Memory。每个 Workflow 角色额外保留最近
+8 个完整工具结果，更早的结构化结果压缩后仍保留 outcome、路径、摘要或短预览。
 
 ## Workflow Evidence Gates
 

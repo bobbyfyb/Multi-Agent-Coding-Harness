@@ -38,8 +38,19 @@ class MemoryTools:
         )
         return f"Stored memory:\n{format_memory(memory)}"
 
-    def memory_search(self, query: str, limit: int = 10) -> str:
-        return format_memory_list(self.manager.search(query, limit=limit))
+    def memory_search(
+        self,
+        query: str,
+        limit: int = 10,
+        include_inactive: bool = False,
+    ) -> str:
+        return format_memory_list(
+            self.manager.search(
+                query,
+                limit=limit,
+                include_inactive=include_inactive,
+            )
+        )
 
     def memory_get(self, memory_id: str) -> str:
         return format_memory(self.manager.get(memory_id))
@@ -47,6 +58,18 @@ class MemoryTools:
     def memory_forget(self, memory_id: str) -> str:
         memory = self.manager.forget(memory_id)
         return f"Forgot memory:\n{format_memory(memory)}"
+
+    def memory_mark_stale(self, memory_id: str, reason: str) -> str:
+        memory = self.manager.mark_stale(memory_id, reason=reason)
+        return f"Marked memory stale:\n{format_memory(memory)}"
+
+    def memory_archive(self, memory_id: str, reason: str = "") -> str:
+        memory = self.manager.archive(memory_id, reason=reason or None)
+        return f"Archived memory:\n{format_memory(memory)}"
+
+    def memory_restore(self, memory_id: str) -> str:
+        memory = self.manager.restore(memory_id)
+        return f"Restored memory:\n{format_memory(memory)}"
 
 
 def memory_tool_definitions(manager: MemoryManager) -> list[ToolDefinition]:
@@ -111,6 +134,12 @@ def memory_tool_definitions(manager: MemoryManager) -> list[ToolDefinition]:
                         "minimum": 1,
                         "maximum": 50,
                     },
+                    "include_inactive": {
+                        "type": "boolean",
+                        "description": (
+                            "Include stale and archived memories in search results."
+                        ),
+                    },
                 },
                 "required": ["query"],
             },
@@ -125,6 +154,51 @@ def memory_tool_definitions(manager: MemoryManager) -> list[ToolDefinition]:
                 "required": ["memory_id"],
             },
             func=tools.memory_get,
+        ),
+        ToolDefinition(
+            name="memory_mark_stale",
+            description=(
+                "Mark a contradicted or obsolete memory stale. Stale memory is "
+                "retained for audit but excluded from automatic recall."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "memory_id": {"type": "string"},
+                    "reason": {
+                        "type": "string",
+                        "description": "Fresh evidence that invalidated the memory.",
+                    },
+                },
+                "required": ["memory_id", "reason"],
+            },
+            func=tools.memory_mark_stale,
+        ),
+        ToolDefinition(
+            name="memory_archive",
+            description=(
+                "Archive a memory that is no longer useful. This is reversible and "
+                "archived memory is excluded from automatic recall."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "memory_id": {"type": "string"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["memory_id"],
+            },
+            func=tools.memory_archive,
+        ),
+        ToolDefinition(
+            name="memory_restore",
+            description="Restore a stale or archived memory to active recall.",
+            parameters={
+                "type": "object",
+                "properties": {"memory_id": {"type": "string"}},
+                "required": ["memory_id"],
+            },
+            func=tools.memory_restore,
         ),
         ToolDefinition(
             name="memory_forget",

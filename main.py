@@ -59,6 +59,7 @@ def build_agent(
     approval_provider: ApprovalProvider | None = None,
     llm: LLMClient | None = None,
     mcp_manager: MCPManager | None = None,
+    memory_manager: MemoryManager | None = None,
 ) -> Agent:
     workdir = Path.cwd()
     if llm is None:
@@ -66,15 +67,14 @@ def build_agent(
     if approval_provider is None:
         approval_provider = CliApprovalProvider()
     skill_registry = SkillRegistry.for_workdir(workdir)
-    memory_manager = MemoryManager.for_workdir(workdir, llm=llm)
+    if memory_manager is None:
+        memory_manager = MemoryManager.for_workdir(workdir, llm=llm)
     artifact_manager = ArtifactManager.for_workdir(workdir)
     worktree_manager = WorktreeManager.for_workdir(workdir)
     background_jobs = BackgroundJobManager.for_workdir(
         workdir,
         max_concurrent=int(os.getenv("BACKGROUND_MAX_CONCURRENT", "4")),
-        max_runtime_seconds=float(
-            os.getenv("BACKGROUND_MAX_RUNTIME_SECONDS", "1800")
-        ),
+        max_runtime_seconds=float(os.getenv("BACKGROUND_MAX_RUNTIME_SECONDS", "1800")),
     )
     subagent_runner = SubagentRunner(
         llm=llm,
@@ -114,9 +114,7 @@ def build_agent(
         context_manager=ContextManager(
             llm=llm,
             workdir=workdir,
-            max_context_tokens=int(
-                os.getenv("LLM_CONTEXT_WINDOW", "100000")
-            ),
+            max_context_tokens=int(os.getenv("LLM_CONTEXT_WINDOW", "100000")),
             sections=[
                 PromptSection(
                     name="workspace",
@@ -136,7 +134,7 @@ def build_agent(
                 build_memory_policy_section(),
                 build_artifact_policy_section(),
                 build_skill_catalog_section(skill_registry),
-            ]
+            ],
         ),
     )
 
@@ -154,12 +152,9 @@ def _build_llm() -> LLMClient:
             os.getenv("LLM_MAX_RETRY_ELAPSED_SECONDS", "300")
         ),
         fallback_model=(
-            os.getenv("LLM_FALLBACK_MODEL")
-            or os.getenv("FALLBACK_MODEL_ID")
+            os.getenv("LLM_FALLBACK_MODEL") or os.getenv("FALLBACK_MODEL_ID")
         ),
-        escalated_max_tokens=int(
-            os.getenv("LLM_ESCALATED_MAX_TOKENS", "8192")
-        ),
+        escalated_max_tokens=int(os.getenv("LLM_ESCALATED_MAX_TOKENS", "8192")),
         max_continuations=int(os.getenv("LLM_MAX_CONTINUATIONS", "2")),
     )
     return llm
@@ -173,6 +168,7 @@ def main() -> None:
         input_func=approval_session.prompt,
     )
     llm = _build_llm()
+    memory_manager = MemoryManager.for_workdir(workdir, llm=llm)
     mcp_manager = MCPManager(load_mcp_config(workdir), workdir=workdir)
     mcp_manager.start()
     for warning in mcp_manager.warnings:
@@ -183,6 +179,7 @@ def main() -> None:
             approval_provider=approval_provider,
             llm=llm,
             mcp_manager=mcp_manager,
+            memory_manager=memory_manager,
         )
         workflow_skill_registry = SkillRegistry.for_workdir(workdir)
         workflow_config = load_workflow_config(
@@ -204,6 +201,7 @@ def main() -> None:
             max_phase_retries=workflow_config.max_phase_retries,
             max_context_tokens=workflow_config.max_context_tokens,
             mcp_manager=mcp_manager,
+            memory_manager=memory_manager,
         )
         messages = agent.new_messages()
     except Exception:
@@ -360,9 +358,7 @@ def _format_workflow_result(result: WorkflowResult) -> str:
             if changed_files
             else "no_changes"
         )
-        lines.append(
-            f"delivery={delivery} worktree={worktree.get('id', 'unknown')}"
-        )
+        lines.append(f"delivery={delivery} worktree={worktree.get('id', 'unknown')}")
         if changed_files:
             lines.append(f"changed_files={', '.join(changed_files)}")
         if result.worktree.get("diff_path"):

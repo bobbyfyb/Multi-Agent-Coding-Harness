@@ -178,6 +178,7 @@ def build_default_hook_manager(
     approval_provider: Any | None = None,
     llm: Any | None = None,
     memory_manager: "MemoryManager | None" = None,
+    enable_memory_extraction: bool = True,
     artifact_manager: "ArtifactManager | None" = None,
     mcp_manager: "MCPManager | None" = None,
 ) -> HookManager:
@@ -214,10 +215,11 @@ def build_default_hook_manager(
             "BeforeLLM",
             MemoryContextHook(memory_manager),
         )
-        manager.register_hook(
-            "Stop",
-            MemoryExtractionHook(memory_manager),
-        )
+        if enable_memory_extraction:
+            manager.register_hook(
+                "Stop",
+                MemoryExtractionHook(memory_manager),
+            )
     permission_kwargs = {"workdir": workdir}
     if approval_provider is not None:
         permission_kwargs["approval_provider"] = approval_provider

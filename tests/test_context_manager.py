@@ -250,6 +250,41 @@ def test_prepare_micro_compacts_old_anthropic_and_openai_results(
     assert update.transcript_path.exists()
 
 
+def test_micro_compaction_keeps_structured_tool_result_evidence(
+    tmp_path: Path,
+) -> None:
+    manager = ContextManager(
+        workdir=tmp_path,
+        keep_recent_tool_results=0,
+        max_tool_result_chars=10_000,
+    )
+    messages = [
+        {"role": "system", "content": "system"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "check-1", "type": "function"}],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "check-1",
+            "content": (
+                '{"ok": true, "result": {"outcome": "passed", '
+                '"exit_code": 0, "summary": "42 tests passed", '
+                '"report_path": ".llm_agent/reports/tests.json"}}'
+            ),
+        },
+    ]
+
+    update = manager.prepare(messages, run_id="structured-result")
+
+    assert update is not None
+    compacted = update.messages[-1]["content"]
+    assert compacted.startswith("<compacted_tool_result>")
+    assert '"outcome": "passed"' in compacted
+    assert '"summary": "42 tests passed"' in compacted
+
+
 def test_prepare_persists_large_tool_results_with_preview(tmp_path: Path) -> None:
     manager = ContextManager(
         workdir=tmp_path,

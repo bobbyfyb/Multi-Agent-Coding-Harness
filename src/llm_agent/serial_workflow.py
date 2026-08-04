@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal
 from uuid import uuid4
@@ -19,6 +20,10 @@ from llm_agent.context_manager import (
 from llm_agent.hooks import build_default_hook_manager
 from llm_agent.hooks.permission_hooks import ApprovalProvider
 from llm_agent.llm_client import LLMClient
+from llm_agent.memory_system import (
+    MemoryManager,
+    build_memory_policy_section,
+)
 from llm_agent.skill_system import (
     SkillNotFoundError,
     SkillRegistry,
@@ -71,6 +76,7 @@ Workflow worker output:
 """.strip()
 
 SKILL_TOOLS = {"skill_list", "skill_load", "skill_read_resource"}
+MEMORY_READ_TOOLS = {"memory_search", "memory_get"}
 PM_TOOLS = {
     "artifact_create",
     "artifact_update",
@@ -84,6 +90,7 @@ PM_TOOLS = {
     "glob",
     "search_text",
     "search",
+    *MEMORY_READ_TOOLS,
     *SKILL_TOOLS,
 }
 ENGINEER_TOOLS = {
@@ -106,6 +113,7 @@ ENGINEER_TOOLS = {
     "search",
     "run_tests",
     "run_lint",
+    *MEMORY_READ_TOOLS,
     *SKILL_TOOLS,
 }
 QA_TOOLS = {
@@ -125,10 +133,14 @@ QA_TOOLS = {
     "search",
     "run_tests",
     "run_lint",
+    *MEMORY_READ_TOOLS,
     *SKILL_TOOLS,
 }
 
 VERIFICATION_TOOLS = {"run_tests", "run_lint"}
+ATTEMPT_HANDOFFS_KEY = "attempt_handoffs"
+MAX_ATTEMPT_HANDOFFS = 4
+MAX_HANDOFF_ACTIONS = 12
 EVIDENCE_PHASES = {
     "engineer_implement",
     "engineer_fix",
@@ -198,10 +210,9 @@ class SerialCodingWorkflow:
     workflow_store: WorkflowStore | None = None
     worktree_manager: WorktreeManager | None = None
     mcp_manager: MCPManager | None = None
+    memory_manager: MemoryManager | None = None
     isolation: WorkflowIsolation = "worktree"
-    role_specs: dict[str, RoleSpec] = field(
-        default_factory=lambda: dict(ROLE_SPECS)
-    )
+    role_specs: dict[str, RoleSpec] = field(default_factory=lambda: dict(ROLE_SPECS))
     max_fix_cycles: int = 1
     max_phase_retries: int = 1
     max_context_tokens: int = 100_000
@@ -214,9 +225,7 @@ class SerialCodingWorkflow:
             raise ValueError(f"Unsupported workflow isolation: {self.isolation}")
         if self.isolation == "worktree" and self.worktree_manager is None:
             self.worktree_manager = WorktreeManager.for_workdir(self.workdir)
-        missing_roles = {"pm", "engineer", "qa", "pm_acceptance"} - set(
-            self.role_specs
-        )
+        missing_roles = {"pm", "engineer", "qa", "pm_acceptance"} - set(self.role_specs)
         if missing_roles:
             raise ValueError(
                 "Workflow role_specs missing required role(s): "
@@ -628,7 +637,7 @@ class SerialCodingWorkflow:
                         "phase": phase,
                         "role": role.name,
                         "artifact_ids": gate_result.artifact_ids,
-                        **recovered_data,
+                        **self._trace_phase_data(recovered_data),
                     },
                 )
                 self._persist_phase_completed(record, phase_key, recovered)
@@ -701,10 +710,30 @@ class SerialCodingWorkflow:
         if before_versions is None:
             before_versions = self._artifact_versions()
         run_ids: list[str] = []
-        retry_issue: str | None = None
         last_summary = ""
         last_gate = _GateResult(ok=False, message="Phase did not run.")
         phase_data = self._phase_checkpoint_data(record, phase_key)
+        handoffs = self._attempt_handoffs(phase_data)
+        if not handoffs:
+            interrupted_handoff = self._interrupted_attempt_handoff(phase_data)
+            if interrupted_handoff is not None:
+                phase_data = self._append_attempt_handoff(
+                    phase_data,
+                    interrupted_handoff,
+                )
+                handoffs = [interrupted_handoff]
+        latest_handoff = handoffs[-1] if handoffs else None
+        checkpoint = record.checkpoints.get(phase_key) if record is not None else None
+        previous_attempts = max(
+            [
+                int(phase_data.get("current_attempt") or 0),
+                int(checkpoint.attempts if checkpoint is not None else 0),
+                *(int(item.get("attempt") or 0) for item in handoffs),
+            ],
+        )
+        retry_issue = self._handoff_issue(latest_handoff) or (
+            checkpoint.error if checkpoint is not None else None
+        )
         if (
             self.isolation == "worktree"
             and phase in EVIDENCE_PHASES
@@ -732,7 +761,8 @@ class SerialCodingWorkflow:
             },
         )
 
-        for attempt in range(1, self.max_phase_retries + 2):
+        for local_attempt in range(1, self.max_phase_retries + 2):
+            attempt = previous_attempts + local_attempt
             agent = self._build_role_agent(
                 role,
                 workflow_id=workflow_id,
@@ -745,7 +775,7 @@ class SerialCodingWorkflow:
             if retry_issue is not None:
                 attempt_prompt = (
                     f"{prompt}\n\n"
-                    f"{self._corrective_prompt(phase, retry_issue)}"
+                    f"{self._corrective_prompt(phase, retry_issue, latest_handoff)}"
                 )
             messages.append({"role": "user", "content": attempt_prompt})
 
@@ -759,8 +789,20 @@ class SerialCodingWorkflow:
                     "current_run_id": phase_run_id,
                 },
             )
+            attempt_state: dict[str, Any] = {
+                "tool_counts": {},
+                "recent_actions": [],
+                "recent_failures": [],
+                "progress": [],
+            }
 
             def phase_on_event(event: AgentEvent) -> None:
+                if self._capture_attempt_event(attempt_state, event):
+                    self._update_phase_checkpoint_data(
+                        record,
+                        phase_key,
+                        {"current_attempt_state": attempt_state},
+                    )
                 self._capture_verification_event(
                     record,
                     phase_key,
@@ -788,6 +830,8 @@ class SerialCodingWorkflow:
                     run_ids=run_ids,
                     summary=last_summary,
                     error=exc,
+                    run_id=phase_run_id,
+                    attempt_state=attempt_state,
                 )
             last_summary = result.content
             phase_data = self._phase_checkpoint_data(record, phase_key)
@@ -806,7 +850,21 @@ class SerialCodingWorkflow:
                     data={**gate_result.data, "agent_status": result.status},
                 )
             phase_data = {**phase_data, **gate_result.data}
+            handoff = self._build_attempt_handoff(
+                record=record,
+                phase=phase,
+                attempt=attempt,
+                run_id=phase_run_id,
+                agent_status=result.status,
+                summary=last_summary,
+                gate_issue=None if gate_result.ok else gate_result.message,
+                artifact_ids=gate_result.artifact_ids,
+                phase_data=phase_data,
+                attempt_state=attempt_state,
+            )
+            phase_data = self._append_attempt_handoff(phase_data, handoff)
             self._replace_phase_checkpoint_data(record, phase_key, phase_data)
+            latest_handoff = handoff
             last_gate = _GateResult(
                 ok=gate_result.ok,
                 message=gate_result.message,
@@ -817,9 +875,7 @@ class SerialCodingWorkflow:
                 self._record_workflow_trace(
                     "workflow.phase.completed",
                     phase="completed",
-                    status=(
-                        "ok" if result.status == "completed" else "warning"
-                    ),
+                    status=("ok" if result.status == "completed" else "warning"),
                     data={
                         "workflow_id": workflow_id,
                         "phase_key": phase_key,
@@ -827,7 +883,7 @@ class SerialCodingWorkflow:
                         "role": role.name,
                         "attempts": attempt,
                         "artifact_ids": last_gate.artifact_ids,
-                        **last_gate.data,
+                        **self._trace_phase_data(last_gate.data),
                     },
                 )
                 phase_result = WorkflowPhaseResult(
@@ -843,7 +899,7 @@ class SerialCodingWorkflow:
                 self._persist_phase_completed(record, phase_key, phase_result)
                 return phase_result
 
-            if attempt <= self.max_phase_retries:
+            if local_attempt <= self.max_phase_retries:
                 retry_issue = last_gate.message
 
         self._record_workflow_trace(
@@ -855,7 +911,7 @@ class SerialCodingWorkflow:
                 "phase_key": phase_key,
                 "phase": phase,
                 "role": role.name,
-                "attempts": self.max_phase_retries + 1,
+                "attempts": previous_attempts + self.max_phase_retries + 1,
                 "error": last_gate.message,
             },
         )
@@ -866,7 +922,7 @@ class SerialCodingWorkflow:
             run_ids=run_ids,
             artifact_ids=last_gate.artifact_ids,
             summary=last_summary,
-            attempts=self.max_phase_retries + 1,
+            attempts=previous_attempts + self.max_phase_retries + 1,
             error=last_gate.message,
             data=last_gate.data,
         )
@@ -885,14 +941,29 @@ class SerialCodingWorkflow:
         run_ids: list[str],
         summary: str,
         error: Exception,
+        run_id: str,
+        attempt_state: dict[str, Any],
     ) -> WorkflowPhaseResult:
         message = f"Role agent failed: {type(error).__name__}: {error}"
         if error.__cause__ is not None:
             message += (
-                f"; caused by {type(error.__cause__).__name__}: "
-                f"{error.__cause__}"
+                f"; caused by {type(error.__cause__).__name__}: {error.__cause__}"
             )
         phase_data = self._phase_checkpoint_data(record, phase_key)
+        handoff = self._build_attempt_handoff(
+            record=record,
+            phase=phase,
+            attempt=attempt,
+            run_id=run_id,
+            agent_status="failed",
+            summary=summary,
+            gate_issue=message,
+            artifact_ids=[],
+            phase_data=phase_data,
+            attempt_state=attempt_state,
+        )
+        phase_data = self._append_attempt_handoff(phase_data, handoff)
+        self._replace_phase_checkpoint_data(record, phase_key, phase_data)
         self._record_workflow_trace(
             "workflow.phase.failed",
             phase="failed",
@@ -949,6 +1020,14 @@ class SerialCodingWorkflow:
             return {}
         checkpoint = record.checkpoints.get(phase_key)
         return dict(checkpoint.data) if checkpoint is not None else {}
+
+    @staticmethod
+    def _trace_phase_data(data: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in data.items()
+            if key not in {ATTEMPT_HANDOFFS_KEY, "current_attempt_state"}
+        }
 
     def _update_phase_checkpoint_data(
         self,
@@ -1023,6 +1102,201 @@ class SerialCodingWorkflow:
         data["verification"] = verification
         self._replace_phase_checkpoint_data(record, phase_key, data)
 
+    @staticmethod
+    def _capture_attempt_event(
+        state: dict[str, Any],
+        event: AgentEvent,
+    ) -> bool:
+        if event.type == "tool_call":
+            tool_name = str(event.data.get("name", "unknown"))
+            counts = state.setdefault("tool_counts", {})
+            counts[tool_name] = int(counts.get(tool_name, 0)) + 1
+            action: dict[str, Any] = {
+                "step": event.step,
+                "tool": tool_name,
+            }
+            target = SerialCodingWorkflow._tool_action_target(
+                event.data.get("arguments")
+            )
+            if target:
+                action["target"] = target
+            actions = state.setdefault("recent_actions", [])
+            actions.append(action)
+            del actions[:-MAX_HANDOFF_ACTIONS]
+            return True
+
+        if event.type == "tool_result":
+            result = event.data.get("result")
+            if not isinstance(result, dict) or result.get("ok") is not False:
+                return False
+            failures = state.setdefault("recent_failures", [])
+            failures.append(
+                {
+                    "step": event.step,
+                    "tool": str(event.data.get("name", "unknown")),
+                    "error": str(result.get("error", "tool failed"))[:500],
+                }
+            )
+            del failures[:-6]
+            return True
+
+        if event.type != "progress":
+            return False
+        content = str(event.data.get("content", "")).strip()
+        if not content or content.startswith(("Six model turns", "This is the final")):
+            return False
+        progress = state.setdefault("progress", [])
+        progress.append(content[:800])
+        del progress[:-4]
+        return True
+
+    @staticmethod
+    def _tool_action_target(arguments: Any) -> dict[str, str]:
+        if not isinstance(arguments, dict):
+            return {}
+        target: dict[str, str] = {}
+        for key in (
+            "path",
+            "query",
+            "pattern",
+            "kind",
+            "title",
+            "task_id",
+            "artifact_id",
+            "memory_id",
+        ):
+            value = arguments.get(key)
+            if isinstance(value, (str, int, float)) and str(value).strip():
+                target[key] = str(value).strip()[:300]
+        return target
+
+    def _build_attempt_handoff(
+        self,
+        *,
+        record: WorkflowRunRecord | None,
+        phase: WorkflowPhase,
+        attempt: int,
+        run_id: str,
+        agent_status: str,
+        summary: str,
+        gate_issue: str | None,
+        artifact_ids: list[str],
+        phase_data: dict[str, Any],
+        attempt_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        verification = [
+            dict(item)
+            for item in phase_data.get("verification") or []
+            if isinstance(item, dict) and int(item.get("attempt") or 0) == attempt
+        ]
+        snapshot: dict[str, Any] | None = None
+        if self.isolation == "worktree" and phase in EVIDENCE_PHASES:
+            try:
+                snapshot = self._worktree_snapshot(record)
+            except WorktreeError:
+                snapshot = None
+
+        handoff: dict[str, Any] = {
+            "attempt": attempt,
+            "run_id": run_id,
+            "agent_status": agent_status,
+            "summary": summary.strip()[:2_000],
+            "gate_issue": gate_issue.strip()[:2_000] if gate_issue else None,
+            "artifact_ids": list(artifact_ids),
+            "tool_counts": dict(attempt_state.get("tool_counts") or {}),
+            "recent_actions": list(attempt_state.get("recent_actions") or []),
+            "recent_failures": list(attempt_state.get("recent_failures") or []),
+            "progress": list(attempt_state.get("progress") or []),
+            "verification": verification,
+        }
+        if snapshot is not None:
+            handoff["worktree"] = snapshot
+        self._record_workflow_trace(
+            "workflow.attempt.handoff",
+            phase="checkpointed",
+            status="warning" if gate_issue else "ok",
+            data={
+                "workflow_id": record.workflow_id if record is not None else None,
+                "workflow_phase": phase,
+                "attempt": attempt,
+                "run_id": run_id,
+                "agent_status": agent_status,
+                "gate_issue": gate_issue,
+                "tool_counts": handoff["tool_counts"],
+                "changed_files": (
+                    snapshot.get("changed_files", []) if snapshot is not None else []
+                ),
+            },
+        )
+        return handoff
+
+    @staticmethod
+    def _append_attempt_handoff(
+        phase_data: dict[str, Any],
+        handoff: dict[str, Any],
+    ) -> dict[str, Any]:
+        updated = dict(phase_data)
+        handoffs = SerialCodingWorkflow._attempt_handoffs(updated)
+        handoffs.append(dict(handoff))
+        updated[ATTEMPT_HANDOFFS_KEY] = handoffs[-MAX_ATTEMPT_HANDOFFS:]
+        updated.pop("current_attempt_state", None)
+        return updated
+
+    @staticmethod
+    def _attempt_handoffs(phase_data: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            dict(item)
+            for item in phase_data.get(ATTEMPT_HANDOFFS_KEY) or []
+            if isinstance(item, dict)
+        ]
+
+    @staticmethod
+    def _interrupted_attempt_handoff(
+        phase_data: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        state = phase_data.get("current_attempt_state")
+        attempt = int(phase_data.get("current_attempt") or 0)
+        if not isinstance(state, dict) or attempt <= 0:
+            return None
+        if not any(
+            state.get(key)
+            for key in (
+                "tool_counts",
+                "recent_actions",
+                "recent_failures",
+                "progress",
+            )
+        ):
+            return None
+        verification = [
+            dict(item)
+            for item in phase_data.get("verification") or []
+            if isinstance(item, dict) and int(item.get("attempt") or 0) == attempt
+        ]
+        return {
+            "attempt": attempt,
+            "run_id": str(phase_data.get("current_run_id") or ""),
+            "agent_status": "interrupted",
+            "summary": "",
+            "gate_issue": (
+                "The previous attempt was interrupted before it could satisfy the "
+                "phase evidence gate."
+            ),
+            "artifact_ids": [],
+            "tool_counts": dict(state.get("tool_counts") or {}),
+            "recent_actions": list(state.get("recent_actions") or []),
+            "recent_failures": list(state.get("recent_failures") or []),
+            "progress": list(state.get("progress") or []),
+            "verification": verification,
+        }
+
+    @staticmethod
+    def _handoff_issue(handoff: dict[str, Any] | None) -> str | None:
+        if handoff is None:
+            return None
+        issue = str(handoff.get("gate_issue") or "").strip()
+        return issue or None
+
     def _build_role_agent(
         self,
         role: RoleSpec,
@@ -1036,14 +1310,13 @@ class SerialCodingWorkflow:
         mcp_manager = self.mcp_manager if mcp_scope is not None else None
         allowed_tools = set(role.tool_names)
         if mcp_manager is not None and mcp_scope is not None:
-            allowed_tools.update(
-                mcp_manager.tool_names_for_scope(mcp_scope)
-            )
+            allowed_tools.update(mcp_manager.tool_names_for_scope(mcp_scope))
         registry = build_default_registry(
             workdir=execution_workdir,
             task_workdir=self.workdir,
             artifact_manager=self.artifact_manager,
             skill_registry=self.skill_registry,
+            memory_manager=self.memory_manager,
             mcp_manager=mcp_manager,
             mcp_scope=mcp_scope or "main",
         ).subset(allowed_tools)
@@ -1072,6 +1345,11 @@ class SerialCodingWorkflow:
                 content=WORKFLOW_WORKER_OUTPUT_INSTRUCTIONS,
                 priority=32,
             ),
+            *(
+                [build_memory_policy_section(priority=33, read_only=True)]
+                if self.memory_manager is not None
+                else []
+            ),
             *self._build_role_skill_sections(role),
             build_artifact_policy_section(priority=40),
             build_tool_summary_section(registry.tool_specs()),
@@ -1094,6 +1372,7 @@ class SerialCodingWorkflow:
             llm=self.llm,
             workdir=self.workdir,
             max_context_tokens=self.max_context_tokens,
+            keep_recent_tool_results=8,
             sections=sections,
         )
         return Agent(
@@ -1104,6 +1383,9 @@ class SerialCodingWorkflow:
                 workdir=execution_workdir,
                 task_workdir=self.workdir,
                 approval_provider=self.approval_provider,
+                llm=self.llm,
+                memory_manager=self.memory_manager,
+                enable_memory_extraction=False,
                 artifact_manager=self.artifact_manager,
                 mcp_manager=mcp_manager,
             ),
@@ -1331,9 +1613,7 @@ class SerialCodingWorkflow:
                     "changed during this phase."
                 )
             if not reason:
-                return failed(
-                    "outcome=no_change requires metadata.no_change_reason."
-                )
+                return failed("outcome=no_change requires metadata.no_change_reason.")
             if declared_files != actual_files:
                 return failed(
                     "ImplementationReport changed_files does not match the "
@@ -1428,9 +1708,7 @@ class SerialCodingWorkflow:
         if verdict not in {"pass", "fail"}:
             return _GateResult(
                 ok=False,
-                message=(
-                    "test_report must set metadata.verdict to 'pass' or 'fail'."
-                ),
+                message=("test_report must set metadata.verdict to 'pass' or 'fail'."),
                 artifact_ids=[artifact.id],
             )
 
@@ -1456,15 +1734,10 @@ class SerialCodingWorkflow:
             dict(item)
             for item in phase_data.get("verification") or []
             if isinstance(item, dict)
-            and (
-                current_run_id is None
-                or item.get("run_id") == current_run_id
-            )
+            and (current_run_id is None or item.get("run_id") == current_run_id)
         ]
         successful = [
-            item
-            for item in verification
-            if item.get("outcome") in {"passed", "clean"}
+            item for item in verification if item.get("outcome") in {"passed", "clean"}
         ]
         failed = [
             item
@@ -1472,10 +1745,9 @@ class SerialCodingWorkflow:
             if item.get("outcome")
             in {"failed", "issues_found", "error", "timed_out", "tool_error"}
         ]
-        worktree_changed = (
-            isinstance(before, dict)
-            and before.get("diff_sha256") != after.get("diff_sha256")
-        )
+        worktree_changed = isinstance(before, dict) and before.get(
+            "diff_sha256"
+        ) != after.get("diff_sha256")
         evidence = {
             "report_id": artifact.id,
             "verdict": verdict,
@@ -1532,9 +1804,7 @@ class SerialCodingWorkflow:
             self.artifact_manager.get_artifact(artifact_id)
             for artifact_id in artifact_ids
         ]
-        return self._latest(
-            [artifact for artifact in matches if artifact.kind == kind]
-        )
+        return self._latest([artifact for artifact in matches if artifact.kind == kind])
 
     def _latest_workflow_artifact(
         self,
@@ -1604,6 +1874,23 @@ class SerialCodingWorkflow:
 
         return "\n".join(lines) or "- No structured evidence was recorded."
 
+    @staticmethod
+    def _format_reflection_artifacts(artifacts: list[Artifact]) -> str:
+        parts: list[str] = []
+        for artifact in artifacts:
+            metadata = json.dumps(
+                artifact.metadata,
+                ensure_ascii=False,
+                default=str,
+            )[:1_500]
+            parts.append(
+                f"## {artifact.kind}: {artifact.title}\n"
+                f"Status: {artifact.status}\n"
+                f"Metadata: {metadata}\n"
+                f"{artifact.content[:3_000]}"
+            )
+        return "\n\n".join(parts) or "(none)"
+
     def _changed_workflow_artifacts(
         self,
         workflow_id: str,
@@ -1644,17 +1931,13 @@ class SerialCodingWorkflow:
     def _artifact_ids(self) -> set[str]:
         return {
             artifact.id
-            for artifact in self.artifact_manager.list_artifacts(
-                include_archived=True
-            )
+            for artifact in self.artifact_manager.list_artifacts(include_archived=True)
         }
 
     def _artifact_versions(self) -> dict[str, int]:
         return {
             artifact.id: artifact.version
-            for artifact in self.artifact_manager.list_artifacts(
-                include_archived=True
-            )
+            for artifact in self.artifact_manager.list_artifacts(include_archived=True)
         }
 
     def _finish(
@@ -1669,19 +1952,13 @@ class SerialCodingWorkflow:
         error: str | None = None,
         record: WorkflowRunRecord | None = None,
     ) -> WorkflowResult:
-        artifact_ids = [
-            artifact.id
-            for artifact in self._workflow_artifacts(
-                workflow_id,
-                initial_artifact_ids,
-            )
-        ]
+        workflow_artifacts = self._workflow_artifacts(
+            workflow_id,
+            initial_artifact_ids,
+        )
+        artifact_ids = [artifact.id for artifact in workflow_artifacts]
         worktree = self._worktree_review(record)
-        if (
-            status == "completed"
-            and worktree is not None
-            and worktree.get("error")
-        ):
+        if status == "completed" and worktree is not None and worktree.get("error"):
             status = "failed"
             error = f"Workflow worktree review failed: {worktree['error']}"
         result = WorkflowResult(
@@ -1703,6 +1980,45 @@ class SerialCodingWorkflow:
                 fix_cycles=fix_cycles,
                 error=error,
             )
+        reflected_memory_ids: list[str] = []
+        if (
+            status == "completed"
+            and qa_verdict == "pass"
+            and self.memory_manager is not None
+            and record is not None
+        ):
+            try:
+                reflected = self.memory_manager.reflect_from_workflow(
+                    workflow_id=workflow_id,
+                    request=record.request,
+                    evidence_summary=self._format_evidence_summary(record),
+                    artifact_context=self._format_reflection_artifacts(
+                        workflow_artifacts
+                    ),
+                    changed_files=(
+                        [str(path) for path in worktree.get("changed_files", [])]
+                        if worktree is not None
+                        else []
+                    ),
+                )
+            except Exception as exc:
+                reflected = []
+                self._record_workflow_trace(
+                    "workflow.memory.reflection_failed",
+                    phase="failed",
+                    status="warning",
+                    data={"workflow_id": workflow_id, "error": exc},
+                )
+            reflected_memory_ids = [memory.id for memory in reflected]
+            if reflected_memory_ids:
+                self._record_workflow_trace(
+                    "workflow.memory.reflected",
+                    phase="completed",
+                    data={
+                        "workflow_id": workflow_id,
+                        "memory_ids": reflected_memory_ids,
+                    },
+                )
         self._record_workflow_trace(
             "workflow.completed",
             phase="completed",
@@ -1719,10 +2035,9 @@ class SerialCodingWorkflow:
                     else None
                 ),
                 "changed_files": (
-                    worktree.get("changed_files", [])
-                    if worktree is not None
-                    else []
+                    worktree.get("changed_files", []) if worktree is not None else []
                 ),
+                "reflected_memory_ids": reflected_memory_ids,
                 "error": error,
             },
         )
@@ -1821,9 +2136,7 @@ class SerialCodingWorkflow:
             role=str(data["role"]),
             status=str(data["status"]),  # type: ignore[arg-type]
             run_ids=[str(value) for value in data.get("run_ids") or []],
-            artifact_ids=[
-                str(value) for value in data.get("artifact_ids") or []
-            ],
+            artifact_ids=[str(value) for value in data.get("artifact_ids") or []],
             summary=str(data.get("summary") or ""),
             attempts=int(data.get("attempts") or 1),
             error=str(data["error"]) if data.get("error") is not None else None,
@@ -1859,14 +2172,29 @@ class SerialCodingWorkflow:
         )[0]
 
     @staticmethod
-    def _corrective_prompt(phase: WorkflowPhase, issue: str) -> str:
+    def _corrective_prompt(
+        phase: WorkflowPhase,
+        issue: str,
+        handoff: dict[str, Any] | None = None,
+    ) -> str:
+        handoff_context = ""
+        if handoff is not None:
+            handoff_context = (
+                "\n\n<attempt_handoff>\n"
+                "This bounded checkpoint describes the previous attempt. The "
+                "current workspace and fresh tool evidence remain authoritative.\n"
+                f"{json.dumps(handoff, ensure_ascii=False, indent=2)}\n"
+                "</attempt_handoff>"
+            )
         return (
             f"The {phase} phase did not satisfy its completion evidence gate.\n"
             f"Issue: {issue}\n\n"
             "Resolve this specific issue with the available tools, then create or "
             "update the required phase artifact so its metadata matches the actual "
             "code and verification evidence. Do not redo unrelated work. Use "
-            "expected_version when updating an existing artifact."
+            "expected_version when updating an existing artifact. Continue from "
+            "the existing workspace state and verify assumptions when needed."
+            f"{handoff_context}"
         )
 
     @staticmethod
