@@ -105,6 +105,28 @@ def test_basic_tools_blocks_dangerous_bash(tmp_path: Path) -> None:
     assert "blocked fragment" in result["error"]
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "pip install fastapi",
+        "python -m pip install -e .",
+        "conda install fastapi",
+        "uv pip install fastapi",
+    ],
+)
+def test_basic_tools_blocks_shared_python_environment_mutation(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    registry = ToolRegistry()
+    register_tools(registry, workdir=tmp_path)
+
+    result = registry.call("bash", {"command": command})
+
+    assert result["ok"] is False
+    assert "Shared Python environment mutation is blocked" in result["error"]
+
+
 def test_basic_tools_blocks_bash_cd_outside_workspace(tmp_path: Path) -> None:
     registry = ToolRegistry()
     register_tools(registry, workdir=tmp_path)
@@ -252,6 +274,38 @@ def test_search_text_returns_structured_matches(tmp_path: Path) -> None:
         "column": 13,
         "text": "    return 'needle'",
     }
+
+
+def test_search_text_falls_back_when_rg_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / ".env").write_text("needle=secret\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("value = 'needle'\n", encoding="utf-8")
+    (tmp_path / "notes.txt").write_text("needle\n", encoding="utf-8")
+
+    def missing_rg(*_: object, **__: object) -> None:
+        raise FileNotFoundError("rg")
+
+    monkeypatch.setattr("llm_agent.tools.basic_tools.subprocess.run", missing_rg)
+    registry = ToolRegistry()
+    register_tools(registry, workdir=tmp_path)
+
+    result = registry.call(
+        "search_text",
+        {"query": "needle", "globs": ["*.py"]},
+    )
+
+    assert result["ok"] is True
+    assert result["result"]["matches"] == [
+        {
+            "path": "app.py",
+            "line": 1,
+            "column": 10,
+            "text": "value = 'needle'",
+        }
+    ]
 
 
 def test_default_registry_loads_basic_tools(tmp_path: Path) -> None:

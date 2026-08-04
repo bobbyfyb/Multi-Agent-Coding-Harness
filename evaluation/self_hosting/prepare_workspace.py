@@ -17,6 +17,13 @@ BASELINE_REF = "demo-api-ui-baseline-v1"
 BASELINE_COMMIT = "fe17f79149066034ba68836f1c3fc3e2f30daf38"
 PRD_WRITER_COMMIT = "a51d7c850360fe45b1d3a6ccd716c3601d3d08e8"
 CODE_REVIEW_SHA256 = "e61b095f887f91c47ad4a820744c1a4840996280168bf0718eeae75313a4d1ec"
+HARNESS_RUNTIME_PATHS = (
+    "main.py",
+    "src",
+    "pyproject.toml",
+    "uv.lock",
+    "evaluation/self_hosting/config",
+)
 
 
 class PreparationError(RuntimeError):
@@ -137,10 +144,24 @@ def _copy_runtime_bundle(
         )
 
     (runtime_root / "memory").mkdir()
+    harness_diff = _run(
+        ["git", "diff", "--binary", "HEAD", "--", *HARNESS_RUNTIME_PATHS],
+        cwd=repo_root,
+        text=False,
+    ).stdout
+    if not isinstance(harness_diff, bytes):
+        raise PreparationError("git diff did not return binary data.")
     metadata = {
         "schema_version": 1,
         "baseline_ref": source_ref,
         "source_commit": source_commit,
+        "harness_commit": _git_text(repo_root, "rev-parse", "HEAD"),
+        "harness_branch": _git_text(repo_root, "branch", "--show-current"),
+        "harness_dirty": bool(harness_diff),
+        "harness_diff_sha256": (
+            sha256(harness_diff).hexdigest() if harness_diff else None
+        ),
+        "preparation_script_sha256": sha256(Path(__file__).read_bytes()).hexdigest(),
         "prepared_at": datetime.now(timezone.utc).isoformat(),
         "memory": "empty",
         "mcp": "disabled",

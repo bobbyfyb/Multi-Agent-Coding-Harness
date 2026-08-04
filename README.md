@@ -171,7 +171,8 @@ print(result.steps, result.tool_calls, result.usage)
 - `edit_file` 要求 `old_text` 恰好出现一次，可使用 `expected_sha256`
   防止覆盖读取后发生的修改。
 - `write_file/edit_file` 使用同目录临时文件进行原子替换。
-- `search_text` 使用 `rg --json` 返回有上限的结构化匹配。
+- `search_text` 优先使用 `rg --json` 返回有上限的结构化匹配；隔离环境中找不到
+  `rg` 时自动使用受相同工作区和敏感路径约束的 Python fallback。
 
 结构化验证工具：
 
@@ -726,6 +727,9 @@ Worktree，若隔离目录已经丢失则明确失败，不会静默创建新目
   `metadata.no_change_reason`。
 - QA 的 `metadata.verdict=pass` 至少需要一次当前尝试中成功的 `run_tests` 或
   `run_lint`，且不能同时存在失败、超时或工具错误，也不能在 QA 阶段改变 Patch。
+- 如果 QA 报告声称 `pass`，但测试、Lint、超时或执行错误等机器证据表明失败，
+  编排器会把有效 verdict 降级为 `fail` 并进入 Engineer Fix；报告值和有效值都会
+  保存在 checkpoint。纯权限/工具调用错误仍留在 QA 重试，避免误导 Engineer。
 - 编排器把最终证据摘要注入 PM Acceptance，报告声明和运行事实冲突时以后者为准。
 
 示例 Artifact metadata：

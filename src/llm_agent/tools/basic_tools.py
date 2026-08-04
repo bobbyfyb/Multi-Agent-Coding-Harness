@@ -1,12 +1,16 @@
 import difflib
+import fnmatch
 import glob as glob_lib
 import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Any, TYPE_CHECKING
 from uuid import uuid4
 
@@ -205,8 +209,15 @@ class BasicTools:
                 timeout=30,
                 env=safe_subprocess_env(self.workdir),
             )
-        except FileNotFoundError as exc:
-            raise RuntimeError("rg is required for search_text.") from exc
+        except FileNotFoundError:
+            return self._search_text_fallback(
+                query=query,
+                path=path,
+                search_path=search_path,
+                globs=globs or [],
+                regex=regex,
+                max_results=max_results,
+            )
         except subprocess.TimeoutExpired as exc:
             raise TimeoutError("search_text timed out after 30 seconds.") from exc
         if result.returncode not in {0, 1}:
@@ -236,6 +247,67 @@ class BasicTools:
                     "text": str(data["lines"]["text"]).rstrip("\r\n"),
                 }
             )
+            if len(matches) >= max_results:
+                break
+        return {
+            "query": query,
+            "path": path,
+            "matches": matches,
+            "count": len(matches),
+            "truncated": len(matches) >= max_results,
+        }
+
+    def _search_text_fallback(
+        self,
+        *,
+        query: str,
+        path: str,
+        search_path: Path,
+        globs: list[str],
+        regex: bool,
+        max_results: int,
+    ) -> dict[str, Any]:
+        try:
+            pattern = re.compile(query) if regex else None
+        except re.error as exc:
+            raise ValueError(f"Invalid search regex: {exc}") from exc
+
+        deadline = perf_counter() + 30
+        matches: list[dict[str, Any]] = []
+        for file_path in _iter_search_files(self.workdir, search_path):
+            if perf_counter() >= deadline:
+                raise TimeoutError("search_text timed out after 30 seconds.")
+            relative = file_path.relative_to(self.workdir).as_posix()
+            if not _matches_search_globs(relative, globs):
+                continue
+            try:
+                lines = file_path.open(
+                    encoding="utf-8",
+                    errors="replace",
+                )
+            except OSError:
+                continue
+            with lines:
+                for line_number, line in enumerate(lines, start=1):
+                    if "\0" in line:
+                        break
+                    if pattern is not None:
+                        match = pattern.search(line)
+                        column = match.start() + 1 if match is not None else 0
+                    else:
+                        column = line.find(query) + 1
+                    if column <= 0:
+                        continue
+                    matches.append(
+                        {
+                            "path": relative,
+                            "line": line_number,
+                            "column": column,
+                            "text": line.rstrip("\r\n"),
+                        }
+                    )
+                    if len(matches) >= max_results:
+                        break
             if len(matches) >= max_results:
                 break
         return {
@@ -460,6 +532,46 @@ def register_tools(
             workdir=workdir,
             background_manager=background_manager,
         )
+    )
+
+
+def _iter_search_files(workdir: Path, search_path: Path) -> Iterator[Path]:
+    if search_path.is_file():
+        if not is_sensitive_workspace_path(workdir, search_path):
+            yield search_path
+        return
+
+    for root, directories, filenames in os.walk(search_path):
+        root_path = Path(root)
+        directories[:] = [
+            name
+            for name in directories
+            if not name.startswith(".")
+            and not is_sensitive_workspace_path(workdir, root_path / name)
+        ]
+        for filename in filenames:
+            if filename.startswith("."):
+                continue
+            candidate = (root_path / filename).resolve()
+            if is_sensitive_workspace_path(workdir, candidate):
+                continue
+            if candidate.is_file():
+                yield candidate
+
+
+def _matches_search_globs(relative_path: str, globs: list[str]) -> bool:
+    includes = [pattern for pattern in globs if not pattern.startswith("!")]
+    excludes = [pattern[1:] for pattern in globs if pattern.startswith("!")]
+
+    def matches(pattern: str) -> bool:
+        normalized = pattern.removeprefix("./")
+        candidates = [relative_path, Path(relative_path).name]
+        if normalized.startswith("**/"):
+            normalized = normalized[3:]
+        return any(fnmatch.fnmatchcase(candidate, normalized) for candidate in candidates)
+
+    return (not includes or any(matches(pattern) for pattern in includes)) and not any(
+        matches(pattern) for pattern in excludes
     )
 
 

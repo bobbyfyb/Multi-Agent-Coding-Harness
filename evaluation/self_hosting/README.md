@@ -40,6 +40,7 @@ The preparation script:
 - installs fixed workflow and MCP-disabled runtime configuration;
 - copies the pinned local skills without nested Git metadata;
 - starts with empty memory;
+- records the harness commit, branch, runtime dirty diff, and preparation script hash;
 - writes provenance to `.llm_agent/evaluation.json`.
 
 Run the current harness against that target while keeping the target as the

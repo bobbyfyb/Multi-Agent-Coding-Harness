@@ -64,6 +64,9 @@ HARD_DENY_COMMAND_FRAGMENTS = (
     "> /dev/sda",
 )
 
+PYTHON_ENV_MUTATIONS = {"install", "uninstall"}
+CONDA_ENV_MUTATIONS = {"install", "remove", "uninstall", "update"}
+
 SECRET_ENV_MARKERS = (
     "API_KEY",
     "AUTH",
@@ -142,8 +145,90 @@ def validate_shell_command(
     for fragment in fragments or HARD_DENY_COMMAND_FRAGMENTS:
         if fragment.casefold() in command_for_match:
             raise ValueError(f"Shell command contains blocked fragment: {fragment}")
+    _validate_shared_environment_mutation(
+        command,
+        Path(workdir).resolve() if workdir is not None else None,
+    )
     if workdir is not None:
         _validate_shell_cd_targets(command, Path(workdir).resolve())
+
+
+def _validate_shared_environment_mutation(
+    command: str,
+    workspace: Path | None,
+) -> None:
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()")
+        tokens = list(lexer)
+    except ValueError as exc:
+        raise ValueError(f"Invalid shell command quoting: {exc}") from exc
+
+    controls = {";", ";;", "&", "&&", "|", "||", "(", ")"}
+    segment: list[str] = []
+    for token in [*tokens, ";"]:
+        if token not in controls:
+            segment.append(token)
+            continue
+        if segment:
+            _validate_command_segment_environment(segment, workspace)
+            segment = []
+
+
+def _validate_command_segment_environment(
+    tokens: list[str],
+    workspace: Path | None,
+) -> None:
+    lowered = [token.casefold() for token in tokens]
+    for index, token in enumerate(tokens):
+        executable = Path(token).name.casefold()
+        remaining = lowered[index + 1 :]
+
+        if executable in {"pip", "pip3", "pipx"} and any(
+            action in remaining for action in PYTHON_ENV_MUTATIONS
+        ):
+            if executable != "pipx" and _is_workspace_executable(token, workspace):
+                continue
+            _raise_shared_environment_mutation(token)
+
+        if (executable == "python" or executable.startswith("python3")) and any(
+            remaining[offset : offset + 2] == ["-m", "pip"]
+            and any(
+                action in remaining[offset + 2 :]
+                for action in PYTHON_ENV_MUTATIONS
+            )
+            for offset in range(max(0, len(remaining) - 1))
+        ):
+            if _is_workspace_executable(token, workspace):
+                continue
+            _raise_shared_environment_mutation(token)
+
+        if executable in {"conda", "mamba", "micromamba"} and any(
+            action in remaining for action in CONDA_ENV_MUTATIONS
+        ):
+            _raise_shared_environment_mutation(token)
+
+        if executable == "uv" and any(
+            remaining[offset : offset + 2] == ["pip", action]
+            for action in PYTHON_ENV_MUTATIONS
+            for offset in range(max(0, len(remaining) - 1))
+        ):
+            _raise_shared_environment_mutation(token)
+
+
+def _is_workspace_executable(token: str, workspace: Path | None) -> bool:
+    if workspace is None or "/" not in token or "$" in token or "`" in token:
+        return False
+    path = Path(token)
+    candidate = path.resolve() if path.is_absolute() else (workspace / path).resolve()
+    return candidate.is_relative_to(workspace)
+
+
+def _raise_shared_environment_mutation(command: str) -> None:
+    raise ValueError(
+        "Shared Python environment mutation is blocked for "
+        f"{command!r}. Edit dependency manifests or use a virtual environment "
+        "located inside the workspace."
+    )
 
 
 def _validate_shell_cd_targets(command: str, workspace: Path) -> None:

@@ -480,6 +480,7 @@ class SerialCodingWorkflow:
                     request,
                     fix=True,
                     fix_cycle=fix_cycles,
+                    evidence_summary=self._format_evidence_summary(record),
                 ),
                 gate=lambda before, data: self._gate_implementation_report(
                     record,
@@ -875,7 +876,12 @@ class SerialCodingWorkflow:
                 self._record_workflow_trace(
                     "workflow.phase.completed",
                     phase="completed",
-                    status=("ok" if result.status == "completed" else "warning"),
+                    status=(
+                        "ok"
+                        if result.status == "completed"
+                        and not last_gate.data.get("gate_warning")
+                        else "warning"
+                    ),
                     data={
                         "workflow_id": workflow_id,
                         "phase_key": phase_key,
@@ -1091,6 +1097,17 @@ class SerialCodingWorkflow:
                 evidence[key] = payload[key]
         if payload.get("summary") is not None:
             evidence["summary"] = str(payload["summary"])[:1_000]
+        failures = payload.get("failures")
+        if isinstance(failures, list):
+            evidence["failures"] = [
+                {
+                    key: str(item[key])[:500]
+                    for key in ("test", "classname", "kind", "message")
+                    if item.get(key) is not None
+                }
+                for item in failures[:20]
+                if isinstance(item, dict)
+            ]
         if outer.get("ok") is not True and outer.get("error") is not None:
             evidence["error"] = str(outer["error"])[:1_000]
         if event.duration_ms is not None:
@@ -1745,45 +1762,74 @@ class SerialCodingWorkflow:
             if item.get("outcome")
             in {"failed", "issues_found", "error", "timed_out", "tool_error"}
         ]
+        actionable_failed = [
+            item for item in failed if item.get("outcome") != "tool_error"
+        ]
         worktree_changed = isinstance(before, dict) and before.get(
             "diff_sha256"
         ) != after.get("diff_sha256")
         evidence = {
             "report_id": artifact.id,
             "verdict": verdict,
+            "reported_verdict": verdict,
+            "effective_verdict": verdict,
+            "verdict_overridden": False,
             "verification": verification,
             "successful_checks": len(successful),
             "failed_checks": len(failed),
+            "actionable_failed_checks": len(actionable_failed),
             "worktree_changed_during_qa": worktree_changed,
             "worktree_before": before,
             "worktree_after": after,
         }
-        if verdict == "pass" and not successful:
-            return _GateResult(
-                ok=False,
-                message=(
-                    "test_report declares verdict=pass, but no successful "
-                    "run_tests or run_lint result was recorded in this attempt."
-                ),
-                artifact_ids=[artifact.id],
-                data={"qa_verdict": verdict, "qa_evidence": evidence},
-            )
-        if verdict == "pass" and failed:
-            return _GateResult(
-                ok=False,
-                message=(
-                    "test_report declares verdict=pass, but a verification tool "
-                    "reported failure, issues, timeout, or error."
-                ),
-                artifact_ids=[artifact.id],
-                data={"qa_verdict": verdict, "qa_evidence": evidence},
-            )
         if verdict == "pass" and worktree_changed:
             return _GateResult(
                 ok=False,
                 message=(
                     "QA verification changed tracked project files. A pass verdict "
                     "requires the Worktree to remain unchanged during QA."
+                ),
+                artifact_ids=[artifact.id],
+                data={"qa_verdict": verdict, "qa_evidence": evidence},
+            )
+        if failed and not actionable_failed:
+            return _GateResult(
+                ok=False,
+                message=(
+                    "QA verification was blocked by a tool execution or permission "
+                    "error and must be retried before routing work to Engineer."
+                ),
+                artifact_ids=[artifact.id],
+                data={"qa_verdict": verdict, "qa_evidence": evidence},
+            )
+        if verdict == "pass" and actionable_failed:
+            warning = (
+                "test_report declared verdict=pass, but machine verification "
+                "reported a failure, issue, timeout, or execution error; the "
+                "effective QA verdict was downgraded to fail."
+            )
+            evidence = {
+                **evidence,
+                "verdict": "fail",
+                "effective_verdict": "fail",
+                "verdict_overridden": True,
+            }
+            return _GateResult(
+                ok=True,
+                message=warning,
+                artifact_ids=[artifact.id],
+                data={
+                    "qa_verdict": "fail",
+                    "qa_evidence": evidence,
+                    "gate_warning": warning,
+                },
+            )
+        if verdict == "pass" and not successful:
+            return _GateResult(
+                ok=False,
+                message=(
+                    "test_report declares verdict=pass, but no successful "
+                    "run_tests or run_lint result was recorded in this attempt."
                 ),
                 artifact_ids=[artifact.id],
                 data={"qa_verdict": verdict, "qa_evidence": evidence},
@@ -1860,13 +1906,37 @@ class SerialCodingWorkflow:
                 checks = []
                 for item in qa.get("verification") or []:
                     if isinstance(item, dict):
-                        checks.append(
+                        check = (
                             f"{item.get('tool', 'unknown')}="
                             f"{item.get('outcome', 'unknown')}"
                         )
+                        summary = str(item.get("summary") or "").strip()
+                        if summary:
+                            check += f" summary={summary[:300]}"
+                        failed_tests = [
+                            str(failure.get("test") or "").strip()
+                            for failure in item.get("failures") or []
+                            if isinstance(failure, dict)
+                            and str(failure.get("test") or "").strip()
+                        ]
+                        if failed_tests:
+                            check += " failed_tests=" + ", ".join(failed_tests[:20])
+                        error = str(item.get("error") or "").strip()
+                        if error:
+                            check += f" error={error[:300]}"
+                        checks.append(check)
                 rendered_checks = ", ".join(checks) or "none"
+                reported_verdict = (
+                    qa.get("reported_verdict") or qa.get("verdict") or "unknown"
+                )
+                effective_verdict = (
+                    qa.get("effective_verdict") or qa.get("verdict") or "unknown"
+                )
+                verdict_summary = str(effective_verdict)
+                if reported_verdict != effective_verdict:
+                    verdict_summary += f" (reported={reported_verdict})"
                 lines.append(
-                    f"- {phase}: QA verdict={qa.get('verdict') or 'unknown'}, "
+                    f"- {phase}: QA verdict={verdict_summary}, "
                     f"checks={rendered_checks}, "
                     "worktree_changed_during_qa="
                     f"{bool(qa.get('worktree_changed_during_qa'))}"
@@ -2228,20 +2298,28 @@ class SerialCodingWorkflow:
         *,
         fix: bool,
         fix_cycle: int = 0,
+        evidence_summary: str | None = None,
     ) -> str:
         if fix:
             action = (
                 f"This is fix cycle {fix_cycle}. Read the latest test_report, "
-                "fix the reported failures, then update or create an "
+                "reproduce and fix its concrete failures, then update or create an "
                 "implementation_report artifact."
+            )
+            evidence = (
+                "\n\nAuthoritative workflow evidence from the previous QA phase:\n"
+                f"{evidence_summary}"
+                if evidence_summary
+                else ""
             )
         else:
             action = (
                 "Read the latest PRD and TaskSpec artifacts, implement only the "
                 "requested scope, then create an implementation_report artifact."
             )
+            evidence = ""
         return f"""
-{action}
+{action}{evidence}
 
 Workflow id: {workflow_id}
 User request:
@@ -2250,7 +2328,14 @@ User request:
 Required actions:
 - Inspect relevant artifacts with artifact_list/artifact_get before acting.
 - Make focused code changes only when needed.
-- Run focused verification when appropriate.
+- In a fix cycle, existing Worktree changes are only the starting point. Produce a
+  new phase-local source, test, or configuration diff that addresses the failed
+  evidence. Updating an artifact, restaging files, or merely rerunning checks is not
+  a code fix and cannot satisfy the evidence gate.
+- Re-run exact failed test IDs first, then the relevant broader suite. A keyword-only
+  selection is not proof that the requested behavior was tested.
+- Do not install packages into a shared interpreter. Record dependencies in project
+  manifests and lockfiles, or use a virtual environment inside the Worktree.
 - Create or update one artifact with kind="implementation_report".
 - Include metadata.workflow_id="{workflow_id}" and metadata.role="engineer".
 - Set metadata.outcome exactly to "changed", "no_change", or "blocked".
@@ -2285,8 +2370,15 @@ User request:
 Required actions:
 - Read the latest PRD, TaskSpec, and ImplementationReport artifacts.
 - Do not modify source files.
-- Run focused verification using run_tests and/or run_lint. A pass verdict requires
-  at least one successful result from one of these tools in this phase.
+- Run focused verification using run_tests and/or run_lint. Treat their structured
+  outcomes as authoritative over prose reports or assumptions.
+- Set verdict="pass" only when this attempt has at least one passed/clean check,
+  every verification call completed successfully, and QA did not change source files.
+- Set verdict="fail" for failed tests, lint issues, timeouts, or execution errors.
+  If a tool cannot run because permission was denied, report that blocker and never
+  claim the check passed.
+- Judge coverage from the selected test paths and collected test IDs. A keyword match
+  count alone is not evidence that the requested feature was tested.
 - Create one artifact with kind="test_report".
 - Set metadata.workflow_id="{workflow_id}".
 - Set metadata.role="qa".

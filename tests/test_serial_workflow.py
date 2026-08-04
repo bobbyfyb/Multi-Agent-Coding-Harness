@@ -564,6 +564,249 @@ def test_worktree_evidence_gate_rejects_qa_pass_without_verification(
     manager.remove(result.worktree["worktree"]["id"], discard_changes=True)
 
 
+def test_worktree_evidence_gate_downgrades_false_pass_and_runs_fix_cycle(
+    tmp_path: Path,
+) -> None:
+    workdir = _repository(tmp_path)
+    (workdir / "test_app.py").write_text(
+        "from app import value\n\n\ndef test_value():\n    assert value == 'fixed'\n",
+        encoding="utf-8",
+    )
+    _git(workdir, "add", "test_app.py")
+    _git(workdir, "commit", "--amend", "--no-edit")
+    manager = WorktreeManager.for_workdir(workdir)
+    llm = FakeLLM(
+        [
+            _response(
+                _create_call(
+                    "call-prd",
+                    kind="prd",
+                    title="PRD",
+                    content="Change app.py.",
+                    status="ready",
+                ),
+                _create_call(
+                    "call-task",
+                    kind="task_spec",
+                    title="Task Spec",
+                    content="Change app.py and verify it.",
+                    status="ready",
+                    metadata={"change_required": True},
+                ),
+            ),
+            LLMResponse(content="planning done", tool_calls=[], raw={}),
+            _response(
+                _edit_call(
+                    "call-edit-initial",
+                    path="app.py",
+                    old_text="value = 'original'",
+                    new_text="value = 'initial'",
+                ),
+                _create_call(
+                    "call-impl-initial",
+                    kind="implementation_report",
+                    title="Implementation Report",
+                    content="Initial implementation.",
+                    metadata={
+                        "outcome": "changed",
+                        "changed_files": ["app.py"],
+                    },
+                ),
+            ),
+            LLMResponse(content="implementation done", tool_calls=[], raw={}),
+            _response(
+                _run_tests_call("call-tests-failed", targets=["test_app.py"]),
+                _create_call(
+                    "call-false-pass",
+                    kind="test_report",
+                    title="Test Report",
+                    content="Incorrectly claimed that tests passed.",
+                    metadata={"verdict": "pass"},
+                ),
+            ),
+            LLMResponse(content="qa pass", tool_calls=[], raw={}),
+            _response(
+                _edit_call(
+                    "call-edit-fix",
+                    path="app.py",
+                    old_text="value = 'initial'",
+                    new_text="value = 'fixed'",
+                ),
+                _create_call(
+                    "call-impl-fix",
+                    kind="implementation_report",
+                    title="Fix Implementation Report",
+                    content="Fixed the machine-reported failure.",
+                    metadata={
+                        "outcome": "changed",
+                        "changed_files": ["app.py"],
+                    },
+                ),
+            ),
+            LLMResponse(content="fix done", tool_calls=[], raw={}),
+            _response(
+                _run_tests_call("call-tests-passed", targets=["test_app.py"]),
+                _create_call(
+                    "call-regression-pass",
+                    kind="test_report",
+                    title="Regression Test Report",
+                    content="Regression test passed.",
+                    metadata={"verdict": "pass"},
+                ),
+            ),
+            LLMResponse(content="regression pass", tool_calls=[], raw={}),
+            _response(
+                _create_call(
+                    "call-accept",
+                    kind="acceptance_report",
+                    title="Acceptance Report",
+                    content="Accepted after the evidence-driven fix.",
+                )
+            ),
+            LLMResponse(content="accepted", tool_calls=[], raw={}),
+        ]
+    )
+    workflow = SerialCodingWorkflow(
+        llm=llm,  # type: ignore[arg-type]
+        workdir=workdir,
+        artifact_manager=ArtifactManager.for_workdir(workdir),
+        approval_provider=AutoApprovalProvider(approved=True),
+        worktree_manager=manager,
+        isolation="worktree",
+    )
+
+    result = workflow.run("Change app.py.", run_id="wf-false-pass")
+
+    assert result.status == "completed"
+    assert result.fix_cycles == 1
+    initial_qa = next(phase for phase in result.phases if phase.phase == "qa_verify")
+    assert initial_qa.status == "completed"
+    assert initial_qa.data["qa_verdict"] == "fail"
+    evidence = initial_qa.data["qa_evidence"]
+    assert evidence["reported_verdict"] == "pass"
+    assert evidence["effective_verdict"] == "fail"
+    assert evidence["verdict_overridden"] is True
+    assert evidence["actionable_failed_checks"] == 1
+    assert "run_tests=failed" in str(llm.messages[6][-1]["content"])
+    assert "test_value" in str(llm.messages[6][-1]["content"])
+    assert "new phase-local" in str(llm.messages[6][-1]["content"])
+    assert "keyword match" in str(llm.messages[4][-1]["content"])
+    assert result.worktree is not None
+    manager.remove(result.worktree["worktree"]["id"], discard_changes=True)
+
+
+def test_worktree_evidence_gate_retries_qa_after_permission_tool_error(
+    tmp_path: Path,
+) -> None:
+    class DenyLintApprovalProvider:
+        def approve(self, request: Any) -> bool:
+            return request.tool_name != "run_lint"
+
+    workdir = _repository(tmp_path)
+    (workdir / "test_app.py").write_text(
+        "from app import value\n\n\ndef test_value():\n    assert value == 'workflow'\n",
+        encoding="utf-8",
+    )
+    _git(workdir, "add", "test_app.py")
+    _git(workdir, "commit", "--amend", "--no-edit")
+    manager = WorktreeManager.for_workdir(workdir)
+    llm = FakeLLM(
+        [
+            _response(
+                _create_call(
+                    "call-prd",
+                    kind="prd",
+                    title="PRD",
+                    content="Change app.py.",
+                    status="ready",
+                ),
+                _create_call(
+                    "call-task",
+                    kind="task_spec",
+                    title="Task Spec",
+                    content="Change app.py and verify it.",
+                    status="ready",
+                    metadata={"change_required": True},
+                ),
+            ),
+            LLMResponse(content="planning done", tool_calls=[], raw={}),
+            _response(
+                _edit_call(
+                    "call-edit",
+                    path="app.py",
+                    old_text="value = 'original'",
+                    new_text="value = 'workflow'",
+                ),
+                _create_call(
+                    "call-impl",
+                    kind="implementation_report",
+                    title="Implementation Report",
+                    content="Changed app.py.",
+                    metadata={
+                        "outcome": "changed",
+                        "changed_files": ["app.py"],
+                    },
+                ),
+            ),
+            LLMResponse(content="implementation done", tool_calls=[], raw={}),
+            _response(
+                _run_lint_call("call-lint-denied"),
+                _create_call(
+                    "call-first-report",
+                    kind="test_report",
+                    title="Test Report",
+                    content="Lint was denied but pass was claimed.",
+                    metadata={"verdict": "pass"},
+                ),
+            ),
+            LLMResponse(content="qa pass", tool_calls=[], raw={}),
+            _response(
+                _run_tests_call("call-tests-passed", targets=["test_app.py"]),
+                _create_call(
+                    "call-second-report",
+                    kind="test_report",
+                    title="Retry Test Report",
+                    content="Focused test passed.",
+                    metadata={"verdict": "pass"},
+                ),
+            ),
+            LLMResponse(content="qa retry pass", tool_calls=[], raw={}),
+            _response(
+                _create_call(
+                    "call-accept",
+                    kind="acceptance_report",
+                    title="Acceptance Report",
+                    content="Accepted after QA retry.",
+                )
+            ),
+            LLMResponse(content="accepted", tool_calls=[], raw={}),
+        ]
+    )
+    workflow = SerialCodingWorkflow(
+        llm=llm,  # type: ignore[arg-type]
+        workdir=workdir,
+        artifact_manager=ArtifactManager.for_workdir(workdir),
+        approval_provider=DenyLintApprovalProvider(),
+        worktree_manager=manager,
+        isolation="worktree",
+    )
+
+    result = workflow.run("Change app.py.", run_id="wf-qa-tool-error")
+
+    assert result.status == "completed"
+    assert result.fix_cycles == 0
+    qa = next(phase for phase in result.phases if phase.phase == "qa_verify")
+    assert qa.attempts == 2
+    assert qa.data["qa_verdict"] == "pass"
+    handoffs = qa.data["attempt_handoffs"]
+    assert handoffs[0]["verification"][0]["outcome"] == "tool_error"
+    assert "must be retried" in handoffs[0]["gate_issue"]
+    assert handoffs[1]["verification"][0]["outcome"] == "passed"
+    assert not any(phase.phase == "engineer_fix" for phase in result.phases)
+    assert result.worktree is not None
+    manager.remove(result.worktree["worktree"]["id"], discard_changes=True)
+
+
 def test_worktree_fix_cycle_requires_a_new_diff_and_regression_evidence(
     tmp_path: Path,
 ) -> None:
@@ -1357,7 +1600,10 @@ def _repository(tmp_path: Path) -> Path:
     _git(tmp_path, "init", "-b", "main")
     _git(tmp_path, "config", "user.email", "agent@example.com")
     _git(tmp_path, "config", "user.name", "Agent Test")
-    (tmp_path / ".gitignore").write_text(".llm_agent/\n", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text(
+        ".llm_agent/\n__pycache__/\n.pytest_cache/\n",
+        encoding="utf-8",
+    )
     (tmp_path / "app.py").write_text("value = 'original'\n", encoding="utf-8")
     _git(tmp_path, "add", ".")
     _git(tmp_path, "commit", "-m", "initial")
@@ -1541,6 +1787,22 @@ def _run_lint_call(call_id: str) -> LLMToolCall:
         name="run_lint",
         arguments={},
         raw={"id": call_id, "name": "run_lint"},
+    )
+
+
+def _run_tests_call(
+    call_id: str,
+    *,
+    targets: list[str] | None = None,
+) -> LLMToolCall:
+    arguments: dict[str, Any] = {}
+    if targets is not None:
+        arguments["targets"] = targets
+    return LLMToolCall(
+        id=call_id,
+        name="run_tests",
+        arguments=arguments,
+        raw={"id": call_id, "name": "run_tests"},
     )
 
 
