@@ -17,6 +17,8 @@ from llm_agent.tools.verification_tools import (
 if TYPE_CHECKING:
     from llm_agent.artifact_system import ArtifactManager
     from llm_agent.background_jobs import BackgroundJobManager
+    from llm_agent.mcp_config import MCPToolScope
+    from llm_agent.mcp_system import MCPManager
     from llm_agent.memory_system import MemoryManager
     from llm_agent.skill_system import SkillRegistry
     from llm_agent.subagent import SubagentRunner
@@ -53,6 +55,17 @@ def register_worktree_tools(
     register_tools(registry, manager=manager)
 
 
+def register_mcp_tools(
+    registry: ToolRegistry,
+    *,
+    manager: "MCPManager",
+    scope: "MCPToolScope",
+) -> None:
+    from llm_agent.tools.mcp_tools import register_tools
+
+    register_tools(registry, manager=manager, scope=scope)
+
+
 def register_default_tools(
     registry: ToolRegistry,
     *,
@@ -64,6 +77,8 @@ def register_default_tools(
     artifact_manager: "ArtifactManager | None" = None,
     background_manager: "BackgroundJobManager | None" = None,
     worktree_manager: "WorktreeManager | None" = None,
+    mcp_manager: "MCPManager | None" = None,
+    mcp_scope: "MCPToolScope" = "main",
 ) -> None:
     register_basic_tools(
         registry,
@@ -94,6 +109,8 @@ def register_default_tools(
         )
     if subagent_runner is not None:
         register_subagent_tools(registry, runner=subagent_runner)
+    if mcp_manager is not None:
+        register_mcp_tools(registry, manager=mcp_manager, scope=mcp_scope)
 
 
 def build_default_registry(
@@ -106,6 +123,8 @@ def build_default_registry(
     artifact_manager: "ArtifactManager | None" = None,
     background_manager: "BackgroundJobManager | None" = None,
     worktree_manager: "WorktreeManager | None" = None,
+    mcp_manager: "MCPManager | None" = None,
+    mcp_scope: "MCPToolScope" = "main",
 ) -> ToolRegistry:
     registry = ToolRegistry()
     register_default_tools(
@@ -118,6 +137,8 @@ def build_default_registry(
         artifact_manager=artifact_manager,
         background_manager=background_manager,
         worktree_manager=worktree_manager,
+        mcp_manager=mcp_manager,
+        mcp_scope=mcp_scope,
     )
     return registry
 
@@ -128,6 +149,7 @@ __all__ = [
     "register_basic_tools",
     "register_background_tools",
     "register_memory_tools",
+    "register_mcp_tools",
     "register_search_tools",
     "register_skill_tools",
     "register_subagent_tools",

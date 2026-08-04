@@ -11,6 +11,7 @@ from llm_agent.trace_system import elapsed_ms, record_trace
 
 if TYPE_CHECKING:
     from llm_agent.artifact_system import ArtifactManager
+    from llm_agent.mcp_system import MCPManager
     from llm_agent.memory_system import MemoryManager
 
 
@@ -178,6 +179,7 @@ def build_default_hook_manager(
     llm: Any | None = None,
     memory_manager: "MemoryManager | None" = None,
     artifact_manager: "ArtifactManager | None" = None,
+    mcp_manager: "MCPManager | None" = None,
 ) -> HookManager:
     from llm_agent.hooks.artifact_hooks import ArtifactContextHook
     from llm_agent.hooks.memory_hooks import (
@@ -223,6 +225,16 @@ def build_default_hook_manager(
         "PreToolUse",
         PermissionHook(**permission_kwargs),
     )
+    if mcp_manager is not None:
+        from llm_agent.hooks.mcp_hooks import MCPPermissionHook
+
+        manager.register_hook(
+            "PreToolUse",
+            MCPPermissionHook(
+                mcp_manager,
+                approval_provider=approval_provider,
+            ),
+        )
     return manager
 
 

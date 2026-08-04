@@ -2,12 +2,14 @@
 
 一个支持 OpenAI / Anthropic 官方 SDK、tool calling、权限 Hook、持久化
 Task System、长期 Memory、同步 Subagent、按需 Skill 加载和结构化 Trace 的
-Python Agent Harness，并提供可靠代码验证、有界错误恢复和托管后台进程。
+Python Agent Harness，并支持通过官方 SDK 接入外部 MCP Tools，提供可靠代码
+验证、有界错误恢复和托管后台进程。
 修改型 Subagent 可选择在独立 Git Worktree 中执行。
 
 ## 运行
 
 项目默认从 `src/.env`、`src/llm_agent/.env` 或项目根目录 `.env` 加载配置。
+根目录的 `.env.example` 提供了不含密钥的完整配置模板。
 
 ```dotenv
 ANTHROPIC_API_KEY=...
@@ -40,8 +42,8 @@ Worker。Worker 使用全新的消息上下文，完成后只将结构化报告�
 
 两种工具模式：
 
-- `explore`：`bash`、`read_file`、`glob`、`search`
-- `general`：在 `explore` 基础上增加 `write_file`、`edit_file`
+- `explore`：只读文件、Glob、文本搜索和网络搜索
+- `general`：增加 Bash、文件修改、验证工具和允许暴露给 Subagent 的 MCP Tools
 
 子 Agent 不具备 Task 工具或 `subagent_run`，不会修改父 Agent 的任务状态，也
 不能继续递归委派。文件修改和危险命令仍然经过权限 Hook。
@@ -540,6 +542,97 @@ skill_read_resource(
 加载 code-review skill，检查当前代码改动并按严重程度报告问题。
 ```
 
+## MCP Tools
+
+项目保留本地核心工具，并把 MCP 作为可选的外部工具来源。启动时
+`MCPManager` 使用官方 Python SDK 连接服务器、发现 Tools，并将其转换为现有
+`ToolDefinition`；之后仍经过同一个 Agent loop、权限 Hook 和 TraceRecorder。
+
+项目级配置位于：
+
+```text
+.llm_agent/mcp.yaml
+```
+
+没有该文件时不会启动 MCP 运行时，现有行为保持不变。stdio 示例：
+
+```yaml
+version: 1
+
+servers:
+  demo:
+    transport: stdio
+    command: python
+    args:
+      - "{workspace}/examples/mcp_demo_server.py"
+    cwd: "{workspace}"
+    workspace_scoped: true
+    expose_to: [main, engineer, subagent]
+    include_tools: [echo, workspace_info]
+    permission: confirm
+    tool_permissions:
+      echo: allow
+    env:
+      MCP_DEMO_VALUE: "${MCP_DEMO_VALUE}"
+    timeout_seconds: 30
+    max_tools: 16
+```
+
+Streamable HTTP 示例：
+
+```yaml
+version: 1
+
+servers:
+  issue_tracker:
+    transport: streamable_http
+    url: https://mcp.example.com/mcp
+    headers:
+      Authorization: "Bearer ${MCP_ACCESS_TOKEN}"
+    expose_to: [main, pm, engineer, qa]
+    include_tools: [issue_get, issue_create]
+    permission: confirm
+    tool_permissions:
+      issue_get: allow
+      issue_create: confirm
+```
+
+`examples/mcp.yaml` 提供了已验证的 Context7 配置模板；将其内容放入
+`.llm_agent/mcp.yaml` 并设置 `CONTEXT7_API_KEY` 后即可连接远程文档工具。
+
+运行规则：
+
+- 工具以 `mcp__<server>__<tool>` 注册，避免与本地工具或其他服务器冲突。
+- `expose_to` 支持 `main`、`pm`、`engineer`、`qa`、`pm_acceptance` 和
+  `subagent`；`explore` Subagent 始终不接收 MCP Tools。
+- `workspace_scoped: true` 仅用于 stdio。主工作区与不同 Worktree 会建立独立
+  session，`{workspace}` 可用于 `cwd`、`args` 和显式环境变量。
+- 权限以本地 `permission` / `tool_permissions` 为准。MCP annotations 只作为
+  展示信息，不会自动降低权限等级。
+- stdio 子进程默认使用清洗后的环境，只额外注入 `env` 中显式声明的变量；
+  `${NAME}` 从 Harness 进程环境解析，缺失时连接失败。
+- HTTP URL 必须使用 HTTPS，只有 loopback 地址允许 HTTP；静态 headers 支持
+  `${NAME}`，当前 MVP 不实现 OAuth 登录流程。
+- `include_tools`、`exclude_tools` 和 `max_tools` 控制注入模型的 schema 规模。
+  optional server 连接失败只打印 warning；`required: true` 会阻止系统启动。
+- MCP `isError=true` 会转成普通工具错误回灌给模型，不自动重试可能产生副作用的
+  调用。图片、音频和 blob 不直接进入 LLM 上下文，文本结果也有大小上限。
+
+启动 CLI 后可查看连接、工具和 session 数量：
+
+```text
+/mcp-list
+```
+
+仓库中的 `examples/mcp_demo_server.py` 可以用于 smoke test。例如配置 demo 后输入：
+
+```text
+调用 demo MCP 的 echo 工具返回 "hello MCP"，然后读取 workspace_info 并总结。
+```
+
+MVP 只接入 MCP Tools；Resources、Prompts、Sampling、动态 tool-list 订阅和 OAuth
+留给确有使用场景时扩展。
+
 ## Workflow Configuration
 
 串行 workflow 支持项目级配置文件：
@@ -550,6 +643,7 @@ skill_read_resource(
 
 MVP 只开放隔离模式、role skill 和运行预算配置，不开放工具权限、phase 顺序或模型覆盖。
 这样可以保持 PM / Engineer / QA 的安全边界稳定。
+`examples/workflow.yaml` 提供了不依赖外部 Skill 的基础模板。
 
 ```yaml
 version: 1

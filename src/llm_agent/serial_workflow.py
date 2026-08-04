@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import TYPE_CHECKING, Any, Callable, Literal
 from uuid import uuid4
 
 from llm_agent.agent import Agent, AgentCallback, AgentEvent
@@ -39,6 +39,11 @@ from llm_agent.worktree import (
     WorktreeError,
     WorktreeManager,
 )
+
+
+if TYPE_CHECKING:
+    from llm_agent.mcp_config import MCPToolScope
+    from llm_agent.mcp_system import MCPManager
 
 
 WorkflowStatus = Literal["completed", "failed"]
@@ -125,6 +130,13 @@ EVIDENCE_PHASES = {
     "qa_regression",
 }
 
+WORKFLOW_MCP_SCOPES: dict[str, "MCPToolScope"] = {
+    "pm": "pm",
+    "engineer": "engineer",
+    "qa": "qa",
+    "pm-acceptance": "pm_acceptance",
+}
+
 
 @dataclass(frozen=True)
 class RoleSpec:
@@ -179,6 +191,7 @@ class SerialCodingWorkflow:
     skill_registry: SkillRegistry | None = None
     workflow_store: WorkflowStore | None = None
     worktree_manager: WorktreeManager | None = None
+    mcp_manager: MCPManager | None = None
     isolation: WorkflowIsolation = "worktree"
     role_specs: dict[str, RoleSpec] = field(
         default_factory=lambda: dict(ROLE_SPECS)
@@ -943,12 +956,21 @@ class SerialCodingWorkflow:
         request: str,
         execution_workdir: Path,
     ) -> Agent:
+        mcp_scope = WORKFLOW_MCP_SCOPES.get(role.agent_id)
+        mcp_manager = self.mcp_manager if mcp_scope is not None else None
+        allowed_tools = set(role.tool_names)
+        if mcp_manager is not None and mcp_scope is not None:
+            allowed_tools.update(
+                mcp_manager.tool_names_for_scope(mcp_scope)
+            )
         registry = build_default_registry(
             workdir=execution_workdir,
             task_workdir=self.workdir,
             artifact_manager=self.artifact_manager,
             skill_registry=self.skill_registry,
-        ).subset(role.tool_names)
+            mcp_manager=mcp_manager,
+            mcp_scope=mcp_scope or "main",
+        ).subset(allowed_tools)
         sections = [
             PromptSection(
                 name="workspace",
@@ -1007,6 +1029,7 @@ class SerialCodingWorkflow:
                 task_workdir=self.workdir,
                 approval_provider=self.approval_provider,
                 artifact_manager=self.artifact_manager,
+                mcp_manager=mcp_manager,
             ),
             workdir=execution_workdir,
             max_steps=role.max_steps,
