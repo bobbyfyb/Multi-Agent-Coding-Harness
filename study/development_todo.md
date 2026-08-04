@@ -1,5 +1,17 @@
 # Multi-Agent Coding Harness 开发 TODO
 
+## 0. 当前阶段
+
+核心功能已进入 **Feature Freeze**。后续不再以增加模块数量为目标，优先完成：
+
+- 仓库与配置模板整理
+- 2-3 个可复现 Demo
+- 小规模对照评估与指标汇总
+- README 架构图、Artifact/Trace 样例和发布说明
+
+OAuth、并行 Agent Team、复杂 Web UI、向量数据库记忆和完整 MCP 生态继续保留为
+非阻塞的后续方向。
+
 ## 1. 上层开发目标
 
 当前项目后续统一朝 **Multi-Agent Coding Harness** 方向演进。
@@ -428,7 +440,10 @@ Web UI 可以继续复用同一个 Agent、Hook 和 Event 边界。
 - Evidence Gate 已校验 ImplementationReport、Worktree Diff 与验证工具结果；
   `shared` 兼容模式没有独立 Diff 事实源，因此只执行较弱的 Artifact gate。
 
-## 3. 接下来优先补全的单 Agent Harness 能力
+## 3. Harness 能力状态与可选扩展
+
+本节未完成项均为 Feature Freeze 后的可选增强，不阻塞 Demo、评估或 `v1.0.0`
+发布。
 
 ### 3.1 Trace / Observability
 
@@ -546,7 +561,7 @@ Web UI 可以继续复用同一个 Agent、Hook 和 Event 边界。
 - [x] 支持 worktree-aware stdio session
 - [x] 隔离 stdio 子进程环境并限制远程 HTTP URL
 - [x] 提供本地 stdio demo 和真实协议集成测试
-- [ ] 根据实际需求接入一个业务型 MCP server
+- [x] 接入并验证 Context7 远程 MCP server
 - [ ] 按需评估 Resources、Prompts、OAuth 与动态 tool-list 订阅
 
 初版目标：
@@ -562,7 +577,7 @@ MCP tools -> ToolRegistry -> Agent loop 不变
 
 目标：让 coding agent 可以安全执行真实开发任务。
 
-- [ ] 设计权限等级：allow / confirm / deny
+- [x] 设计权限等级：allow / confirm / deny
 - [ ] 将权限规则配置化
 - [ ] 支持 `permissions.yaml`
 - [ ] 区分读操作、写操作、网络操作、进程操作
@@ -687,11 +702,11 @@ INIT
 职责：
 
 - [ ] 与用户交互并澄清需求
-- [ ] 输出 PRD
-- [ ] 拆分 TaskSpec
-- [ ] 分配任务给 Engineer
-- [ ] 根据 QA 反馈决定是否返工
-- [ ] 最终验收
+- [x] 输出 PRD
+- [x] 拆分 TaskSpec
+- [x] 由 Orchestrator 分配任务给 Engineer
+- [x] 根据 QA 反馈触发返工
+- [x] 最终验收
 
 需要的工具/上下文：
 
@@ -704,12 +719,12 @@ INIT
 
 职责：
 
-- [ ] 理解 TaskSpec
-- [ ] 制定实现计划
-- [ ] 读取代码
-- [ ] 修改代码
-- [ ] 运行局部测试
-- [ ] 输出 WorkReport
+- [x] 理解 TaskSpec
+- [x] 制定并执行实现方案
+- [x] 读取代码
+- [x] 修改代码
+- [x] 运行局部测试
+- [x] 输出 ImplementationReport
 
 后续可以拆分：
 
@@ -724,11 +739,11 @@ INIT
 
 - [ ] 根据 PRD 生成 TestPlan
 - [ ] 根据 TaskSpec 生成 TestCase
-- [ ] 运行测试命令
-- [ ] 分析失败日志
-- [ ] 生成 TestReport
+- [x] 运行测试命令
+- [x] 分析失败日志
+- [x] 生成 TestReport
 - [ ] 生成 DefectReport
-- [ ] 判断是否满足验收标准
+- [x] 判断是否满足验收标准
 
 QA 必须基于真实测试结果：
 
@@ -886,15 +901,15 @@ pytest / ruff / build / API test / UI test
 
 这个项目想在简历上有说服力，至少需要满足：
 
-- [ ] 有清楚 README
+- [x] 有清楚 README
 - [ ] 有架构图
 - [ ] 有可运行 demo
-- [ ] 有完整 trace 输出
+- [x] 有完整 trace 输出
 - [ ] 有 artifact 样例
-- [ ] 有测试覆盖
-- [ ] 有权限与安全设计
+- [x] 有测试覆盖
+- [x] 有权限与安全设计
 - [x] 有上下文压缩或 memory 能力
-- [ ] 有一个多 agent 闭环 demo
+- [x] 有一个多 agent 闭环 demo
 - [ ] 能解释和 Codex / Claude Code 的差异
 
 面试时重点讲：

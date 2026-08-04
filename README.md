@@ -9,6 +9,7 @@ Python Agent Harness，并支持通过官方 SDK 接入外部 MCP Tools，提供
 ## 运行
 
 项目默认从 `src/.env`、`src/llm_agent/.env` 或项目根目录 `.env` 加载配置。
+根目录的 `.env.example` 提供了不含密钥的完整配置模板。
 
 ```dotenv
 ANTHROPIC_API_KEY=...
@@ -563,7 +564,7 @@ servers:
     transport: stdio
     command: python
     args:
-      - /absolute/path/to/LLM-agent/examples/mcp_demo_server.py
+      - "{workspace}/examples/mcp_demo_server.py"
     cwd: "{workspace}"
     workspace_scoped: true
     expose_to: [main, engineer, subagent]
@@ -595,6 +596,9 @@ servers:
       issue_get: allow
       issue_create: confirm
 ```
+
+`examples/mcp.yaml` 提供了已验证的 Context7 配置模板；将其内容放入
+`.llm_agent/mcp.yaml` 并设置 `CONTEXT7_API_KEY` 后即可连接远程文档工具。
 
 运行规则：
 
@@ -639,6 +643,7 @@ MVP 只接入 MCP Tools；Resources、Prompts、Sampling、动态 tool-list 订�
 
 MVP 只开放隔离模式、role skill 和运行预算配置，不开放工具权限、phase 顺序或模型覆盖。
 这样可以保持 PM / Engineer / QA 的安全边界稳定。
+`examples/workflow.yaml` 提供了不依赖外部 Skill 的基础模板。
 
 ```yaml
 version: 1

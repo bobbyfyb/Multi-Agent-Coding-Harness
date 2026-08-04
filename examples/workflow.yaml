@@ -1,0 +1,22 @@
+version: 1
+
+workflow:
+  isolation: worktree
+  max_fix_cycles: 1
+  max_phase_retries: 1
+  max_context_tokens: 100000
+
+roles:
+  pm:
+    max_steps: 10
+
+  engineer:
+    optional_skills:
+      - code-review
+    max_steps: 24
+
+  qa:
+    max_steps: 16
+
+  pm_acceptance:
+    max_steps: 8

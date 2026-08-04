@@ -1,0 +1,20 @@
+version: 1
+
+servers:
+  context7:
+    transport: streamable_http
+    url: https://mcp.context7.com/mcp
+    headers:
+      Authorization: "Bearer ${CONTEXT7_API_KEY}"
+    expose_to:
+      - main
+      - engineer
+      - qa
+      - subagent
+    include_tools:
+      - resolve-library-id
+      - query-docs
+    permission: allow
+    required: false
+    timeout_seconds: 30
+    max_tools: 2
