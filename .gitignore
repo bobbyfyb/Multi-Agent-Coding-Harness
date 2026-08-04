@@ -92,3 +92,7 @@ logs/
 *~
 *.tmp
 *.temp
+
+# Evaluation runtime data
+evaluation/**/workspaces/
+evaluation/**/results/raw/

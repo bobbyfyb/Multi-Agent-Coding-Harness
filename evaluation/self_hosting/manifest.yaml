@@ -1,0 +1,44 @@
+version: 1
+name: self-hosting-api-and-web-console
+
+baseline:
+  ref: demo-api-ui-baseline-v1
+  commit: fe17f79149066034ba68836f1c3fc3e2f30daf38
+
+runtime:
+  memory: empty
+  mcp_config: config/mcp.yaml
+  workflow_config: config/workflow.yaml
+  repeated_runs_per_mode: 3
+
+skills:
+  prd-writer:
+    source: .llm_agent/skills/prd-writer
+    git_commit: a51d7c850360fe45b1d3a6ccd716c3601d3d08e8
+  code-review:
+    source: .llm_agent/skills/code-review
+    skill_sha256: e61b095f887f91c47ad4a820744c1a4840996280168bf0718eeae75313a4d1ec
+
+stages:
+  - id: api-server
+    task: tasks/01_api_server.md
+    acceptance: acceptance/backend.md
+    checker: checks/backend_contract.py
+  - id: web-console
+    requires: accepted-api-server-commit
+    task: tasks/02_web_console.md
+    acceptance: acceptance/frontend.md
+    checker: checks/frontend_contract.py
+
+metrics:
+  - external_contract_passed
+  - workflow_status
+  - qa_verdict
+  - fix_cycles
+  - phase_attempts
+  - changed_files
+  - llm_calls
+  - tool_calls
+  - input_tokens
+  - output_tokens
+  - duration_seconds
