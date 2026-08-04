@@ -787,6 +787,98 @@ def test_serial_workflow_resume_reruns_running_phase_when_gate_is_missing(
     assert len(llm.messages) == 8
 
 
+def test_serial_workflow_accepts_max_steps_when_evidence_gate_passes(
+    tmp_path: Path,
+) -> None:
+    workflow_id = "wf-max-steps-evidence"
+    llm = FakeLLM(
+        [
+            _response(
+                _create_call(
+                    "call-prd",
+                    kind="prd",
+                    title="PRD",
+                    content="Plan.",
+                    status="ready",
+                    metadata={"workflow_id": workflow_id, "role": "pm"},
+                ),
+                _create_call(
+                    "call-task",
+                    kind="task_spec",
+                    title="Task Spec",
+                    content="Task.",
+                    status="ready",
+                    metadata={"workflow_id": workflow_id, "role": "pm"},
+                ),
+            ),
+            *_successful_outputs(workflow_id, include_pm=False),
+        ]
+    )
+    role_specs = dict(ROLE_SPECS)
+    role_specs["pm"] = replace(ROLE_SPECS["pm"], max_steps=1)
+    workflow = SerialCodingWorkflow(
+        llm=llm,  # type: ignore[arg-type]
+        workdir=tmp_path,
+        artifact_manager=ArtifactManager.for_workdir(tmp_path),
+        approval_provider=AutoApprovalProvider(approved=True),
+        role_specs=role_specs,
+        isolation="shared",
+    )
+
+    result = workflow.run("Build a feature.", run_id=workflow_id)
+
+    assert result.status == "completed"
+    assert result.phases[0].status == "completed"
+    assert result.phases[0].attempts == 1
+    assert result.phases[0].data["agent_status"] == "max_steps"
+
+
+def test_serial_workflow_ignores_artifacts_owned_by_another_workflow(
+    tmp_path: Path,
+) -> None:
+    workflow_id = "wf-owned"
+    llm = FakeLLM(_successful_outputs(workflow_id))
+    workflow = _workflow(tmp_path, llm)
+    assert workflow.workflow_store is not None
+    record = workflow.workflow_store.create_run(
+        workflow_id=workflow_id,
+        request="Build with owned artifacts.",
+        initial_artifact_ids=[],
+    )
+    workflow.workflow_store.mark_phase_started(
+        record,
+        phase_key="pm_plan",
+        phase="pm_plan",
+        role="PM",
+        before_versions={},
+    )
+    artifacts = ArtifactManager.for_workdir(tmp_path)
+    artifacts.create_artifact(
+        kind="prd",
+        title="Foreign PRD",
+        content="Wrong workflow.",
+        status="ready",
+        metadata={"workflow_id": "wf-foreign", "role": "pm"},
+    )
+    artifacts.create_artifact(
+        kind="task_spec",
+        title="Foreign Task Spec",
+        content="Wrong workflow.",
+        status="ready",
+        metadata={"workflow_id": "wf-foreign", "role": "pm"},
+    )
+
+    result = workflow.resume(workflow_id)
+
+    assert result.status == "completed"
+    assert result.phases[0].summary == "planning done"
+    assert len(llm.messages) == 8
+    assert all(
+        artifacts.get_artifact(artifact_id).metadata.get("workflow_id") == workflow_id
+        for artifact_id in result.artifact_ids
+    )
+
+
 def test_serial_workflow_retries_missing_artifact_gate(
     tmp_path: Path,
 ) -> None:

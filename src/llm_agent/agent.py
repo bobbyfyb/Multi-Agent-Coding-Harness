@@ -118,6 +118,8 @@ ANSI_YELLOW = "\033[33m"
 ANSI_GREEN = "\033[32m"
 ANSI_RED = "\033[31m"
 ANSI_MAGENTA = "\033[35m"
+TOOL_CALL_PREVIEW_CHARS = 400
+TOOL_RESULT_PREVIEW_CHARS = 600
 
 
 @dataclass
@@ -981,7 +983,10 @@ def print_agent_event(event: AgentEvent) -> None:
         return
 
     if event.type == "tool_call":
-        arguments = json.dumps(event.data["arguments"], ensure_ascii=False)
+        arguments = _format_event_payload(
+            event.data["arguments"],
+            max_chars=TOOL_CALL_PREVIEW_CHARS,
+        )
         print(
             f"{prefix}{ANSI_YELLOW}> [tool call] {event.data['name']}{ANSI_RESET} "
             f"{ANSI_DIM}{arguments}{ANSI_RESET}"
@@ -1032,11 +1037,15 @@ def print_agent_event(event: AgentEvent) -> None:
     if event.type == "tool_result":
         result = event.data["result"]
         result_color = _tool_result_color(result)
+        result_preview = _format_event_payload(
+            result,
+            max_chars=TOOL_RESULT_PREVIEW_CHARS,
+        )
 
         print(
             f"{prefix}{result_color}[tool result] "
             f"{event.data['name']} ->{ANSI_RESET} "
-            f"{json.dumps(result, ensure_ascii=False)}"
+            f"{result_preview}"
         )
         return
 
@@ -1326,3 +1335,13 @@ def _tool_result_color(result: Any) -> str:
     if payload.get("outcome") in {"issues_found", "no_tests"}:
         return ANSI_YELLOW
     return ANSI_GREEN
+
+
+def _format_event_payload(value: Any, *, max_chars: int) -> str:
+    serialized = json.dumps(value, ensure_ascii=False, default=str)
+    if len(serialized) <= max_chars:
+        return serialized
+    return (
+        f"{serialized[:max_chars]}... "
+        f"<truncated; {len(serialized)} chars total>"
+    )

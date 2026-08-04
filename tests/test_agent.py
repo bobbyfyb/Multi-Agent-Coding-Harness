@@ -335,6 +335,27 @@ def test_print_agent_event_outputs_human_readable_trace(capsys: Any) -> None:
     assert "done" in output
 
 
+def test_print_agent_event_truncates_large_tool_payloads(capsys: Any) -> None:
+    arguments = {"path": "large.txt", "content": "a" * 1_000}
+    result = {"ok": True, "result": "b" * 2_000}
+
+    print_agent_event(
+        AgentEvent("tool_call", 1, {"name": "write_file", "arguments": arguments})
+    )
+    print_agent_event(
+        AgentEvent("tool_result", 1, {"name": "read_file", "result": result})
+    )
+
+    output = capsys.readouterr().out
+
+    assert output.count("<truncated;") == 2
+    assert '"content": "' + "a" * 400 not in output
+    assert '"result": "' + "b" * 600 not in output
+    assert "chars total>" in output
+    assert arguments["content"] == "a" * 1_000
+    assert result["result"] == "b" * 2_000
+
+
 def test_agent_returns_direct_final_answer_without_tools() -> None:
     registry = ToolRegistry()
     llm = FakeLLM(

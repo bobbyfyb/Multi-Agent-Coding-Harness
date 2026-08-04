@@ -367,6 +367,7 @@ class SerialCodingWorkflow:
             request=request,
             prompt=self._pm_prompt(workflow_id, request),
             gate=lambda before, _: self._gate_planning_artifacts(
+                workflow_id,
                 initial_artifact_ids,
                 before,
             ),
@@ -544,6 +545,7 @@ class SerialCodingWorkflow:
                 evidence_summary=self._format_evidence_summary(record),
             ),
             gate=lambda before, _: self._gate_required_artifacts(
+                workflow_id,
                 initial_artifact_ids,
                 before,
                 required={"acceptance_report": None},
@@ -789,13 +791,20 @@ class SerialCodingWorkflow:
                 )
             last_summary = result.content
             phase_data = self._phase_checkpoint_data(record, phase_key)
+            gate_result = gate(before_versions, phase_data)
             if result.status != "completed":
+                gate_message = gate_result.message
+                if not gate_result.ok:
+                    gate_message = (
+                        f"Role agent ended with status={result.status}; "
+                        f"evidence gate: {gate_result.message}"
+                    )
                 gate_result = _GateResult(
-                    ok=False,
-                    message=f"Role agent ended with status={result.status}.",
+                    ok=gate_result.ok,
+                    message=gate_message,
+                    artifact_ids=gate_result.artifact_ids,
+                    data={**gate_result.data, "agent_status": result.status},
                 )
-            else:
-                gate_result = gate(before_versions, phase_data)
             phase_data = {**phase_data, **gate_result.data}
             self._replace_phase_checkpoint_data(record, phase_key, phase_data)
             last_gate = _GateResult(
@@ -808,6 +817,9 @@ class SerialCodingWorkflow:
                 self._record_workflow_trace(
                     "workflow.phase.completed",
                     phase="completed",
+                    status=(
+                        "ok" if result.status == "completed" else "warning"
+                    ),
                     data={
                         "workflow_id": workflow_id,
                         "phase_key": phase_key,
@@ -1189,10 +1201,12 @@ class SerialCodingWorkflow:
 
     def _gate_planning_artifacts(
         self,
+        workflow_id: str,
         initial_artifact_ids: set[str],
         before_versions: dict[str, int],
     ) -> _GateResult:
         gate = self._gate_required_artifacts(
+            workflow_id,
             initial_artifact_ids,
             before_versions,
             required={
@@ -1230,6 +1244,7 @@ class SerialCodingWorkflow:
         phase_data: dict[str, Any],
     ) -> _GateResult:
         gate = self._gate_required_artifacts(
+            record.workflow_id,
             initial_artifact_ids,
             before_versions,
             required={"implementation_report": None},
@@ -1239,6 +1254,7 @@ class SerialCodingWorkflow:
 
         report = self.artifact_manager.get_artifact(gate.artifact_ids[0])
         task_spec = self._latest_workflow_artifact(
+            record.workflow_id,
             initial_artifact_ids,
             "task_spec",
         )
@@ -1349,12 +1365,14 @@ class SerialCodingWorkflow:
 
     def _gate_required_artifacts(
         self,
+        workflow_id: str,
         initial_artifact_ids: set[str],
         before_versions: dict[str, int],
         *,
         required: dict[str, set[str] | None],
     ) -> _GateResult:
         artifacts = self._changed_workflow_artifacts(
+            workflow_id,
             initial_artifact_ids,
             before_versions,
         )
@@ -1398,6 +1416,7 @@ class SerialCodingWorkflow:
         phase_data: dict[str, Any],
     ) -> _GateResult:
         gate = self._gate_required_artifacts(
+            record.workflow_id,
             initial_artifact_ids,
             before_versions,
             required={"test_report": None},
@@ -1519,12 +1538,16 @@ class SerialCodingWorkflow:
 
     def _latest_workflow_artifact(
         self,
+        workflow_id: str,
         initial_artifact_ids: set[str],
         kind: str,
     ) -> Artifact:
         matches = [
             artifact
-            for artifact in self._workflow_artifacts(initial_artifact_ids)
+            for artifact in self._workflow_artifacts(
+                workflow_id,
+                initial_artifact_ids,
+            )
             if artifact.kind == kind
         ]
         if not matches:
@@ -1583,6 +1606,7 @@ class SerialCodingWorkflow:
 
     def _changed_workflow_artifacts(
         self,
+        workflow_id: str,
         initial_artifact_ids: set[str],
         before_versions: dict[str, int],
     ) -> list[Artifact]:
@@ -1590,17 +1614,32 @@ class SerialCodingWorkflow:
         for artifact in self.artifact_manager.list_artifacts(include_archived=True):
             if artifact.id in initial_artifact_ids:
                 continue
+            if not self._artifact_belongs_to_workflow(artifact, workflow_id):
+                continue
             previous_version = before_versions.get(artifact.id)
             if previous_version is None or artifact.version != previous_version:
                 artifacts.append(artifact)
         return artifacts
 
-    def _workflow_artifacts(self, initial_artifact_ids: set[str]) -> list[Artifact]:
+    def _workflow_artifacts(
+        self,
+        workflow_id: str,
+        initial_artifact_ids: set[str],
+    ) -> list[Artifact]:
         return [
             artifact
             for artifact in self.artifact_manager.list_artifacts(include_archived=True)
             if artifact.id not in initial_artifact_ids
+            and self._artifact_belongs_to_workflow(artifact, workflow_id)
         ]
+
+    @staticmethod
+    def _artifact_belongs_to_workflow(
+        artifact: Artifact,
+        workflow_id: str,
+    ) -> bool:
+        owner = artifact.metadata.get("workflow_id")
+        return owner is None or str(owner) == workflow_id
 
     def _artifact_ids(self) -> set[str]:
         return {
@@ -1631,7 +1670,11 @@ class SerialCodingWorkflow:
         record: WorkflowRunRecord | None = None,
     ) -> WorkflowResult:
         artifact_ids = [
-            artifact.id for artifact in self._workflow_artifacts(initial_artifact_ids)
+            artifact.id
+            for artifact in self._workflow_artifacts(
+                workflow_id,
+                initial_artifact_ids,
+            )
         ]
         worktree = self._worktree_review(record)
         if (
@@ -1836,6 +1879,8 @@ class SerialCodingWorkflow:
         {request}
 
         Required actions:
+        - Create the required PRD and TaskSpec before optional repository
+          exploration. The user request is the primary planning input.
         - Create one artifact with kind="prd" and status="ready".
         - Create one artifact with kind="task_spec" and status="ready".
         - Include metadata.workflow_id="{workflow_id}" and metadata.role="pm".
@@ -1843,6 +1888,8 @@ class SerialCodingWorkflow:
           files must change, or false only for verify-only/no-code work.
         - You may create project tasks if useful, but the artifact gate requires the PRD
         and TaskSpec artifacts.
+        - After both required artifacts are created successfully, stop calling tools
+          and return a concise status summary.
         - Do not modify source files.
         """.strip()
 
@@ -1954,7 +2001,8 @@ ROLE_SPECS: dict[str, RoleSpec] = {
         agent_id="pm",
         instructions=(
             "You are the PM worker. Produce clear planning artifacts and task "
-            "handoffs. Do not modify source files."
+            "handoffs. Create the required artifacts before optional repository "
+            "exploration, then stop using tools. Do not modify source files."
         ),
         tool_names=PM_TOOLS,
         max_steps=10,
