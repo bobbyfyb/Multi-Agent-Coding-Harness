@@ -1,587 +1,341 @@
-# LLM Agent 项目复盘与秋招面试准备
+# Multi-Agent Coding Harness 项目复盘与面试主讲稿
 
 ## 1. 项目定位
 
-本项目是一个面向 coding agent 场景的轻量级 LLM Agent 框架，核心目标是把大模型调用、工具调用、权限控制、上下文组织、事件输出等能力拆成清晰模块，形成一个可扩展、可测试、可继续演进的 agent runtime。
+### 1.1 一句话介绍
 
-一句话介绍：
+这是一个用 Python 从零实现的 **Multi-Agent Coding Harness**：它把不同厂商的 LLM tool calling、可靠代码工具、权限与隔离、上下文和记忆、可恢复工作流、结构化协作产物以及执行追踪组合成一套可测试的 Agent Runtime。
 
-> 我实现了一个支持 OpenAI SDK 和 Anthropic SDK 的 LLM Agent 框架，通过统一的 LLMClient 适配层屏蔽不同厂商 tool calling 协议差异，并在 agent loop 中接入工具注册、权限检查、hook 扩展和事件打印，支持后续扩展为 coding agent。
+它不是聊天机器人，也不是简单的“调用模型再执行函数”。项目要解决的是：
 
-适合在简历中描述为：
+> 当模型被允许读取仓库、修改代码、运行命令，并由多个角色连续协作时，如何让执行过程可控、可恢复、可验证、可审计。
 
-- 基于 Python 实现轻量级 LLM Agent runtime，支持 OpenAI / Anthropic 两类 SDK 的统一调用和 tool calling 输出适配。
-- 设计 ToolRegistry、HookManager、PermissionHook、ContextManager 等模块，解耦模型调用、工具执行、权限确认、上下文生命周期和日志展示。
-- 实现 bash、文件读写编辑、glob 搜索、Web search 等工具，并通过工作区路径校验、危险命令拦截、用户确认机制降低工具执行风险。
+### 1.2 项目背景
 
-## 2. 当前已实现功能
+一个能演示 tool calling 的 Agent Loop 很容易写，但一旦任务变长，就会出现工程问题：
 
-### 2.1 LLM 调用适配
+- OpenAI 与 Anthropic 的消息、工具定义和工具结果协议不同，上层逻辑容易被供应商格式污染。
+- 模型输出只是“建议”，工具执行却会产生真实副作用，需要权限、安全边界和可回放记录。
+- 长任务会超出上下文窗口；单纯保留聊天历史既昂贵，也不能支持进程退出后的恢复。
+- 多角色只靠自然语言交接，容易丢失约束、重复工作，甚至“报告完成但没有改代码”。
+- QA 可能口头声称测试通过，但真实命令失败；Harness 必须拥有独立于模型叙述的事实来源。
+- 网络超时、输出截断、依赖缺失和进程中断是常态，不能把所有异常都当成一次性失败。
 
-核心文件：
+因此，本项目的重点不是堆叠更多 Agent，而是补齐 **Agent 执行基础设施**。
 
-- `src/llm_agent/llm_client.py`
+### 1.3 设计目标
 
-已支持：
+1. **统一模型协议**：Agent 只处理统一消息、响应和 Tool Call，不依赖厂商 SDK 对象。
+2. **控制真实副作用**：代码操作受工作区边界、权限策略、Worktree 和结构化验证约束。
+3. **支持长任务**：区分运行内上下文、工作流短期状态和跨会话长期记忆。
+4. **协作有协议**：Task 表达控制状态，Artifact 表达角色交付物，Workflow 负责状态迁移。
+5. **结果可证伪**：以 Git diff 和验证工具结果为事实，不以模型自述作为最终证据。
+6. **过程可恢复、可观察**：Workflow checkpoint 支持 resume，Trace 支持定位每一步成本和失败。
+7. **保持轻量**：优先使用文件存储、串行编排和组合式模块，避免为了“完整”过早引入分布式系统。
 
-- OpenAI SDK 调用。
-- Anthropic SDK 调用。
-- OpenAI compatible / Anthropic compatible 形式的 base_url 配置。
-- 从环境变量或 `.env` 加载模型、API Key、base_url。
-- 统一返回 `LLMResponse`。
-- 统一抽象 tool call 为 `LLMToolCall`。
-- 将工具定义转换成不同 provider 所需格式。
-- 将工具执行结果按 provider 协议回灌给模型。
+### 1.4 明确不做什么
 
-统一响应结构：
+当前版本不是：
 
-```python
-@dataclass(frozen=True)
-class LLMToolCall:
-    id: str
-    name: str
-    arguments: dict[str, Any]
-    raw: dict[str, Any]
+- 完整容器沙箱或云端 Agent 平台；
+- 并行 Agent Team 调度系统；
+- 通用向量记忆平台；
+- 全量实现 MCP 的所有能力；
+- 已达到生产级成功率的自主软件工程产品。
 
+这些边界很重要。面试时应说明：项目选择先把串行闭环做可靠，再用评测决定是否增加并行和分布式复杂度。
 
-@dataclass(frozen=True)
-class LLMResponse:
-    content: str
-    tool_calls: list[LLMToolCall]
-    raw: dict[str, Any]
-    stop_reason: str | None = None
-    usage: dict[str, Any] = field(default_factory=dict)
-```
+## 2. 总体架构
 
-这个设计的关键点是：上层 agent 不直接依赖 OpenAI 或 Anthropic 的原始响应结构，而是只处理统一后的 `LLMResponse` 和 `LLMToolCall`。
-
-### 2.2 Agent Loop
-
-核心文件：
-
-- `src/llm_agent/agent.py`
-
-当前 agent loop 的流程：
+### 2.1 分层视图
 
 ```text
-用户消息
-  -> LLMClient.chat()
-  -> 判断是否有 tool_calls
-  -> 触发 tool_call event
-  -> PreToolUse hooks
-  -> ToolRegistry.call()
-  -> PostToolUse hooks
-  -> tool result 回灌给 LLM
-  -> 继续下一轮
-  -> 没有 tool_calls 时输出 final answer
+┌──────────────────────────────────────────────────────────────┐
+│ CLI / Workflow API                                           │
+│ 多行输入、事件展示、workflow run/show/resume、MCP 状态       │
+└─────────────────────────────┬────────────────────────────────┘
+                              │
+┌─────────────────────────────▼────────────────────────────────┐
+│ Orchestration                                                │
+│ SerialCodingWorkflow / SubagentRunner / BackgroundJobManager │
+└───────────────┬──────────────────────────────┬───────────────┘
+                │                              │
+┌───────────────▼──────────────┐ ┌────────────▼────────────────┐
+│ Agent Runtime               │ │ Collaboration State          │
+│ Agent Loop / Hook / Recovery│ │ Task / Artifact / Checkpoint │
+│ Context / Event             │ │ Attempt Handoff / Memory     │
+└───────────────┬──────────────┘ └────────────┬────────────────┘
+                │                              │
+┌───────────────▼──────────────────────────────▼────────────────┐
+│ Capability Layer                                             │
+│ ToolRegistry / Coding Tools / Verification / Skills / MCP     │
+└───────────────┬──────────────────────────────┬────────────────┘
+                │                              │
+┌───────────────▼──────────────┐ ┌────────────▼────────────────┐
+│ Provider Adapter            │ │ Execution & Observability    │
+│ OpenAI SDK / Anthropic SDK  │ │ Worktree / Security / Trace  │
+└──────────────────────────────┘ └─────────────────────────────┘
 ```
 
-关键设计：
+### 2.2 三类关键数据
 
-- `Agent.run(messages)` 接收外部维护的 `messages`，因此多轮会话历史可以由调用方保留。
-- `max_steps` 控制 agent 最多执行多少轮工具循环，防止模型无限调用工具。
-- `on_event` 用于输出中间步骤，如 `step`、`tool_call`、`tool_result`、`final`。
-- hook 系统可以影响流程，但 event 系统只负责观察和展示。
+系统刻意区分三类数据，避免一个 `messages` 列表承担所有职责：
 
-### 2.3 ToolRegistry 工具注册机制
+| 数据 | 作用 | 生命周期 | 事实来源 |
+|---|---|---|---|
+| Conversation Context | 当前 Agent 推理所需的近期对话和工具结果 | 单次运行或交互会话 | `ContextManager` |
+| Workflow State | 当前需求处于哪个阶段、已尝试什么、如何恢复 | 单个 Workflow，可跨进程 | `WorkflowStore` / checkpoint |
+| Durable Knowledge | 用户偏好、项目约定、验证过的经验 | 跨会话 | `MemoryManager` |
 
-核心文件：
+此外还有两类协作数据：
 
-- `src/llm_agent/tool_registry.py`
-- `src/llm_agent/tools/basic_tools.py`
-- `src/llm_agent/tools/search_tools.py`
-- `src/llm_agent/tools/__init__.py`
+- **Task**：谁要做什么、状态是什么、依赖是否满足，是控制面。
+- **Artifact**：PRD、TaskSpec、ImplementationReport、TestReport、AcceptanceReport，是数据面。
 
-`ToolRegistry` 负责：
+## 3. 两条核心运行链路
 
-- 注册工具。
-- 检查重名工具。
-- 调用工具函数。
-- 将工具定义转换成 LLM 可识别的 tool spec。
-- 捕获工具执行异常，并统一返回 `{"ok": False, "error": ...}`。
+### 3.1 单 Agent ReAct 链路
 
-工具定义结构：
-
-```python
-@dataclass(frozen=True)
-class ToolDefinition:
-    name: str
-    description: str
-    parameters: dict[str, Any]
-    func: ToolFunction
-```
-
-当前基础工具：
-
-- `bash`：在 workspace 内执行 shell 命令。
-- `read_file`：读取 UTF-8 文件。
-- `write_file`：写入文件。
-- `edit_file`：替换文件中的一段文本。
-- `glob`：按 glob pattern 查找文件。
-- `search`：通过 SerpAPI 搜索网络信息。
-
-### 2.4 权限与 Hook 系统
-
-核心文件：
-
-- `src/llm_agent/hooks/__init__.py`
-- `src/llm_agent/hooks/permission_hooks.py`
-
-Hook 事件：
+当前 Agent Loop 属于工程化的 ReAct 变体：模型交替进行决策和行动，但系统只展示模型主动生成的 progress summary，不伪造或暴露隐藏 chain-of-thought。
 
 ```text
-UserPromptSubmit   用户输入后、进入 LLM 前
-PreToolUse         工具执行前
-PostToolUse        工具执行后
-Stop               agent 最终停止时
+用户输入
+  -> UserPromptSubmit Hook
+  -> ContextManager 预算与压缩
+  -> BeforeLLM Hook 注入 Task/Artifact/Memory 运行时上下文
+  -> LLMClient.chat
+  -> 无 Tool Call：输出 final，触发 Stop Hook
+  -> 有 Tool Call：PreToolUse Hook
+  -> ToolRegistry 执行
+  -> PostToolUse Hook
+  -> 按 provider 协议批量回灌工具结果
+  -> 进入下一 step
 ```
 
-HookResult 支持三种行为：
+关键约束：
+
+- `max_steps` 或角色预算防止无限循环。
+- 厂商 SDK 重试被收口到自己的 Recovery 策略，避免双重重试。
+- Tool Call 与 Tool Result 被视为原子消息组，压缩时不能拆开。
+- Hook 注入的上下文只进入本轮请求，不污染 canonical conversation。
+- 多工具调用先全部执行，再按 Anthropic 官方要求以同一条 `user` 消息批量回灌 `tool_result`。
+
+### 3.2 串行 Coding Workflow 链路
 
 ```text
-allow    允许继续
-deny     拒绝当前工具调用
-replace  替换工具执行结果
+用户需求
+  -> PM：创建 PRD + TaskSpec
+  -> Evidence Gate：检查规划产物和 change_required
+  -> 为 workflow 创建共享 Git Worktree
+  -> Engineer：实际修改代码 + ImplementationReport
+  -> Gate：用 Worktree diff 校验是否真的改了代码
+  -> QA：只读运行 test/lint + TestReport
+  -> Gate：用结构化命令证据决定 pass/fail
+  -> fail：把证据和短期 handoff 交给 Engineer 修复
+  -> QA 回归，循环次数受限
+  -> PM：基于权威 QA 结果生成 AcceptanceReport
+  -> 成功时生成 patch，等待显式 apply
 ```
 
-权限 hook 当前策略：
-
-- 硬拒绝危险 bash 片段：`sudo`、`rm -rf /`、`shutdown`、`reboot`、`mkfs`、`dd if=` 等。
-- 对 `read_file`、`write_file`、`edit_file` 做 workspace 路径越界检查。
-- 对 `write_file`、`edit_file` 默认要求用户确认。
-- 对部分可能有破坏性的 bash 命令要求用户确认。
-- 支持 CLI 确认，也支持测试中的自动确认/拒绝 provider。
-
-为什么用 hook：
-
-- 权限控制属于 agent 执行前后的扩展逻辑，不应该写死在 agent loop。
-- 未来可以继续接入审计日志、输出截断、敏感信息脱敏、上下文注入、记忆保存等能力。
-
-### 2.5 ContextManager 上下文生命周期
-
-核心文件：
-
-- `src/llm_agent/context_manager.py`
-
-当前实现：
-
-- `ContextManager`：统一管理初始 system prompt 和运行时 messages。
-- `PromptSection` 支持 `name`、`content`、`priority`、`token_budget`。
-- 支持 OpenAI / Anthropic 工具消息原子分组，避免压缩拆散调用与结果。
-- 支持大工具结果落盘、旧工具结果占位、自动摘要和 reactive compact。
-- 压缩前历史保存为 JSONL Transcript。
-
-设计目的：
-
-- system prompt 不直接散落在 agent loop 中。
-- 上下文构建、预算、压缩和恢复由同一组件管理。
-- 为后续长期记忆和更精确的 token estimator 预留入口。
-
-### 2.6 事件输出系统
-
-核心文件：
-
-- `src/llm_agent/agent.py`
-
-`AgentEvent` 用于把内部执行过程传给外部 UI 或 CLI：
-
-```python
-@dataclass(frozen=True)
-class AgentEvent:
-    type: AgentEventType
-    step: int
-    data: dict[str, Any]
-```
-
-当前事件：
-
-- `step`
-- `tool_call`
-- `permission_granted`
-- `permission_denied`
-- `tool_result`
-- `final`
-
-与 hook 的区别：
-
-- hook 可以改变 agent 行为。
-- event 只负责观察和展示，不改变流程。
-
-这是项目里一个比较重要的边界设计。
-
-## 3. 整体架构图
-
-```text
-main.py
-  |
-  | build_agent()
-  v
-Agent
-  |
-  | uses
-  +--> LLMClient
-  |      |
-  |      +--> OpenAI SDK
-  |      +--> Anthropic SDK
-  |
-  +--> ToolRegistry
-  |      |
-  |      +--> basic_tools
-  |      +--> search_tools
-  |
-  +--> HookManager
-  |      |
-  |      +--> PermissionHook
-  |      +--> future hooks
-  |
-  +--> ContextManager
-  |
-  +--> AgentEvent / print_agent_event
-```
-
-工具调用时序：
-
-```text
-LLM 返回 tool_calls
-  |
-  v
-Agent emit(tool_call)
-  |
-  v
-HookManager.trigger("PreToolUse")
-  |
-  +-- deny -> 回灌 Permission denied tool_result
-  |
-  +-- allow -> ToolRegistry.call()
-                 |
-                 v
-              HookManager.trigger("PostToolUse")
-                 |
-                 v
-              回灌 tool_result
-```
-
-## 4. 关键设计取舍
-
-### 4.1 为什么使用官方 SDK，而不是直接 HTTP 调用
-
-直接 HTTP 的优点是透明、可控，但缺点是：
-
-- 不同 provider 的接口细节变化时维护成本高。
-- 类型和错误处理都要自己做。
-- tool calling 的消息结构容易写错。
-
-使用官方 SDK 的优点：
-
-- 请求构造、鉴权、超时、错误类型由 SDK 托管。
-- 更贴近官方协议。
-- 适配层只需要关注项目内部统一接口。
-
-本项目采用官方 SDK + 自己的轻量适配层：
-
-```text
-OpenAI SDK / Anthropic SDK
-        |
-        v
-LLMClient 统一抽象
-        |
-        v
-Agent 不关心底层 provider
-```
+Workflow 是 Orchestrator-Worker 模式：Orchestrator 决定阶段、输入、角色工具权限、重试和验收；PM、Engineer、QA 是 Worker。角色 Agent 不直接决定整个流程走向。
 
-### 4.2 为什么要统一 LLMToolCall
+## 4. 模块地图
 
-OpenAI 和 Anthropic 的 tool calling 结构不同。
+| 模块 | 核心职责 | 关键文件 | 深挖文档 |
+|---|---|---|---|
+| LLM Adapter | 屏蔽 OpenAI/Anthropic 协议差异 | `llm_client.py` | [Runtime](modules/01_runtime_and_provider.md) |
+| Agent Runtime | ReAct 循环、工具回灌、事件、预算 | `agent.py` | [Runtime](modules/01_runtime_and_provider.md) |
+| Hook / Event | 行为扩展与只读观测分离 | `hooks/`, `agent.py` | [Runtime](modules/01_runtime_and_provider.md) |
+| Recovery / Background | 重试、截断续写、后台 Bash | `recovery.py`, `background_jobs.py` | [Runtime](modules/01_runtime_and_provider.md) |
+| Context | Prompt section、token 预算、压缩 | `context_manager.py` | [Context](modules/02_context_memory_and_skills.md) |
+| Memory | 检索、反思、遗忘、长期知识 | `memory_system.py` | [Context](modules/02_context_memory_and_skills.md) |
+| Skill | 发现、按需加载、角色能力增强 | `skill_system.py` | [Context](modules/02_context_memory_and_skills.md) |
+| Tools / Security | 文件、命令、验证和权限边界 | `tools/`, `security.py` | [Tools](modules/03_tools_security_and_observability.md) |
+| Trace | 层级执行记录、脱敏和成本诊断 | `trace_system.py` | [Tools](modules/03_tools_security_and_observability.md) |
+| MCP | 外部工具协议接入 | `mcp_system.py` | [Tools](modules/03_tools_security_and_observability.md) |
+| Task | 结构化任务状态和依赖 | `task_system.py` | [Task 专题](task_system_design.md) |
+| Artifact | 角色间持久化交付协议 | `artifact_system.py` | [Workflow](modules/04_collaboration_and_workflow.md) |
+| Subagent | 隔离上下文的同步委派 | `subagent.py` | [Workflow](modules/04_collaboration_and_workflow.md) |
+| Worktree | 修改隔离、diff、patch、显式应用 | `worktree.py` | [Workflow](modules/04_collaboration_and_workflow.md) |
+| Workflow | 串行状态机、checkpoint、evidence gate | `serial_workflow.py` | [Workflow](modules/04_collaboration_and_workflow.md) |
 
-OpenAI 大致是：
+## 5. 最重要的设计取舍
 
-```json
-{
-  "tool_calls": [
-    {
-      "id": "call_1",
-      "type": "function",
-      "function": {
-        "name": "add",
-        "arguments": "{\"a\":1,\"b\":2}"
-      }
-    }
-  ]
-}
-```
+### 5.1 为什么只在 LLMClient 做一层适配
 
-Anthropic 大致是：
+OpenAI 和 Anthropic 的差异集中在 API 边界：
 
-```json
-{
-  "content": [
-    {
-      "type": "tool_use",
-      "id": "toolu_1",
-      "name": "add",
-      "input": {"a": 1, "b": 2}
-    }
-  ]
-}
-```
+- system message 的位置不同；
+- Tool schema 的包装不同；
+- Tool Call 的字段结构不同；
+- Anthropic 的多个 `tool_result` 要在同一条 user content 中回灌；
+- stop reason 和 usage 字段不同。
 
-如果 agent loop 直接处理这些原始结构，会导致 provider 逻辑污染 agent。统一成 `LLMToolCall` 后，agent 只关心：
+因此项目使用官方 SDK 保留类型、超时和错误语义，只在边界转换成 `LLMResponse`、`LLMToolCall` 和统一消息。Agent Loop 不出现 provider 分支。这比自己维护 HTTP 请求更可靠，也比在所有上层模块传播 SDK 对象更低耦合。
 
-```python
-tool_call.name
-tool_call.arguments
-tool_call.id
-```
+### 5.2 为什么 Tool 定义放在 Python，而不是静态 JSON
 
-### 4.3 为什么消息历史由调用方维护
+工具 schema、执行函数和依赖对象应共同演进。纯 JSON 只能描述 schema，仍需额外映射执行函数，容易产生“定义存在但实现未注册”的漂移。
 
-`Agent.run(messages)` 接收消息列表，而不是只接收用户字符串。
+当前采用：每个工具模块暴露 `register_tools()`，`tools/__init__.py` 负责组合。这样既支持按角色裁剪工具，又能把 `MemoryManager`、`WorktreeManager`、MCP session 等运行时依赖显式注入。
 
-好处：
+### 5.3 为什么 Hook、Event 和 Trace 分开
 
-- 多轮对话可以保留历史。
-- 外部可以插入 system message、memory、summary、tool result。
-- 未来可以实现 `AgentSession`，统一封装 history、memory、budget。
+- **Hook** 可以改变行为：拒绝、允许、替换结果、注入上下文。
+- **Event** 面向 CLI/UI：展示 step、progress、tool call、final，不改变执行。
+- **Trace** 面向事后诊断：持久化结构化事件、父子关系、耗时和 usage。
 
-当前 `main.py` 中：
+如果三者合并，日志代码可能意外控制流程，UI 也会被持久化格式绑定。当前边界让权限策略可以单测，CLI 可以更换，Trace 写入失败也默认不阻断任务。
 
-```python
-messages = agent.new_messages()
-messages.append({"role": "user", "content": query})
-agent.run(messages, on_event=print_agent_event)
-```
+### 5.4 为什么不把短期进展全部写入长期 Memory
 
-同一个 `messages` 在 while loop 中持续复用，因此会话历史不会丢。
+失败尝试、临时文件和未验证结论会污染长期记忆。项目采用三层策略：
 
-### 4.4 为什么 hook 不直接 print
+1. 当前 Agent 内由 Context summary 保留近期因果链；
+2. Workflow retry/resume 由 checkpoint 和 bounded attempt handoff 保留进展；
+3. 只有稳定偏好、项目事实和成功工作流反思进入长期 Memory。
 
-项目中区分了两个机制：
+这让“下一次重试不要从头开始”和“下一次会话不要继承错误结论”同时成立。
 
-```text
-Hook  负责控制行为
-Event 负责展示状态
-```
+### 5.5 为什么每个 Workflow 共享一个 Worktree
 
-如果 hook 直接 print，会带来：
+Engineer 的修改必须立即对 QA 可见，QA 的失败又必须能交给下一轮 Engineer。若每个角色各建 Worktree，就需要在每一阶段做 merge/cherry-pick 和冲突处理，复杂度远超串行 MVP 的收益。
 
-- 输出重复。
-- CLI、Web UI、测试环境难以复用。
-- 权限逻辑和展示逻辑耦合。
+一个 Workflow 一个 Worktree 能提供：
 
-所以权限 hook 只返回 `HookResult.deny(...)` 或 `HookResult.allow(...)`，agent 再 emit `permission_denied` / `permission_granted` 事件。
+- 与主分支隔离；
+- 角色间共享连续文件状态；
+- phase-local diff 和最终 patch；
+- 成功后由用户显式 apply。
 
-### 4.5 为什么权限做双层防护
+并行 Worker 出现后，才有必要升级为每个并行分支一个 Worktree。
 
-目前有两层安全机制：
+### 5.6 为什么 QA 结论不能只相信 TestReport
 
-1. Tool 层硬约束：例如 `safe_path()` 和 bash deny list。
-2. Hook 层策略控制：例如用户确认、路径越界检查、危险命令确认。
+LLM 可能把失败描述成成功，也可能漏写 changed files。Evidence Gate 以 Harness 采集的机器证据为准：
 
-原因是：
+- 实现阶段将报告中的 `changed_files` 与真实 Git diff 对齐；
+- QA pass 必须有当前阶段成功的 `run_tests` / `run_lint` 事件；
+- QA 角色没有源码写权限；
+- Acceptance verdict 必须与权威 QA 状态一致。
 
-- hook 是可配置的，可能被替换或关闭。
-- tool 是最后一道防线，不应该完全依赖外部策略。
+这体现了项目最核心的工程原则：**模型负责提出和解释，Harness 负责验证和裁决。**
 
-这对于 coding agent 很重要，因为模型可能会生成高风险工具调用。
+### 5.7 为什么保留本地工具，同时支持 MCP
 
-## 5. 项目亮点
+MCP 适合接入 Context7、GitHub 等外部能力，但本地 Coding Tools 与 Worktree、路径保护、命令日志和验证证据深度耦合。全部改造成 MCP Server 会增加进程通信和部署成本，却不会自动获得更强隔离。
 
-可以在面试中重点强调：
+因此 MCP 被作为扩展适配层：远程工具转换成普通 `ToolDefinition`，之后仍走同一套 Registry、Permission Hook 和 Trace。
 
-1. 不是简单调用 API，而是做了 provider-agnostic 的 tool calling 抽象。
-2. 不是把逻辑堆在一个 while loop 里，而是拆成 LLMClient、Agent、ToolRegistry、HookManager、ContextManager。
-3. 支持 Anthropic 官方推荐的多工具结果批量回灌方式。
-4. 工具执行前有权限检查和用户确认。
-5. event 和 hook 分离，既能输出中间步骤，又能扩展 agent 行为。
-6. 有 pytest 覆盖 agent loop、LLMClient、工具注册、hooks、权限拒绝和结果替换。
+### 5.8 为什么先做串行而不是 Agent Team
 
-## 6. 当前不足与后续规划
+并行会引入共享状态竞争、代码冲突、任务抢占、取消传播和成本放大。串行 PM/Engineer/QA 已足够展示：
 
-当前不足：
+- Orchestrator-Worker；
+- 角色隔离；
+- Artifact 协议；
+- 验证反馈闭环；
+- checkpoint/resume。
 
-- 还没有 streaming 输出。
-- 工具调用是串行执行，多工具并发还未实现。
-- 工具参数只用 JSON schema 描述，还没有用 Pydantic 做运行时强校验。
-- 权限规则目前是写在代码里的，后续可以配置化。
-- bash 工具仍然基于 `shell=True`，需要更严格的 sandbox 或命令白名单。
-- 长期 memory 机制尚未实现，当前已具备 ContextManager 摘要和 UserPromptSubmit hook。
-- 还没有 trace 文件、审计日志、token 统计和成本统计。
+真实评测表明当前主要瓶颈仍是证据一致性和 token 效率，而不是吞吐量，因此并行不是收尾阶段的优先项。
 
-后续开发方向：
+## 6. 典型问题与解决过程
 
-- 支持 streaming：边生成边输出，tool call 阶段仍保持结构化解析。
-- 支持异步工具执行：多个独立 tool calls 可以并发执行。
-- 引入 Pydantic Tool Schema：统一参数校验、默认值、文档生成。
-- 权限策略配置化：例如 `permissions.yaml`。
-- 引入短期/长期记忆：对话摘要、用户偏好、项目知识库。
-- 继续优化上下文压缩：接入精确 tokenizer 和压缩质量评估。
-- 增加审计日志：记录每次工具调用、参数、结果、审批状态。
-- 增加 sandbox：进一步限制 bash 和文件写入能力。
-- 支持 MCP：把外部工具生态接进 ToolRegistry。
+### 6.1 模型报告“完成”，实际没有修改代码
 
-## 7. 校招面试高频问题与参考回答
+**原因**：最初只检查 `ImplementationReport` 是否存在，相当于让模型自己证明自己。
 
-### Q1：这个项目解决了什么问题？
+**修复**：Workflow 接入 Worktree snapshot；Evidence Gate 检查 phase-local Git diff，并将报告的 `changed_files` 与真实变化对齐。无改动任务必须显式声明 `no_change`，需要改动却无 diff 时直接失败。
 
-参考回答：
+### 6.2 QA 声称通过，但测试命令失败
 
-> 这个项目解决的是 LLM Agent 在真实执行任务时的工程化问题。单纯调用大模型只能得到文本，但 coding agent 需要能调用工具、读取文件、执行命令、修改代码，还要处理权限、安全、上下文和多轮历史。我做的是一个轻量 agent runtime，把模型调用、工具注册、tool calling 解析、权限检查、hook 扩展和事件输出拆成独立模块，方便后续继续扩展。
+**原因**：自然语言 Artifact 和工具事件是两个事实源，早期没有明确优先级。
 
-### Q2：为什么不直接在业务代码里调用 OpenAI 或 Anthropic？
+**修复**：`run_tests` / `run_lint` 返回结构化结果，Workflow 捕获阶段内 verification event；机器失败会把 TestReport 的 pass 降级为 fail，PM 也不能绕过该结论。
 
-参考回答：
+### 6.3 Workflow retry 从头重复工作
 
-> 因为不同 provider 的 tool calling 协议不一样。如果业务层直接依赖 SDK 原始结构，后面切 provider 或支持 compatible API 时会很难维护。所以我封装了 `LLMClient`，把 OpenAI 和 Anthropic 的请求格式、tool schema、tool result 回灌、响应解析都收敛到一层适配器里。上层 agent 只处理统一的 `LLMResponse` 和 `LLMToolCall`。
+**原因**：长期 Memory 不适合存临时进展，而新的角色 Agent 又没有上一尝试的完整上下文。
 
-### Q3：OpenAI 和 Anthropic 的 tool calling 有什么差异？
+**修复**：为 phase checkpoint 增加 bounded attempt handoff，记录最近工具动作、失败、进展、验证结果和 Worktree changed files；重试和 resume 通过 `<working_state>` 注入。长期 Memory 只在成功后反思，避免失败污染。
 
-参考回答：
+### 6.4 在错误 Python 环境中验证，产生假缺依赖
 
-> OpenAI 的工具调用通常在 assistant message 的 `tool_calls` 字段里，函数参数是 JSON 字符串；Anthropic 的工具调用在 `content` block 里，`type` 是 `tool_use`，参数是结构化的 `input` 对象。工具结果回灌也不同，OpenAI 用 role 为 `tool` 的消息并带 `tool_call_id`，Anthropic 推荐把多个 `tool_result` block 放到一个 user message 的 content 数组里。我在 `LLMClient` 里分别适配，然后统一暴露给 agent。
+**原因**：直接使用 Harness 自身解释器运行目标仓库测试，无法代表目标项目环境。
 
-### Q4：Agent loop 是怎么工作的？
+**修复**：验证工具优先识别 `pyproject.toml + uv.lock`，执行 `uv run --locked --no-env-file`，并清除共享 `VIRTUAL_ENV`；依赖缺失、lock 过期和环境建立失败分别结构化分类，交给正确角色处理。
 
-参考回答：
+### 6.5 依赖缺失时 Agent 试图污染共享环境
 
-> Agent loop 每一步先调用 LLM。如果模型没有返回 tool call，就把文本作为 final answer。如果返回 tool call，就先把 assistant message 加入历史，再逐个触发工具执行流程：emit 工具调用事件、执行 PreToolUse hooks、调用 ToolRegistry、执行 PostToolUse hooks、把结果按 provider 协议回灌给模型，然后进入下一步。为了防止死循环，我加了 `max_steps`。
+**原因**：模型会自然尝试 `pip install`，但这可能修改 Harness 运行环境，也破坏可复现性。
 
-### Q5：多轮会话历史如何保留？
+**修复**：安全层阻止共享 Python 环境变更，要求 Engineer 修改项目 dependency manifest/lockfile，或使用工作区内虚拟环境。QA 只报告环境证据，不自行修源码。
 
-参考回答：
+### 6.6 长输出超时或 Tool Call 截断
 
-> 我没有让 `Agent.run()` 只接收一个字符串，而是让它接收 `messages` 列表。调用方在外部维护同一个 messages 对象，每次用户输入后 append 新 user message，然后调用 agent。agent 内部会继续 append assistant message 和 tool result message。所以同一个 session 的历史是持续保留的。
+**原因**：模型生成长 Artifact 时会触发 timeout 或 max-token 截断；截断后的 Tool Call 参数可能不是合法 JSON 对象。
 
-### Q6：为什么要设计 ToolRegistry？
+**修复**：Recovery 对 timeout/overload 做有界重试与退避；对 output truncation 提升 token 上限并请求 continuation；Tool Call 参数在边界归一化和校验，截断调用不会执行副作用工具。
 
-参考回答：
+更完整的时间线和评测数据见 [评测与故障复盘](modules/05_evaluation_and_incidents.md)。
 
-> ToolRegistry 解决的是工具定义、工具查找、工具执行和 tool schema 暴露的问题。每个工具注册时提供 name、description、parameters 和实际函数。LLMClient 调用模型前会从 registry 获取 tool_specs，模型返回 tool call 后 agent 再通过 registry 按 name 调用实际函数。这样新增工具只需要新增 tool module 并注册，不需要改 agent loop。
+## 7. 当前完成度与证据
 
-### Q7：如何新增一个工具？
+### 7.1 已形成的能力闭环
 
-参考回答：
+- OpenAI / Anthropic 官方 SDK 与统一 Tool Calling。
+- ReAct Agent Loop、Hook、Event、Recovery、Background Bash。
+- 工作区安全 Coding Tools 和项目环境验证工具。
+- Context compact、Workflow 短期 handoff、长期 Memory 生命周期。
+- Task、Artifact、Skill、Subagent、MCP 扩展。
+- PM -> Engineer -> QA -> PM 串行 Workflow。
+- Git Worktree 隔离、Workflow 持久化与 resume。
+- Evidence Gate、结构化 Trace 和自托管评测脚手架。
 
-> 新增工具一般三步：先写一个实际函数，再包装成 `ToolDefinition`，最后在 `tools/__init__.py` 里注册。工具需要提供 JSON schema 参数描述，这样模型才能知道怎么调用。因为 ToolRegistry 的接口统一，agent loop 不需要感知具体工具。
+### 7.2 评测应如何表述
 
-### Q8：为什么要做权限系统？
+不要把“流程跑到了最后”包装成“自主开发成功”。当前自托管 API Server 评测已经验证了 Harness 能够：
 
-参考回答：
+- 在多轮角色切换中保留 Worktree 和 checkpoint；
+- 用机器证据推翻错误的 QA pass；
+- 识别项目依赖和 lockfile 问题；
+- 在失败时阻止错误验收和长期记忆写入；
+- 从 Trace 定位 token 成本和重复工作。
 
-> coding agent 会执行 bash、写文件、编辑文件，如果没有权限控制，模型误调用或者 prompt injection 都可能造成破坏。我的权限系统分两层：工具内部有硬安全边界，比如 workspace 路径限制和危险命令拦截；hook 层做策略控制，比如写文件或危险 bash 前要求用户确认。这样即使 hook 被关闭，工具层也还有最后一道防线。
+但最新候选实现仍未通过外部验收，说明模型执行质量、上下文效率和基准仓库依赖完整性仍需优化。这个结果反而证明 Evidence Gate 没有“为了成功而放水”。
 
-### Q9：Hook 和 Event 有什么区别？
+### 7.3 当前限制
 
-参考回答：
+- Workflow 仅串行执行，Subagent 也是同步的。
+- Context token 估算是近似值，模型真实窗口配置错误时仍可能触发 reactive compact。
+- Artifact metadata 目前是轻量字典，尚未全部升级为强类型 schema。
+- 长期 Memory 使用文件、关键词和 LLM side-query，没有向量数据库。
+- Shell 策略和 Worktree 不是 OS 级沙箱；高风险生产环境仍需容器隔离。
+- MCP 主要支持 tools；OAuth、resources、prompts、sampling 尚未形成完整闭环。
+- WorkflowStore 是本地文件实现，不支持多进程竞争和分布式锁。
+- Trace Markdown 渲染和整体 token 效率仍有已知优化空间。
 
-> Hook 是控制点，可以改变 agent 行为，比如拒绝工具调用、替换工具结果。Event 是观察点，只负责把中间步骤传给 CLI 或 UI，比如打印 tool call、tool result、final answer。两者分离后，权限逻辑不会和展示逻辑耦合，后续接 Web UI 或日志系统也更方便。
+## 8. 三分钟面试讲法
 
-### Q10：为什么 hook 返回 HookResult，而不是直接返回字符串？
+可以按“问题 -> 架构 -> 难点 -> 结果”组织：
 
-参考回答：
+> 我做这个项目是因为普通 Agent Demo 只解决了模型调用工具的问题，但 coding 场景真正困难的是副作用控制、长任务恢复和结果可信度。我用 Python 实现了一套 Multi-Agent Coding Harness，底层通过一层 LLMClient 适配 OpenAI 和 Anthropic 官方 SDK，上层 Agent Loop 统一处理 Tool Call；工具执行统一经过 Registry、Permission Hook、工作区安全检查和 Trace。
+>
+> 长任务方面，我没有把所有信息都塞进聊天历史，而是拆成三层：ContextManager 管运行内压缩，Workflow checkpoint 和 attempt handoff 管重试与 resume，Memory 只保存跨会话稳定知识。多角色协作采用串行 Orchestrator-Worker：PM 产出 PRD 和 TaskSpec，Engineer 在 Workflow 专属 Worktree 修改代码，QA 只读验证，最后 PM 验收。角色之间用 Artifact 交付，用 Task 表达状态。
+>
+> 项目中最关键的改进是 Evidence Gate。早期模型会出现“报告写完但代码没改”或“测试失败却声称 pass”，所以我把 Git diff 和结构化 test/lint 事件设为权威事实，模型报告只负责解释。Workflow 支持 checkpoint/resume，失败尝试通过短期 handoff 续接，但不会污染长期 Memory。
+>
+> 我还用 Agent 自己开发 API Server 做自托管评测。评测确实暴露了依赖环境、上下文成本和重复尝试等问题，也验证了系统能阻止错误验收。这个项目让我关注的不只是 Prompt，而是如何把不稳定模型放进一个可验证、可恢复的工程系统里。
 
-> 因为字符串表达能力太弱，无法区分允许、拒绝、替换结果，也不好携带 reason、value、metadata。`HookResult` 结构化后，agent 可以根据 `action` 做不同处理，同时 event 输出也能拿到明确的 reason。
+## 9. 面试展开顺序
 
-### Q11：工具执行失败时怎么处理？
+面试官追问时建议按以下顺序展开，不要一次把所有模块都讲完：
 
-参考回答：
+1. 先讲 `LLMClient -> Agent -> ToolRegistry` 最小闭环。
+2. 再讲 Hook/Event/Trace 为什么分离。
+3. 用一次“假通过”事故引出 Evidence Gate。
+4. 用重复尝试问题引出三层状态与 Memory 边界。
+5. 用 Worktree 说明副作用隔离和显式 apply。
+6. 最后说明为什么当前选择串行，以及如何演进到并行 Agent Team。
 
-> ToolRegistry 会捕获工具函数抛出的异常，并统一返回 `{"ok": False, "error": ...}`。这样错误不会直接打断 agent loop，而是作为 tool result 回灌给模型。模型可以基于错误信息调整下一步，比如修改参数或换一种方式完成任务。
-
-### Q12：怎么防止 agent 无限调用工具？
-
-参考回答：
-
-> Agent 有 `max_steps` 参数。每完成一轮 LLM 调用和工具结果回灌，step 会递增。如果超过限制还没有 final answer，就抛出异常。CLI 中也可以显式设置 `max_steps=None` 允许无限循环，但默认设计应该保留上限。
-
-### Q13：为什么使用统一 ContextManager？
-
-参考回答：
-
-> 因为上下文不只是初始 system prompt，还包含持续增长的对话、工具结果、任务状态和 Skill。ContextManager 用 section 组织初始 Prompt，并统一负责预算、工具结果落盘、历史摘要和超限恢复。这样 Agent Loop 只负责执行流程，Task 和 Skill 仍保留各自的领域职责。
-
-### Q14：你觉得这个项目最难的点是什么？
-
-参考回答：
-
-> 最难的是把看似简单的 agent loop 拆出合理边界。比如 provider 协议差异应该放在 LLMClient，工具执行放在 ToolRegistry，权限拦截放在 Hook，展示放在 Event。如果边界不清楚，后续加功能会让 agent loop 越来越臃肿。另一个难点是 tool result 的消息格式，OpenAI 和 Anthropic 差异比较大，尤其是 Anthropic 的多工具结果需要按官方推荐方式批量回灌。
-
-### Q15：如果让你继续优化，你会优先做什么？
-
-参考回答：
-
-> 我会优先做三件事。第一是 TraceRecorder，让上下文压缩和工具执行可以完整复盘。第二是 Pydantic 化工具参数，增强参数校验和自动生成 schema。第三是把权限规则配置化，并增加审计日志。之后再做长期 memory、精确 token 估算和异步工具并发。
-
-### Q16：如何处理 prompt injection？
-
-参考回答：
-
-> 当前项目已经有一些基础防护，比如工具层限制 workspace、权限 hook 拦截危险操作、system prompt 强调不要伪造工具结果。但更完整的 prompt injection 防护还需要继续做，比如区分不可信文件内容和系统指令、对高风险工具调用强制确认、记录工具来源、限制可写路径、对网络搜索结果加不可信标记等。
-
-### Q17：为什么 bash 工具有风险？你怎么控制？
-
-参考回答：
-
-> bash 的风险在于它能力过大，可能删除文件、修改系统、泄露环境变量、启动长进程。当前控制方式包括 workspace cwd、timeout、输出长度限制、危险命令硬拦截、PreToolUse 确认。更进一步可以做命令白名单、容器 sandbox、禁止读取敏感环境变量、对命令做 AST 或 shell parser 级分析。
-
-### Q18：测试覆盖了哪些内容？
-
-参考回答：
-
-> 当前测试覆盖了 LLMClient 的 OpenAI/Anthropic tool call 解析和 tool result 消息构造，Agent 的多工具调用回灌、事件输出、多轮历史、max_steps，ToolRegistry 的注册和错误处理，basic tools 的文件读写编辑和路径限制，以及 hooks 的权限拒绝、用户确认和 PostToolUse 替换结果。
-
-## 8. 面试讲项目的推荐顺序
-
-建议 2 到 3 分钟版本：
-
-1. 先讲项目目标：做一个可扩展的 LLM coding agent runtime。
-2. 讲整体架构：LLMClient、Agent、ToolRegistry、HookManager、ContextManager。
-3. 讲一个核心流程：模型返回 tool call，agent 执行工具，结果回灌，直到 final answer。
-4. 讲两个亮点：provider-agnostic tool calling；权限 hook 和 event 分离。
-5. 讲后续优化：streaming、Pydantic schema、memory、sandbox。
-
-可以这样说：
-
-> 我这个项目不是只封装一次 API 调用，而是围绕 LLM Agent 的执行链路做了模块化设计。底层 LLMClient 适配 OpenAI 和 Anthropic SDK，把不同 provider 的 tool calling 格式统一成 LLMToolCall；中间 Agent 负责多轮 tool loop 和消息历史维护；工具通过 ToolRegistry 注册；权限检查和用户确认通过 PreToolUse hook 插入；展示则通过 AgentEvent 输出。这样后续我要加 memory、审计日志、更多工具或者 Web UI，都不用大改 agent loop。
-
-## 9. 简历项目描述示例
-
-项目名称：
-
-> 基于 OpenAI / Anthropic Tool Calling 的轻量级 LLM Agent 框架
-
-项目描述：
-
-> 使用 Python 实现一个可扩展的 LLM Agent runtime，支持 OpenAI SDK 与 Anthropic SDK 的统一调用、原生 tool calling、多轮工具执行、权限确认、上下文压缩和事件追踪。项目抽象了 LLMClient、ToolRegistry、HookManager、ContextManager 等模块，用于降低 provider 差异和 agent loop 复杂度。
-
-简历 bullet：
-
-- 封装 `LLMClient` 统一 OpenAI / Anthropic SDK 调用，适配两类 provider 的工具定义、tool call 解析和 tool result 回灌协议。
-- 设计 `Agent` 多轮执行循环，支持外部维护会话历史、批量工具结果回灌、`max_steps` 防死循环和结构化事件输出。
-- 实现 `ToolRegistry` 和基础工具集，支持 bash、文件读写编辑、glob、Web search 等工具，并统一异常返回。
-- 接入 `HookManager` 和 `PermissionHook`，在工具执行前进行危险命令拦截、workspace 路径校验和用户确认，实现 hook 控制与 event 展示解耦。
-- 使用 pytest 覆盖 LLM 适配、agent loop、工具注册、权限 hook、上下文构建等核心模块，提升可维护性。
-
-## 10. 可继续完善的工程任务清单
-
-短期：
-
-- 给 `search_tools.py` 补充依赖声明和格式化。
-- 增加 `README.md`，写清安装、环境变量、运行方式。
-- 增加权限规则配置文件。
-- 对 final content 做兼容 API marker 清理，例如过滤末尾 `<tool_call>`。
-
-中期：
-
-- 支持 streaming。
-- 支持 async agent loop 和并发工具调用。
-- 使用 Pydantic 定义工具 schema。
-- 增加 tool call 审计日志。
-- 为 ContextManager 接入精确 tokenizer 和压缩摘要质量评估。
-
-长期：
-
-- 实现 memory 模块。
-- 支持 MCP 工具生态。
-- 引入容器级 sandbox。
-- 增加评测集，评估工具调用成功率和任务完成率。
-- 提供 Web UI 或 TUI 展示 agent trace。
+详细问题和回答要点见 [秋招面试问题库](modules/06_interview_question_bank.md)。

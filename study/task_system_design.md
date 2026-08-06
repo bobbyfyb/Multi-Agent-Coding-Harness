@@ -340,7 +340,7 @@ Todo 语义由 session-scope task 表达。
 - 避免 Todo 和 Task 两套状态不一致。
 - 让单 agent 和多 agent 都围绕同一个任务系统。
 - 便于跨会话恢复。
-- 便于后续 PM / Engineer / QA 共享任务状态。
+- 便于当前 PM / Engineer / QA 共享任务状态。
 - 面试中更容易讲成“统一任务状态机”，而不是复制 Claude Code 的历史兼容设计。
 
 对比：
@@ -353,11 +353,13 @@ Todo 语义由 session-scope task 表达。
 
 本项目选择第三种。
 
-## 9. 和未来多 Agent 的关系
+## 9. 和当前 Multi-Agent Workflow 的关系
 
-Task System 是后续多 agent 编排的基础。
+Task System 已经作为 PM / Engineer / QA Workflow 的共享任务控制面。当前
+`SerialCodingWorkflow` 的阶段顺序仍由确定性状态机控制，而不是动态遍历 Task DAG；
+角色可以通过同一组 task tools 创建、认领、更新和完成任务。
 
-未来角色映射：
+当前角色映射：
 
 ```text
 PM Agent
@@ -376,10 +378,9 @@ QA Agent
   -> 如果失败，将任务标记 blocked 或创建 defect task
 
 Orchestrator
-  -> 读取 open tasks
-  -> 找出可执行任务
-  -> 分配给合适 agent
-  -> 根据状态推进流程
+  -> 固定推进 PM / Engineer / QA phase
+  -> 将 Task 与 Artifact、Worktree、Evidence Gate 共同作为阶段状态
+  -> 在 QA fail 后进入有界修复循环
 ```
 
 示例：
@@ -392,7 +393,8 @@ task_0004 [project] QA 测试，blocked_by=task_0002,task_0003
 task_0005 [project] PM 验收，blocked_by=task_0004
 ```
 
-这样 Multi-Agent Coding Harness 不再是几个 agent 闲聊，而是围绕同一个任务图协作。
+这样 Multi-Agent Coding Harness 不再是几个 agent 闲聊，而是围绕持久化任务和交付
+Artifact 协作。动态 ready-task 调度仍是未来并行 Agent Team 才需要的能力。
 
 ## 10. 当前使用方式
 
@@ -505,8 +507,10 @@ manager.complete_task(task.id, evidence="tests passed")
 - `task_update` 可以直接设置 `completed`，后续可收紧状态流。
 - 没有 release / unclaim 机制。
 - 没有 task history，更新记录只保留最新状态。
-- 没有 trace 集成，任务变化尚未写入执行轨迹。
-- 没有 task list 分支隔离策略。
+- task 操作会作为 Tool Call 写入 Trace，但还没有独立的 task domain event log。
+- 当前串行 Workflow 由固定 phase 状态机调度，没有基于 ready task 的动态派发。
+- Task 可以通过 `task_id` 关联 Artifact，但尚未强制每个 Workflow Artifact 都绑定 Task。
+- 没有 task list 的并发分支/租约隔离策略。
 
 后续优化：
 
@@ -514,9 +518,9 @@ manager.complete_task(task.id, evidence="tests passed")
 - 增加 DAG cycle detection。
 - 增加 `task_release`。
 - 增加 task event log。
-- 增加 task 与 trace 的关联。
-- 增加 task 与 Artifact 的关联，例如 PRD、WorkReport、TestReport。
-- 增加 orchestrator 查询 “ready tasks” 的接口。
+- 增加 task event 与 Trace correlation id 的显式关联。
+- 收紧 Workflow 中 Task 与 Artifact 的关联约束。
+- 为未来并行 Orchestrator 增加 ready-task 查询、claim lease 和原子状态更新。
 
 ## 13. 面试问题与参考回答
 
@@ -596,7 +600,7 @@ manager.complete_task(task.id, evidence="tests passed")
 
 参考回答：
 
-> PM agent 可以创建 project-scope task 和依赖关系；Engineer agent 可以 claim 可执行任务并提交 evidence；QA agent 可以创建 verification task 或 defect task；Orchestrator 根据 status、owner、blocked_by 找出 ready tasks 并分配给不同 agent。这样多 agent 是围绕任务图协作，而不是简单聊天。
+> 当前串行 Workflow 已让 PM、Engineer 和 QA 共享 Task System：PM 创建 project task，Engineer claim 并提交 evidence，QA 更新验证状态。Orchestrator 目前仍使用确定性 phase 状态机；未来并行 Agent Team 才会根据 status、owner、blocked_by 和 lease 动态分配 ready task。这样先验证协作协议，再增加并发调度复杂度。
 
 ### Q14：和 Claude Code 的 Todo/Task 设计有什么不同？
 
@@ -608,7 +612,7 @@ manager.complete_task(task.id, evidence="tests passed")
 
 参考回答：
 
-> 我会优先做三件事：第一是 TraceRecorder，把 task 创建、claim、complete 和 tool call 串成可复盘轨迹；第二是文件锁和 DAG 环检测，让多 agent 并发更安全；第三是 ready task 查询和 task event log，为 orchestrator 分配任务做准备。
+> 当前 Trace、Artifact 和串行 Workflow 都已接入。我会把优化分成两个阶段：收尾阶段先完成可复现 Demo 和评测，不继续扩大系统；只有进入并行 Agent Team 时，才优先补文件锁、claim lease、DAG 环检测、ready-task 查询和 task event log，确保并发状态更新可靠。
 
 ## 14. 简历表达示例
 
@@ -620,6 +624,6 @@ manager.complete_task(task.id, evidence="tests passed")
 
 - 设计 `TaskManager / TaskStore / Task`，将 agent 执行计划持久化为 `.llm_agent/tasks` 下的 JSON task 文件，支持跨会话恢复。
 - 实现 `task_create / task_update / task_list / task_get / task_claim / task_complete` 工具，接入现有 ToolRegistry。
-- 通过 `blocked_by` 依赖检查和 `owner` 字段支持未来多 agent 任务认领与调度。
+- 通过 `blocked_by` 依赖检查和 `owner` 字段支持当前串行角色协作，并为未来并行任务认领预留数据模型。
 - 实现 `TaskPlanningHook`，在 `BeforeLLM` 阶段注入当前任务摘要和基于状态的规划提醒，替代固定轮数 todo reminder。
-- 通过 `evidence` 字段记录测试与验证结果，为后续 QA agent 和 PM 验收提供依据。
+- 通过 `evidence` 字段记录测试与验证结果，并与当前 QA Agent、Artifact 和 Evidence Gate 协作。

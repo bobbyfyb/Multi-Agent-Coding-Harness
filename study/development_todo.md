@@ -869,6 +869,7 @@ pytest / ruff / build / API test / UI test
 - [ ] README 展示架构图
 - [ ] 录制演示 gif 或截图
 - [ ] 增加项目亮点说明
+- [x] 完成系统设计、模块深挖、评测复盘和面试问题文档
 
 验收标准：
 
@@ -919,7 +920,7 @@ pytest / ruff / build / API test / UI test
 这个项目想在简历上有说服力，至少需要满足：
 
 - [x] 有清楚 README
-- [ ] 有架构图
+- [x] 有架构图
 - [ ] 有可运行 demo
 - [x] 有完整 trace 输出
 - [ ] 有 artifact 样例
@@ -927,7 +928,8 @@ pytest / ruff / build / API test / UI test
 - [x] 有权限与安全设计
 - [x] 有上下文压缩或 memory 能力
 - [x] 有一个多 agent 闭环 demo
-- [ ] 能解释和 Codex / Claude Code 的差异
+- [x] 能解释和 Codex / Claude Code 的差异
+- [x] 有按模块组织的源码级面试复盘文档
 
 面试时重点讲：
 
@@ -950,7 +952,7 @@ pytest / ruff / build / API test / UI test
 - [x] trace 记录 step/tool/permission/final
 - [x] 新增 `run_tests` 工具
 - [x] 新增 `run_lint` 工具
-- [ ] QA 思路先不单独成 agent，而是让当前 agent 能调用 test 工具并总结失败
+- [x] QA 已升级为只读角色 Agent，并由 Evidence Gate 校验结构化测试结果
 - [x] 为 trace 写测试
 - [x] 为 test tools 写测试
 

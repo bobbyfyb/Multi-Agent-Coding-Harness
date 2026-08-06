@@ -767,3 +767,14 @@ CLI 命令：
 
 Artifacts 仍然是跨角色交接和恢复的主数据；Trace 负责审计和调试，workflow
 record 只保存编排状态。
+
+## 设计与面试文档
+
+系统设计、源码级模块拆解、真实评测复盘和秋招面试问题统一整理在
+[`study/README.md`](study/README.md)。建议先阅读项目总览，再沿 Runtime、Context、
+Tools/Security、Workflow 和 Evaluation 五个模块深入；Task System 另有独立专题。
+
+文档会明确区分已实现能力、评测验证和当前限制。最新 self-hosting 评测中的候选
+实现尚未通过外部 API contract，但已经验证了 QA 机器证据覆盖角色自报 pass、
+Worktree 隔离、Workflow resume、依赖环境分类和失败不污染长期 Memory 等 Harness
+行为。
