@@ -29,6 +29,7 @@ from llm_agent.skill_system import (
     SkillRegistry,
     build_skill_catalog_section,
 )
+from llm_agent.task_system import Task, TaskManager, TaskSystemError
 from llm_agent.tools import build_default_registry
 from llm_agent.trace_system import (
     TraceRecorder,
@@ -36,6 +37,7 @@ from llm_agent.trace_system import (
     summarize_text,
     trace_scope,
 )
+from llm_agent.workflow_checkpoint import build_attempt_checkpoint
 from llm_agent.workflow_store import (
     WorkflowRunRecord,
     WorkflowStore,
@@ -70,6 +72,13 @@ Workflow worker output:
   implementation, verification, or acceptance content in artifacts.
 - Final chat responses should be concise status summaries, not full artifact
   copies. Prefer 3-5 short bullets.
+- Treat the assigned Task as live execution state. When a decision, blocker, or
+  meaningful remaining step changes, update its notes before spending more turns
+  on broad discovery. In particular, respond to step-budget warnings by recording
+  what is completed, what remains, and the exact next action.
+- If an attempt must continue, structure the concise status with headings
+  "Completed", "Remaining", "Next actions", "Decisions", and "Blockers" when
+  applicable. The Orchestrator persists these fields for the next loop.
 - If a loaded skill expects interactive clarification, adapt it to this workflow:
   make reasonable assumptions, record open questions or risks in the artifact,
   and continue unless the original request has no usable core idea.
@@ -83,6 +92,8 @@ PM_TOOLS = {
     "artifact_get",
     "artifact_list",
     "task_create",
+    "task_claim",
+    "task_complete",
     "task_update",
     "task_list",
     "task_get",
@@ -139,6 +150,7 @@ QA_TOOLS = {
 
 VERIFICATION_TOOLS = {"run_tests", "run_lint"}
 ATTEMPT_HANDOFFS_KEY = "attempt_handoffs"
+CONTINUATION_CHECKPOINT_KEY = "continuation_checkpoint"
 MAX_ATTEMPT_HANDOFFS = 4
 MAX_HANDOFF_ACTIONS = 12
 EVIDENCE_PHASES = {
@@ -146,6 +158,24 @@ EVIDENCE_PHASES = {
     "engineer_fix",
     "qa_verify",
     "qa_regression",
+}
+WORKTREE_MUTATION_TOOLS = {"write_file", "edit_file", "bash"}
+WORKFLOW_ROOT_TASK_KEY = "workflow_root"
+PLANNING_TASK_SPECS: dict[str, dict[str, Any]] = {
+    "engineer_implement": {
+        "role": "engineer",
+        "owner": "engineer",
+    },
+    "qa_verify": {
+        "role": "qa",
+        "owner": "qa",
+        "blocked_by": "engineer_implement",
+    },
+    "pm_acceptance": {
+        "role": "pm_acceptance",
+        "owner": "pm-acceptance",
+        "blocked_by": "qa_verify",
+    },
 }
 
 WORKFLOW_MCP_SCOPES: dict[str, "MCPToolScope"] = {
@@ -235,6 +265,183 @@ class SerialCodingWorkflow:
             raise ValueError("max_fix_cycles cannot be negative.")
         if self.max_phase_retries < 0:
             raise ValueError("max_phase_retries cannot be negative.")
+
+    def _task_manager(self, workflow_id: str) -> TaskManager:
+        return TaskManager.for_workdir(
+            self.workdir,
+            task_list_id=workflow_id,
+        )
+
+    def _workflow_task(self, workflow_id: str, task_key: str) -> Task | None:
+        matches = [
+            task
+            for task in self._task_manager(workflow_id).list_tasks(
+                include_completed=True
+            )
+            if str(task.metadata.get("workflow_id") or "") == workflow_id
+            and str(task.metadata.get("task_key") or "") == task_key
+        ]
+        if len(matches) > 1:
+            raise TaskSystemError(
+                f"Workflow {workflow_id} has duplicate task_key={task_key!r}."
+            )
+        return matches[0] if matches else None
+
+    def _ensure_workflow_root_task(self, record: WorkflowRunRecord) -> Task:
+        manager = self._task_manager(record.workflow_id)
+        root = self._workflow_task(record.workflow_id, WORKFLOW_ROOT_TASK_KEY)
+        if root is None:
+            root = manager.create_task(
+                title=f"Complete workflow {record.workflow_id}",
+                description=(
+                    "Orchestrator-owned root for PM planning, implementation, QA, "
+                    "and final acceptance."
+                ),
+                scope="session",
+                owner="workflow-orchestrator",
+                priority=0,
+                metadata={
+                    "workflow_id": record.workflow_id,
+                    "task_key": WORKFLOW_ROOT_TASK_KEY,
+                    "role": "workflow",
+                },
+            )
+        if root.status == "pending":
+            root = manager.claim_task(root.id, owner="workflow-orchestrator")
+        elif root.status == "blocked":
+            root = manager.update_task(
+                root.id,
+                status="in_progress",
+                owner="workflow-orchestrator",
+                notes="Workflow resumed after a blocked or failed run.",
+            )
+        elif root.status == "cancelled":
+            raise TaskSystemError(
+                f"Workflow root task is cancelled and cannot resume: {root.id}"
+            )
+        return root
+
+    def _ensure_fix_cycle_tasks(
+        self,
+        record: WorkflowRunRecord,
+        fix_cycle: int,
+    ) -> tuple[Task, Task]:
+        workflow_id = record.workflow_id
+        manager = self._task_manager(workflow_id)
+        root = self._ensure_workflow_root_task(record)
+        previous_qa_key = (
+            "qa_verify" if fix_cycle == 1 else f"qa_regression_{fix_cycle - 1}"
+        )
+        previous_qa = self._workflow_task(workflow_id, previous_qa_key)
+        if previous_qa is None:
+            raise TaskSystemError(
+                f"Cannot create fix cycle {fix_cycle}: missing {previous_qa_key} task."
+            )
+
+        fix_key = f"engineer_fix_{fix_cycle}"
+        fix_task = self._workflow_task(workflow_id, fix_key)
+        if fix_task is None:
+            fix_task = manager.create_task(
+                title=f"Engineer fix cycle {fix_cycle}",
+                description=(
+                    "Resolve the actionable failures in the latest QA report, "
+                    "verify the final diff, and update implementation evidence."
+                ),
+                scope="session",
+                owner="engineer",
+                parent_id=root.id,
+                blocked_by=[previous_qa.id],
+                priority=30 + fix_cycle * 2,
+                metadata={
+                    "workflow_id": workflow_id,
+                    "task_key": fix_key,
+                    "role": "engineer",
+                },
+            )
+
+        regression_key = f"qa_regression_{fix_cycle}"
+        regression_task = self._workflow_task(workflow_id, regression_key)
+        if regression_task is None:
+            regression_task = manager.create_task(
+                title=f"QA regression cycle {fix_cycle}",
+                description=(
+                    "Verify the final fix-cycle diff and record the authoritative "
+                    "QA verdict."
+                ),
+                scope="session",
+                owner="qa",
+                parent_id=root.id,
+                blocked_by=[fix_task.id],
+                priority=31 + fix_cycle * 2,
+                metadata={
+                    "workflow_id": workflow_id,
+                    "task_key": regression_key,
+                    "role": "qa",
+                },
+            )
+        return fix_task, regression_task
+
+    def _retarget_acceptance_task(self, record: WorkflowRunRecord) -> None:
+        acceptance = self._workflow_task(record.workflow_id, "pm_acceptance")
+        if acceptance is None or acceptance.status in {"completed", "cancelled"}:
+            return
+        latest_qa_key = (
+            f"qa_regression_{record.fix_cycles}"
+            if record.fix_cycles
+            else "qa_verify"
+        )
+        latest_qa = self._workflow_task(record.workflow_id, latest_qa_key)
+        if latest_qa is None:
+            raise TaskSystemError(
+                f"Cannot prepare acceptance: missing {latest_qa_key} task."
+            )
+        if acceptance.blocked_by != [latest_qa.id]:
+            self._task_manager(record.workflow_id).update_task(
+                acceptance.id,
+                blocked_by=[latest_qa.id],
+                notes=(
+                    "Acceptance dependency updated to the latest authoritative "
+                    f"QA phase: {latest_qa_key}."
+                ),
+            )
+
+    def _close_workflow_root_task(
+        self,
+        workflow_id: str,
+        *,
+        status: WorkflowStatus,
+        qa_verdict: str | None,
+        error: str | None,
+    ) -> None:
+        try:
+            root = self._workflow_task(workflow_id, WORKFLOW_ROOT_TASK_KEY)
+        except TaskSystemError as exc:
+            self._record_workflow_trace(
+                "workflow.task_root.close_failed",
+                phase="failed",
+                status="warning",
+                data={"workflow_id": workflow_id, "error": exc},
+            )
+            return
+        if root is None or root.status in {"completed", "cancelled"}:
+            return
+        manager = self._task_manager(workflow_id)
+        evidence = (
+            f"workflow_status={status}; qa_verdict={qa_verdict or 'unknown'}"
+        )
+        if status == "completed":
+            if root.status == "pending":
+                root = manager.claim_task(root.id, owner="workflow-orchestrator")
+            if root.status == "blocked":
+                root = manager.update_task(root.id, status="in_progress")
+            manager.complete_task(root.id, evidence=evidence)
+            return
+        manager.update_task(
+            root.id,
+            status="blocked",
+            evidence=evidence,
+            notes=(error or "Workflow did not complete successfully.")[:2_000],
+        )
 
     def _ensure_execution_workdir(self, record: WorkflowRunRecord) -> Path:
         if self.isolation == "shared":
@@ -340,6 +547,7 @@ class SerialCodingWorkflow:
             request=request,
             initial_artifact_ids=sorted(initial_artifact_ids),
         )
+        self._ensure_workflow_root_task(record)
 
         with trace_scope(
             trace,
@@ -418,6 +626,7 @@ class SerialCodingWorkflow:
                 initial_artifact_ids,
                 before,
                 data,
+                phase_key="engineer_implement",
             ),
             execution_workdir=execution_workdir,
             on_event=on_event,
@@ -445,6 +654,7 @@ class SerialCodingWorkflow:
                 initial_artifact_ids,
                 before,
                 data,
+                phase_key="qa_verify",
             ),
             execution_workdir=execution_workdir,
             on_event=on_event,
@@ -468,6 +678,7 @@ class SerialCodingWorkflow:
             fix_cycles += 1
             record.fix_cycles = fix_cycles
             self._save_record(record)
+            self._ensure_fix_cycle_tasks(record, fix_cycles)
 
             fix_result = self._ensure_phase(
                 record,
@@ -487,6 +698,7 @@ class SerialCodingWorkflow:
                     initial_artifact_ids,
                     before,
                     data,
+                    phase_key=f"engineer_fix_{fix_cycles}",
                 ),
                 execution_workdir=execution_workdir,
                 on_event=on_event,
@@ -521,6 +733,7 @@ class SerialCodingWorkflow:
                     initial_artifact_ids,
                     before,
                     data,
+                    phase_key=f"qa_regression_{fix_cycles}",
                 ),
                 execution_workdir=execution_workdir,
                 on_event=on_event,
@@ -542,6 +755,7 @@ class SerialCodingWorkflow:
             record.fix_cycles = fix_cycles
             self._save_record(record)
 
+        self._retarget_acceptance_task(record)
         acceptance_result = self._ensure_phase(
             record,
             phase_key="pm_acceptance",
@@ -559,6 +773,7 @@ class SerialCodingWorkflow:
                 initial_artifact_ids,
                 before,
                 qa_verdict=qa_verdict,
+                phase_key="pm_acceptance",
             ),
             execution_workdir=execution_workdir,
             on_event=on_event,
@@ -604,7 +819,14 @@ class SerialCodingWorkflow:
         trace: TraceRecorder | None,
     ) -> WorkflowPhaseResult:
         completed_result = self._record_phase_result(record, phase_key)
-        if completed_result is not None and completed_result.status == "completed":
+        if (
+            completed_result is not None
+            and self._phase_result_is_trusted(
+                record,
+                phase_key,
+                completed_result,
+            )
+        ):
             return completed_result
 
         checkpoint = record.checkpoints.get(phase_key)
@@ -614,7 +836,11 @@ class SerialCodingWorkflow:
                 checkpoint.before_versions,
                 dict(checkpoint.data),
             )
-            if gate_result.ok:
+            if (
+                gate_result.ok
+                and checkpoint.status == "completed"
+                and checkpoint.data.get("agent_status") == "completed"
+            ):
                 recovered_data = {
                     **checkpoint.data,
                     **gate_result.data,
@@ -669,8 +895,11 @@ class SerialCodingWorkflow:
         if self.workflow_store is None:
             raise RuntimeError("Workflow store is required.")
         record = self.workflow_store.load_run(workflow_id)
-        if record.status == "completed":
+        if record.status == "completed" and self._completed_record_is_trusted(record):
             return self._record_to_result(record)
+        if record.status == "completed":
+            self._invalidate_untrusted_phase_suffix(record)
+        self._ensure_workflow_root_task(record)
 
         with trace_scope(
             trace,
@@ -718,12 +947,32 @@ class SerialCodingWorkflow:
         if not handoffs:
             interrupted_handoff = self._interrupted_attempt_handoff(phase_data)
             if interrupted_handoff is not None:
+                interrupted_handoff = self._build_attempt_handoff(
+                    record=record,
+                    phase=phase,
+                    phase_key=phase_key,
+                    attempt=int(interrupted_handoff["attempt"]),
+                    run_id=str(interrupted_handoff.get("run_id") or ""),
+                    agent_status="interrupted",
+                    summary=str(interrupted_handoff.get("summary") or ""),
+                    gate_issue=str(interrupted_handoff.get("gate_issue") or ""),
+                    artifact_ids=[],
+                    phase_data=phase_data,
+                    attempt_state=dict(
+                        phase_data.get("current_attempt_state") or {}
+                    ),
+                )
                 phase_data = self._append_attempt_handoff(
                     phase_data,
                     interrupted_handoff,
                 )
                 handoffs = [interrupted_handoff]
         latest_handoff = handoffs[-1] if handoffs else None
+        prior_role_handoff = self._latest_role_handoff(
+            record,
+            role_name=role.name,
+            exclude_phase_key=phase_key,
+        )
         checkpoint = record.checkpoints.get(phase_key) if record is not None else None
         previous_attempts = max(
             [
@@ -772,12 +1021,26 @@ class SerialCodingWorkflow:
                 execution_workdir=execution_workdir,
             )
             messages = agent.new_messages()
-            attempt_prompt = prompt
-            if retry_issue is not None:
-                attempt_prompt = (
-                    f"{prompt}\n\n"
-                    f"{self._corrective_prompt(phase, retry_issue, latest_handoff)}"
+            prompt_parts = [prompt]
+            task_contract = self._format_phase_task_contract(
+                workflow_id,
+                phase_key,
+            )
+            if task_contract:
+                prompt_parts.append(task_contract)
+            if (
+                latest_handoff is None
+                and local_attempt == 1
+                and prior_role_handoff is not None
+            ):
+                prompt_parts.append(
+                    self._format_prior_role_checkpoint(prior_role_handoff)
                 )
+            if retry_issue is not None:
+                prompt_parts.append(
+                    self._corrective_prompt(phase, retry_issue, latest_handoff)
+                )
+            attempt_prompt = "\n\n".join(prompt_parts)
             messages.append({"role": "user", "content": attempt_prompt})
 
             phase_run_id = f"{workflow_id}-{phase_key}-{attempt}"
@@ -795,10 +1058,15 @@ class SerialCodingWorkflow:
                 "recent_actions": [],
                 "recent_failures": [],
                 "progress": [],
+                "artifact_snapshots": [],
             }
 
             def phase_on_event(event: AgentEvent) -> None:
-                if self._capture_attempt_event(attempt_state, event):
+                if self._capture_attempt_event(
+                    attempt_state,
+                    event,
+                    record=record,
+                ):
                     self._update_phase_checkpoint_data(
                         record,
                         phase_key,
@@ -823,9 +1091,12 @@ class SerialCodingWorkflow:
                         "phase_key": phase_key,
                         "phase": phase,
                         "attempt": attempt,
+                        "source_phase_key": phase_key,
+                        "source_run_id": latest_handoff.get("run_id"),
                         "source_attempt": latest_handoff.get("attempt"),
                         "changed_files": restored_files,
                         "gate_issue": retry_issue,
+                        "context_kind": "attempt_checkpoint",
                     },
                 )
                 if on_event is not None:
@@ -847,6 +1118,35 @@ class SerialCodingWorkflow:
                             depth=1,
                         )
                     )
+
+            if (
+                latest_handoff is None
+                and local_attempt == 1
+                and prior_role_handoff is not None
+            ):
+                prior_checkpoint = prior_role_handoff.get("checkpoint")
+                changed_files = (
+                    list(prior_checkpoint.get("changed_files") or [])
+                    if isinstance(prior_checkpoint, dict)
+                    else []
+                )
+                self._record_workflow_trace(
+                    "workflow.working_context.injected",
+                    phase="event",
+                    data={
+                        "workflow_id": workflow_id,
+                        "phase_key": phase_key,
+                        "phase": phase,
+                        "attempt": attempt,
+                        "source_phase_key": prior_role_handoff.get(
+                            "source_phase_key"
+                        ),
+                        "source_run_id": prior_role_handoff.get("run_id"),
+                        "source_attempt": prior_role_handoff.get("attempt"),
+                        "changed_files": changed_files,
+                        "context_kind": "prior_role_checkpoint",
+                    },
+                )
 
             try:
                 result = agent.run(
@@ -873,26 +1173,43 @@ class SerialCodingWorkflow:
             phase_data = self._phase_checkpoint_data(record, phase_key)
             gate_result = gate(before_versions, phase_data)
             if result.status != "completed":
-                gate_message = gate_result.message
-                if not gate_result.ok:
-                    gate_message = (
-                        f"Role agent ended with status={result.status}; "
-                        f"evidence gate: {gate_result.message}"
+                artifact_gate_ok = gate_result.ok
+                gate_message = f"Role agent ended with status={result.status}; "
+                if artifact_gate_ok:
+                    gate_message += (
+                        "phase continuation is required before completion even "
+                        "though the artifact evidence gate passed."
                     )
+                else:
+                    gate_message += f"evidence gate: {gate_result.message}"
                 gate_result = _GateResult(
-                    ok=gate_result.ok,
+                    ok=False,
                     message=gate_message,
                     artifact_ids=gate_result.artifact_ids,
-                    data={**gate_result.data, "agent_status": result.status},
+                    data={
+                        **gate_result.data,
+                        "agent_status": result.status,
+                        "artifact_gate_ok": artifact_gate_ok,
+                        "continuation_reason": result.status,
+                    },
                 )
+            if "gate_warning" not in gate_result.data:
+                phase_data.pop("gate_warning", None)
             phase_data = {
                 **phase_data,
                 **gate_result.data,
                 "agent_status": result.status,
             }
+            if result.status == "completed" and gate_result.ok:
+                phase_data.pop("artifact_gate_ok", None)
+                phase_data.pop("continuation_reason", None)
+            elif result.status == "completed":
+                phase_data["artifact_gate_ok"] = False
+                phase_data["continuation_reason"] = "phase_retry"
             handoff = self._build_attempt_handoff(
                 record=record,
                 phase=phase,
+                phase_key=phase_key,
                 attempt=attempt,
                 run_id=phase_run_id,
                 agent_status=result.status,
@@ -998,6 +1315,7 @@ class SerialCodingWorkflow:
         handoff = self._build_attempt_handoff(
             record=record,
             phase=phase,
+            phase_key=phase_key,
             attempt=attempt,
             run_id=run_id,
             agent_status="failed",
@@ -1160,6 +1478,16 @@ class SerialCodingWorkflow:
             evidence["error"] = str(outer["error"])[:1_000]
         if event.duration_ms is not None:
             evidence["event_duration_ms"] = event.duration_ms
+        if self.isolation == "worktree":
+            try:
+                snapshot = self._worktree_snapshot(record)
+            except WorktreeError as exc:
+                evidence["worktree_error"] = str(exc)[:1_000]
+            else:
+                evidence["diff_sha256"] = snapshot.get("diff_sha256")
+                evidence["changed_files"] = list(
+                    snapshot.get("changed_files") or []
+                )
 
         data = self._phase_checkpoint_data(record, phase_key)
         verification = list(data.get("verification") or [])
@@ -1167,10 +1495,12 @@ class SerialCodingWorkflow:
         data["verification"] = verification
         self._replace_phase_checkpoint_data(record, phase_key, data)
 
-    @staticmethod
     def _capture_attempt_event(
+        self,
         state: dict[str, Any],
         event: AgentEvent,
+        *,
+        record: WorkflowRunRecord | None,
     ) -> bool:
         if event.type == "tool_call":
             tool_name = str(event.data.get("name", "unknown"))
@@ -1188,22 +1518,93 @@ class SerialCodingWorkflow:
             actions = state.setdefault("recent_actions", [])
             actions.append(action)
             del actions[:-MAX_HANDOFF_ACTIONS]
+            if tool_name in {"artifact_create", "artifact_update"}:
+                arguments = event.data.get("arguments")
+                artifact_call: dict[str, Any] = {"tool": tool_name}
+                if isinstance(arguments, dict):
+                    for key in ("artifact_id", "kind"):
+                        if arguments.get(key) is not None:
+                            artifact_call[key] = str(arguments[key])[:300]
+                pending = state.setdefault("pending_artifact_calls", {})
+                pending[str(event.data.get("id") or "")] = artifact_call
             return True
 
         if event.type == "tool_result":
             result = event.data.get("result")
-            if not isinstance(result, dict) or result.get("ok") is not False:
-                return False
-            failures = state.setdefault("recent_failures", [])
-            failures.append(
-                {
-                    "step": event.step,
-                    "tool": str(event.data.get("name", "unknown")),
-                    "error": str(result.get("error", "tool failed"))[:500],
-                }
+            tool_name = str(event.data.get("name", "unknown"))
+            pending_calls = state.setdefault("pending_artifact_calls", {})
+            pending = pending_calls.pop(
+                str(event.data.get("id") or ""),
+                None,
             )
-            del failures[:-6]
-            return True
+            if not isinstance(result, dict):
+                return bool(pending)
+            if result.get("ok") is False:
+                failures = state.setdefault("recent_failures", [])
+                failures.append(
+                    {
+                        "step": event.step,
+                        "tool": tool_name,
+                        "error": str(result.get("error", "tool failed"))[:500],
+                    }
+                )
+                del failures[:-6]
+                return True
+            if result.get("ok") is not True:
+                return bool(pending)
+
+            changed = bool(pending)
+            if tool_name in WORKTREE_MUTATION_TOOLS and self.isolation == "worktree":
+                try:
+                    mutation_snapshot = self._worktree_snapshot(record)
+                except WorktreeError:
+                    mutation_snapshot = None
+                if mutation_snapshot is not None:
+                    state["last_mutation"] = {
+                        "step": event.step,
+                        "tool": tool_name,
+                        "run_id": event.run_id,
+                        "diff_sha256": mutation_snapshot.get("diff_sha256"),
+                        "changed_files": list(
+                            mutation_snapshot.get("changed_files") or []
+                        ),
+                    }
+                    changed = True
+
+            if isinstance(pending, dict):
+                artifact_id = str(pending.get("artifact_id") or "").strip()
+                if not artifact_id:
+                    artifact_id = self._artifact_id_from_tool_result(result)
+                if artifact_id:
+                    try:
+                        artifact = self.artifact_manager.get_artifact(artifact_id)
+                    except Exception:
+                        artifact = None
+                    if artifact is not None:
+                        diff_sha256: str | None = None
+                        if self.isolation == "worktree":
+                            try:
+                                snapshot = self._worktree_snapshot(record)
+                            except WorktreeError:
+                                snapshot = None
+                            if snapshot is not None:
+                                diff_sha256 = str(
+                                    snapshot.get("diff_sha256") or ""
+                                ) or None
+                        snapshots = state.setdefault("artifact_snapshots", [])
+                        snapshots.append(
+                            {
+                                "artifact_id": artifact.id,
+                                "kind": artifact.kind,
+                                "version": artifact.version,
+                                "run_id": event.run_id,
+                                "step": event.step,
+                                "diff_sha256": diff_sha256,
+                            }
+                        )
+                        del snapshots[:-12]
+                        changed = True
+            return changed
 
         if event.type != "progress":
             return False
@@ -1214,6 +1615,17 @@ class SerialCodingWorkflow:
         progress.append(content[:800])
         del progress[:-4]
         return True
+
+    @staticmethod
+    def _artifact_id_from_tool_result(result: dict[str, Any]) -> str:
+        payload = result.get("result")
+        if not isinstance(payload, str):
+            return ""
+        for line in payload.splitlines():
+            candidate = line.strip().split(" ", 1)[0]
+            if candidate.startswith("artifact_"):
+                return candidate
+        return ""
 
     @staticmethod
     def _tool_action_target(arguments: Any) -> dict[str, str]:
@@ -1240,6 +1652,7 @@ class SerialCodingWorkflow:
         *,
         record: WorkflowRunRecord | None,
         phase: WorkflowPhase,
+        phase_key: str,
         attempt: int,
         run_id: str,
         agent_status: str,
@@ -1261,7 +1674,46 @@ class SerialCodingWorkflow:
             except WorktreeError:
                 snapshot = None
 
+        task_snapshot: list[Task] = []
+        if record is not None:
+            try:
+                task_snapshot = self._task_manager(record.workflow_id).list_tasks(
+                    include_completed=False
+                )
+            except TaskSystemError:
+                task_snapshot = []
+        continuation_reason = (
+            agent_status
+            if agent_status != "completed"
+            else ("phase_retry" if gate_issue else "phase_completed")
+        )
+        checkpoint = build_attempt_checkpoint(
+            phase_key=phase_key,
+            attempt=attempt,
+            run_id=run_id,
+            agent_status=agent_status,
+            continuation_reason=continuation_reason,
+            objective=(
+                f"{phase_key}: {record.request}" if record is not None else phase_key
+            ),
+            summary=summary,
+            attempt_state=attempt_state,
+            verification=verification,
+            worktree_snapshot=snapshot,
+            task_snapshot=task_snapshot,
+            artifact_ids=artifact_ids,
+            semantic=(
+                {
+                    "remaining": [gate_issue],
+                    "next_actions": [gate_issue],
+                }
+                if gate_issue
+                else None
+            ),
+        ).to_dict()
+
         handoff: dict[str, Any] = {
+            "phase_key": phase_key,
             "attempt": attempt,
             "run_id": run_id,
             "agent_status": agent_status,
@@ -1273,6 +1725,10 @@ class SerialCodingWorkflow:
             "recent_failures": list(attempt_state.get("recent_failures") or []),
             "progress": list(attempt_state.get("progress") or []),
             "verification": verification,
+            "artifact_snapshots": list(
+                attempt_state.get("artifact_snapshots") or []
+            )[-12:],
+            "checkpoint": checkpoint,
         }
         if snapshot is not None:
             handoff["worktree"] = snapshot
@@ -1291,6 +1747,12 @@ class SerialCodingWorkflow:
                 "changed_files": (
                     snapshot.get("changed_files", []) if snapshot is not None else []
                 ),
+                "completed": checkpoint["completed"],
+                "remaining": checkpoint["remaining"],
+                "next_actions": checkpoint["next_actions"],
+                "open_task_ids": [
+                    task.get("id") for task in checkpoint["open_tasks"]
+                ],
             },
         )
         return handoff
@@ -1304,6 +1766,9 @@ class SerialCodingWorkflow:
         handoffs = SerialCodingWorkflow._attempt_handoffs(updated)
         handoffs.append(dict(handoff))
         updated[ATTEMPT_HANDOFFS_KEY] = handoffs[-MAX_ATTEMPT_HANDOFFS:]
+        checkpoint = handoff.get("checkpoint")
+        if isinstance(checkpoint, dict):
+            updated[CONTINUATION_CHECKPOINT_KEY] = dict(checkpoint)
         updated.pop("current_attempt_state", None)
         return updated
 
@@ -1362,6 +1827,178 @@ class SerialCodingWorkflow:
         issue = str(handoff.get("gate_issue") or "").strip()
         return issue or None
 
+    @staticmethod
+    def _latest_role_handoff(
+        record: WorkflowRunRecord | None,
+        *,
+        role_name: str,
+        exclude_phase_key: str,
+    ) -> dict[str, Any] | None:
+        if record is None:
+            return None
+        for phase_result in reversed(record.phases):
+            phase_key = str(phase_result.get("phase_key") or "")
+            if phase_key == exclude_phase_key:
+                continue
+            if str(phase_result.get("role") or "") != role_name:
+                continue
+            data = phase_result.get("data")
+            if not isinstance(data, dict):
+                continue
+            handoffs = SerialCodingWorkflow._attempt_handoffs(data)
+            if not handoffs:
+                continue
+            handoff = dict(handoffs[-1])
+            handoff["source_phase_key"] = phase_key
+            return handoff
+        return None
+
+    def _format_phase_task_contract(
+        self,
+        workflow_id: str,
+        phase_key: str,
+    ) -> str:
+        if phase_key == "pm_plan":
+            return ""
+        task = self._workflow_task(workflow_id, phase_key)
+        if task is None:
+            return (
+                "<workflow_task>\n"
+                f"No task with metadata.task_key={phase_key!r} exists in this "
+                "workflow Task list. Report this as a blocker; never guess a task "
+                "id from another run.\n"
+                "</workflow_task>"
+            )
+        return (
+            "<workflow_task>\n"
+            f"Task list id: {workflow_id}\n"
+            f"Required phase task: {task.id}\n"
+            f"Task key: {phase_key}\n"
+            f"Current status: {task.status}\n"
+            "Use task_get to read it. If pending, claim it as this role before "
+            "work. If already in_progress, continue it without creating a duplicate. "
+            "Before the phase can pass, complete it with concrete artifact and "
+            "verification evidence. If it is already completed after a continuation, "
+            "do not reopen or duplicate it; finish the remaining artifact/final-response "
+            "contract only.\n"
+            "</workflow_task>"
+        )
+
+    @staticmethod
+    def _format_prior_role_checkpoint(handoff: dict[str, Any]) -> str:
+        checkpoint = handoff.get("checkpoint")
+        if not isinstance(checkpoint, dict):
+            checkpoint = {
+                "phase_key": handoff.get("source_phase_key"),
+                "attempt": handoff.get("attempt"),
+                "run_id": handoff.get("run_id"),
+                "agent_status": handoff.get("agent_status"),
+                "summary": handoff.get("summary"),
+                "changed_files": SerialCodingWorkflow._handoff_changed_files(
+                    handoff
+                ),
+            }
+        payload = {
+            "source_phase_key": handoff.get("source_phase_key"),
+            **checkpoint,
+        }
+        return (
+            "<prior_role_checkpoint>\n"
+            "This is the latest bounded checkpoint from your previous workflow "
+            "phase. Continue from it and the current workspace; do not repeat broad "
+            "repository discovery. Fresh files, tasks, artifacts, and tool evidence "
+            "remain authoritative.\n"
+            f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n"
+            "</prior_role_checkpoint>"
+        )
+
+    @staticmethod
+    def _latest_artifact_snapshot(
+        phase_data: dict[str, Any],
+        artifact_id: str,
+        *,
+        normalized_key: str,
+    ) -> dict[str, Any] | None:
+        candidates: list[dict[str, Any]] = []
+        normalized = phase_data.get(normalized_key)
+        if isinstance(normalized, dict):
+            candidates.append(dict(normalized))
+        current_state = phase_data.get("current_attempt_state")
+        if isinstance(current_state, dict):
+            candidates.extend(
+                dict(item)
+                for item in current_state.get("artifact_snapshots") or []
+                if isinstance(item, dict)
+            )
+        for handoff in SerialCodingWorkflow._attempt_handoffs(phase_data):
+            candidates.extend(
+                dict(item)
+                for item in handoff.get("artifact_snapshots") or []
+                if isinstance(item, dict)
+            )
+        matches = [
+            item
+            for item in candidates
+            if str(item.get("artifact_id") or "") == artifact_id
+        ]
+        if not matches:
+            return None
+        return max(
+            enumerate(matches),
+            key=lambda pair: (int(pair[1].get("version") or 0), pair[0]),
+        )[1]
+
+    def _gate_phase_task(
+        self,
+        workflow_id: str,
+        phase_key: str,
+    ) -> _GateResult:
+        try:
+            task = self._workflow_task(workflow_id, phase_key)
+        except TaskSystemError as exc:
+            return _GateResult(ok=False, message=str(exc))
+        if task is None:
+            return _GateResult(
+                ok=False,
+                message=(
+                    f"Missing workflow task with metadata.task_key={phase_key!r}."
+                ),
+            )
+        expected_owner = (
+            "pm-acceptance"
+            if phase_key == "pm_acceptance"
+            else ("qa" if phase_key.startswith("qa_") else "engineer")
+        )
+        if task.owner != expected_owner:
+            return _GateResult(
+                ok=False,
+                message=(
+                    f"Workflow task {task.id} for {phase_key} must be owned by "
+                    f"{expected_owner!r}, got {task.owner!r}."
+                ),
+                data={"phase_task_id": task.id, "phase_task_status": task.status},
+            )
+        if task.status != "completed":
+            return _GateResult(
+                ok=False,
+                message=(
+                    f"Workflow task {task.id} for {phase_key} is {task.status}; "
+                    "claim/continue it and complete it with evidence."
+                ),
+                data={"phase_task_id": task.id, "phase_task_status": task.status},
+            )
+        if not str(task.evidence or "").strip():
+            return _GateResult(
+                ok=False,
+                message=f"Completed workflow task {task.id} has no evidence.",
+                data={"phase_task_id": task.id, "phase_task_status": task.status},
+            )
+        return _GateResult(
+            ok=True,
+            message="ok",
+            data={"phase_task_id": task.id, "phase_task_status": task.status},
+        )
+
     def _build_role_agent(
         self,
         role: RoleSpec,
@@ -1379,6 +2016,7 @@ class SerialCodingWorkflow:
         registry = build_default_registry(
             workdir=execution_workdir,
             task_workdir=self.workdir,
+            task_list_id=workflow_id,
             artifact_manager=self.artifact_manager,
             skill_registry=self.skill_registry,
             memory_manager=self.memory_manager,
@@ -1447,6 +2085,8 @@ class SerialCodingWorkflow:
             hooks=build_default_hook_manager(
                 workdir=execution_workdir,
                 task_workdir=self.workdir,
+                task_list_id=workflow_id,
+                workflow_id=workflow_id,
                 approval_provider=self.approval_provider,
                 llm=self.llm,
                 memory_manager=self.memory_manager,
@@ -1561,10 +2201,26 @@ class SerialCodingWorkflow:
                 "task_spec": {"ready", "accepted"},
             },
         )
-        if not gate.ok or self.isolation != "worktree":
+        if not gate.ok:
             return gate
 
         task_spec = self._artifact_from_ids(gate.artifact_ids, "task_spec")
+        task_gate = self._gate_planning_tasks(workflow_id, task_spec)
+        if not task_gate.ok:
+            return _GateResult(
+                ok=False,
+                message=task_gate.message,
+                artifact_ids=gate.artifact_ids,
+                data=task_gate.data,
+            )
+        if self.isolation != "worktree":
+            return _GateResult(
+                ok=True,
+                message="ok",
+                artifact_ids=gate.artifact_ids,
+                data=task_gate.data,
+            )
+
         change_required = task_spec.metadata.get("change_required")
         if not isinstance(change_required, bool):
             return _GateResult(
@@ -1580,7 +2236,138 @@ class SerialCodingWorkflow:
             ok=True,
             message="ok",
             artifact_ids=gate.artifact_ids,
-            data={"change_required": change_required},
+            data={**task_gate.data, "change_required": change_required},
+        )
+
+    def _gate_planning_tasks(
+        self,
+        workflow_id: str,
+        task_spec: Artifact,
+    ) -> _GateResult:
+        try:
+            root = self._workflow_task(workflow_id, WORKFLOW_ROOT_TASK_KEY)
+        except TaskSystemError as exc:
+            return _GateResult(ok=False, message=str(exc))
+        if root is None:
+            return _GateResult(
+                ok=False,
+                message="The workflow has no orchestrator-owned root task.",
+            )
+        raw_task_ids = task_spec.metadata.get("task_ids")
+        if not isinstance(raw_task_ids, dict):
+            return _GateResult(
+                ok=False,
+                message=(
+                    "task_spec metadata.task_ids must map engineer_implement, "
+                    "qa_verify, and pm_acceptance to their real workflow Task ids."
+                ),
+            )
+        task_ids = {
+            str(key): str(value)
+            for key, value in raw_task_ids.items()
+            if str(key).strip() and str(value).strip()
+        }
+        missing = sorted(set(PLANNING_TASK_SPECS) - set(task_ids))
+        if missing:
+            return _GateResult(
+                ok=False,
+                message=(
+                    "task_spec metadata.task_ids is missing required task key(s): "
+                    + ", ".join(missing)
+                ),
+            )
+
+        manager = self._task_manager(workflow_id)
+        all_tasks = manager.list_tasks(include_completed=True)
+        resolved: dict[str, Task] = {}
+        for task_key, spec in PLANNING_TASK_SPECS.items():
+            task_id = task_ids[task_key]
+            try:
+                task = manager.get_task(task_id)
+            except TaskSystemError as exc:
+                return _GateResult(
+                    ok=False,
+                    message=f"TaskSpec references invalid {task_key} task: {exc}",
+                )
+            key_matches = [
+                candidate
+                for candidate in all_tasks
+                if str(candidate.metadata.get("workflow_id") or "") == workflow_id
+                and str(candidate.metadata.get("task_key") or "") == task_key
+            ]
+            if len(key_matches) != 1 or key_matches[0].id != task.id:
+                return _GateResult(
+                    ok=False,
+                    message=(
+                        f"Workflow task_key={task_key!r} must identify exactly one "
+                        "Task and TaskSpec must reference that Task."
+                    ),
+                )
+            expected_metadata = {
+                "workflow_id": workflow_id,
+                "task_key": task_key,
+                "role": spec["role"],
+            }
+            mismatches = [
+                key
+                for key, expected in expected_metadata.items()
+                if str(task.metadata.get(key) or "") != expected
+            ]
+            if mismatches:
+                return _GateResult(
+                    ok=False,
+                    message=(
+                        f"Workflow task {task.id} has invalid metadata fields: "
+                        + ", ".join(mismatches)
+                    ),
+                )
+            if task.parent_id != root.id:
+                return _GateResult(
+                    ok=False,
+                    message=(
+                        f"Workflow task {task.id} must have parent_id={root.id}."
+                    ),
+                )
+            if task.owner != spec["owner"]:
+                return _GateResult(
+                    ok=False,
+                    message=(
+                        f"Workflow task {task.id} owner must be {spec['owner']!r}."
+                    ),
+                )
+            if task.status != "pending":
+                return _GateResult(
+                    ok=False,
+                    message=(
+                        f"PM-created workflow task {task.id} must remain pending "
+                        "until its role claims it."
+                    ),
+                )
+            resolved[task_key] = task
+
+        for task_key, spec in PLANNING_TASK_SPECS.items():
+            dependency_key = spec.get("blocked_by")
+            expected_blockers = (
+                [resolved[str(dependency_key)].id] if dependency_key else []
+            )
+            if resolved[task_key].blocked_by != expected_blockers:
+                return _GateResult(
+                    ok=False,
+                    message=(
+                        f"Workflow task {resolved[task_key].id} has invalid "
+                        f"blocked_by; expected {expected_blockers}."
+                    ),
+                )
+
+        return _GateResult(
+            ok=True,
+            message="ok",
+            data={
+                "root_task_id": root.id,
+                "task_ids": {
+                    key: resolved[key].id for key in PLANNING_TASK_SPECS
+                },
+            },
         )
 
     def _gate_implementation_report(
@@ -1589,6 +2376,8 @@ class SerialCodingWorkflow:
         initial_artifact_ids: set[str],
         before_versions: dict[str, int],
         phase_data: dict[str, Any],
+        *,
+        phase_key: str,
     ) -> _GateResult:
         gate = self._gate_required_artifacts(
             record.workflow_id,
@@ -1596,8 +2385,16 @@ class SerialCodingWorkflow:
             before_versions,
             required={"implementation_report": None},
         )
-        if not gate.ok or self.isolation != "worktree":
+        if not gate.ok:
             return gate
+        task_gate = self._gate_phase_task(record.workflow_id, phase_key)
+        if self.isolation != "worktree":
+            return _GateResult(
+                ok=task_gate.ok,
+                message=task_gate.message,
+                artifact_ids=gate.artifact_ids,
+                data=task_gate.data,
+            )
 
         report = self.artifact_manager.get_artifact(gate.artifact_ids[0])
         task_spec = self._latest_workflow_artifact(
@@ -1634,6 +2431,22 @@ class SerialCodingWorkflow:
         declared_files = self._metadata_file_list(raw_declared_files)
         actual_files = sorted(str(path) for path in after["changed_files"])
         changed_this_phase = before.get("diff_sha256") != after.get("diff_sha256")
+        report_snapshot = self._latest_artifact_snapshot(
+            phase_data,
+            report.id,
+            normalized_key="implementation_report_snapshot",
+        )
+        verification = [
+            dict(item)
+            for item in phase_data.get("verification") or []
+            if isinstance(item, dict)
+        ]
+        successful_verification = [
+            item
+            for item in verification
+            if item.get("outcome") in {"passed", "clean"}
+            and item.get("diff_sha256") == after.get("diff_sha256")
+        ]
         evidence = {
             "report_id": report.id,
             "change_required": change_required,
@@ -1645,6 +2458,9 @@ class SerialCodingWorkflow:
             "actual_changed_files": actual_files,
             "worktree_before": before,
             "worktree_after": after,
+            "report_snapshot": report_snapshot,
+            "verification": verification,
+            "fresh_successful_checks": len(successful_verification),
         }
 
         def failed(message: str) -> _GateResult:
@@ -1687,29 +2503,81 @@ class SerialCodingWorkflow:
                     "ImplementationReport declares outcome=changed, but the "
                     "Worktree contains no project file changes."
                 )
+            if not successful_verification:
+                return failed(
+                    "ImplementationReport describes a changed Worktree, but no "
+                    "successful run_tests/run_lint result is bound to the final "
+                    "Worktree Diff. Verify after the last mutation."
+                )
 
-        warning: str | None = None
-        if declared_files != actual_files:
-            self.artifact_manager.update_artifact(
-                report.id,
-                metadata={"changed_files": actual_files},
-                expected_version=report.version,
-                change_summary=(
-                    "Reconciled changed_files with authoritative Worktree evidence."
-                ),
+        if report_snapshot is None:
+            return failed(
+                "The implementation_report has no Orchestrator-captured write "
+                "snapshot. Create or update it after final verification."
             )
-            warning = (
+        if int(report_snapshot.get("version") or 0) != report.version:
+            return failed(
+                "The implementation_report version does not match its captured "
+                "write snapshot; read and update the current artifact version."
+            )
+        if report_snapshot.get("diff_sha256") != after.get("diff_sha256"):
+            return failed(
+                "The implementation_report was written for an older Worktree Diff. "
+                "Update it after the final mutation and verification."
+            )
+
+        metadata_updates: dict[str, Any] = {}
+        warnings: list[str] = []
+        if declared_files != actual_files:
+            metadata_updates["changed_files"] = actual_files
+            warnings.append(
                 "ImplementationReport changed_files differed from the Worktree; "
                 "the metadata was reconciled to the authoritative changed-file list."
             )
+        if report.metadata.get("worktree_diff_sha256") != after.get("diff_sha256"):
+            metadata_updates["worktree_diff_sha256"] = after.get("diff_sha256")
+        if metadata_updates:
+            report = self.artifact_manager.update_artifact(
+                report.id,
+                metadata=metadata_updates,
+                expected_version=report.version,
+                change_summary=(
+                    "Bound implementation evidence to authoritative Worktree state."
+                ),
+            )
             evidence["metadata_reconciled"] = True
+        normalized_snapshot = {
+            "artifact_id": report.id,
+            "kind": report.kind,
+            "version": report.version,
+            "run_id": phase_data.get("current_run_id"),
+            "step": report_snapshot.get("step"),
+            "diff_sha256": after.get("diff_sha256"),
+            "orchestrator_normalized": bool(metadata_updates),
+        }
+        evidence["report_snapshot"] = normalized_snapshot
+
+        combined_data = {
+            "implementation_evidence": evidence,
+            "implementation_report_snapshot": normalized_snapshot,
+            **task_gate.data,
+        }
+        if not task_gate.ok:
+            return _GateResult(
+                ok=False,
+                message=task_gate.message,
+                artifact_ids=gate.artifact_ids,
+                data=combined_data,
+            )
+
+        warning = " ".join(warnings) or None
 
         return _GateResult(
             ok=True,
             message=warning or "ok",
             artifact_ids=gate.artifact_ids,
             data={
-                "implementation_evidence": evidence,
+                **combined_data,
                 **({"gate_warning": warning} if warning else {}),
             },
         )
@@ -1765,6 +2633,8 @@ class SerialCodingWorkflow:
         initial_artifact_ids: set[str],
         before_versions: dict[str, int],
         phase_data: dict[str, Any],
+        *,
+        phase_key: str,
     ) -> _GateResult:
         gate = self._gate_required_artifacts(
             record.workflow_id,
@@ -1775,20 +2645,26 @@ class SerialCodingWorkflow:
         if not gate.ok:
             return gate
         artifact = self.artifact_manager.get_artifact(gate.artifact_ids[0])
-        verdict = str(artifact.metadata.get("verdict", "")).strip().lower()
-        if verdict not in {"pass", "fail"}:
+        reported_verdict = str(
+            artifact.metadata.get(
+                "reported_verdict",
+                artifact.metadata.get("verdict", ""),
+            )
+        ).strip().lower()
+        if reported_verdict not in {"pass", "fail"}:
             return _GateResult(
                 ok=False,
                 message=("test_report must set metadata.verdict to 'pass' or 'fail'."),
                 artifact_ids=[artifact.id],
             )
 
+        task_gate = self._gate_phase_task(record.workflow_id, phase_key)
         if self.isolation != "worktree":
             return _GateResult(
-                ok=True,
-                message="ok",
+                ok=task_gate.ok,
+                message=task_gate.message,
                 artifact_ids=[artifact.id],
-                data={"qa_verdict": verdict},
+                data={"qa_verdict": reported_verdict, **task_gate.data},
             )
 
         before = phase_data.get("worktree_before")
@@ -1808,7 +2684,10 @@ class SerialCodingWorkflow:
             and (current_run_id is None or item.get("run_id") == current_run_id)
         ]
         successful = [
-            item for item in verification if item.get("outcome") in {"passed", "clean"}
+            item
+            for item in verification
+            if item.get("outcome") in {"passed", "clean"}
+            and item.get("diff_sha256") == after.get("diff_sha256")
         ]
         failed = [
             item
@@ -1826,12 +2705,23 @@ class SerialCodingWorkflow:
         worktree_changed = isinstance(before, dict) and before.get(
             "diff_sha256"
         ) != after.get("diff_sha256")
+        report_snapshot = self._latest_artifact_snapshot(
+            phase_data,
+            artifact.id,
+            normalized_key="test_report_snapshot",
+        )
+        effective_verdict = (
+            "fail"
+            if reported_verdict == "pass" and actionable_failed
+            else reported_verdict
+        )
+        verdict_overridden = effective_verdict != reported_verdict
         evidence = {
             "report_id": artifact.id,
-            "verdict": verdict,
-            "reported_verdict": verdict,
-            "effective_verdict": verdict,
-            "verdict_overridden": False,
+            "verdict": effective_verdict,
+            "reported_verdict": reported_verdict,
+            "effective_verdict": effective_verdict,
+            "verdict_overridden": verdict_overridden,
             "verification": verification,
             "successful_checks": len(successful),
             "failed_checks": len(failed),
@@ -1840,8 +2730,9 @@ class SerialCodingWorkflow:
             "worktree_changed_during_qa": worktree_changed,
             "worktree_before": before,
             "worktree_after": after,
+            "report_snapshot": report_snapshot,
         }
-        if verdict == "pass" and worktree_changed:
+        if reported_verdict == "pass" and worktree_changed:
             return _GateResult(
                 ok=False,
                 message=(
@@ -1849,7 +2740,23 @@ class SerialCodingWorkflow:
                     "requires the Worktree to remain unchanged during QA."
                 ),
                 artifact_ids=[artifact.id],
-                data={"qa_verdict": verdict, "qa_evidence": evidence},
+                data={
+                    "qa_verdict": effective_verdict,
+                    "qa_evidence": evidence,
+                },
+            )
+        if not verification:
+            return _GateResult(
+                ok=False,
+                message=(
+                    "test_report has no structured run_tests/run_lint evidence in "
+                    "this QA attempt."
+                ),
+                artifact_ids=[artifact.id],
+                data={
+                    "qa_verdict": effective_verdict,
+                    "qa_evidence": evidence,
+                },
             )
         if failed and not actionable_failed:
             return _GateResult(
@@ -1860,45 +2767,120 @@ class SerialCodingWorkflow:
                     "routing work to Engineer."
                 ),
                 artifact_ids=[artifact.id],
-                data={"qa_verdict": verdict, "qa_evidence": evidence},
+                data={
+                    "qa_verdict": effective_verdict,
+                    "qa_evidence": evidence,
+                },
             )
-        if verdict == "pass" and actionable_failed:
+        if reported_verdict == "pass" and not successful and not actionable_failed:
+            return _GateResult(
+                ok=False,
+                message=(
+                    "test_report declares verdict=pass, but no successful "
+                    "run_tests or run_lint result is bound to the final Worktree Diff."
+                ),
+                artifact_ids=[artifact.id],
+                data={
+                    "qa_verdict": effective_verdict,
+                    "qa_evidence": evidence,
+                },
+            )
+        if report_snapshot is None:
+            return _GateResult(
+                ok=False,
+                message=(
+                    "The test_report has no Orchestrator-captured write snapshot. "
+                    "Create or update it after the last verification call."
+                ),
+                artifact_ids=[artifact.id],
+                data={
+                    "qa_verdict": effective_verdict,
+                    "qa_evidence": evidence,
+                },
+            )
+        if int(report_snapshot.get("version") or 0) != artifact.version:
+            return _GateResult(
+                ok=False,
+                message=(
+                    "The test_report version does not match its captured write "
+                    "snapshot; update the current artifact version."
+                ),
+                artifact_ids=[artifact.id],
+                data={
+                    "qa_verdict": effective_verdict,
+                    "qa_evidence": evidence,
+                },
+            )
+        if report_snapshot.get("diff_sha256") != after.get("diff_sha256"):
+            return _GateResult(
+                ok=False,
+                message=(
+                    "The test_report was written for an older Worktree Diff. "
+                    "Update it after final verification."
+                ),
+                artifact_ids=[artifact.id],
+                data={
+                    "qa_verdict": effective_verdict,
+                    "qa_evidence": evidence,
+                },
+            )
+
+        warning: str | None = None
+        if reported_verdict == "pass" and actionable_failed:
             warning = (
                 "test_report declared verdict=pass, but machine verification "
                 "reported a failure, issue, timeout, or execution error; the "
                 "effective QA verdict was downgraded to fail."
             )
-            evidence = {
-                **evidence,
-                "verdict": "fail",
-                "effective_verdict": "fail",
-                "verdict_overridden": True,
-            }
-            return _GateResult(
-                ok=True,
-                message=warning,
-                artifact_ids=[artifact.id],
-                data={
-                    "qa_verdict": "fail",
-                    "qa_evidence": evidence,
-                    "gate_warning": warning,
-                },
+        metadata_updates = {
+            key: value
+            for key, value in {
+                "reported_verdict": reported_verdict,
+                "verdict": effective_verdict,
+                "effective_verdict": effective_verdict,
+                "verdict_overridden": verdict_overridden,
+                "tested_diff_sha256": after.get("diff_sha256"),
+            }.items()
+            if artifact.metadata.get(key) != value
+        }
+        if metadata_updates:
+            artifact = self.artifact_manager.update_artifact(
+                artifact.id,
+                metadata=metadata_updates,
+                expected_version=artifact.version,
+                change_summary=(
+                    "Normalized QA verdict and bound it to authoritative verification."
+                ),
             )
-        if verdict == "pass" and not successful:
+        normalized_snapshot = {
+            "artifact_id": artifact.id,
+            "kind": artifact.kind,
+            "version": artifact.version,
+            "run_id": phase_data.get("current_run_id"),
+            "step": report_snapshot.get("step"),
+            "diff_sha256": after.get("diff_sha256"),
+            "orchestrator_normalized": bool(metadata_updates),
+        }
+        evidence["report_snapshot"] = normalized_snapshot
+        data = {
+            "qa_verdict": effective_verdict,
+            "qa_evidence": evidence,
+            "test_report_snapshot": normalized_snapshot,
+            **task_gate.data,
+            **({"gate_warning": warning} if warning else {}),
+        }
+        if not task_gate.ok:
             return _GateResult(
                 ok=False,
-                message=(
-                    "test_report declares verdict=pass, but no successful "
-                    "run_tests or run_lint result was recorded in this attempt."
-                ),
+                message=task_gate.message,
                 artifact_ids=[artifact.id],
-                data={"qa_verdict": verdict, "qa_evidence": evidence},
+                data=data,
             )
         return _GateResult(
             ok=True,
-            message="ok",
+            message=warning or "ok",
             artifact_ids=[artifact.id],
-            data={"qa_verdict": verdict, "qa_evidence": evidence},
+            data=data,
         )
 
     def _gate_acceptance_report(
@@ -1908,6 +2890,7 @@ class SerialCodingWorkflow:
         before_versions: dict[str, int],
         *,
         qa_verdict: str | None,
+        phase_key: str,
     ) -> _GateResult:
         gate = self._gate_required_artifacts(
             workflow_id,
@@ -1940,9 +2923,8 @@ class SerialCodingWorkflow:
                 artifact_ids=[artifact.id],
             )
 
-        accepted = artifact.status == "accepted"
-        if accepted != (verdict == "pass"):
-            required_status = "accepted" if verdict == "pass" else "not accepted"
+        required_status = "accepted" if verdict == "pass" else "ready"
+        if artifact.status != required_status:
             return _GateResult(
                 ok=False,
                 message=(
@@ -1951,11 +2933,12 @@ class SerialCodingWorkflow:
                 ),
                 artifact_ids=[artifact.id],
             )
+        task_gate = self._gate_phase_task(workflow_id, phase_key)
         return _GateResult(
-            ok=True,
-            message="ok",
+            ok=task_gate.ok,
+            message=task_gate.message,
             artifact_ids=[artifact.id],
-            data={"acceptance_verdict": verdict},
+            data={"acceptance_verdict": verdict, **task_gate.data},
         )
 
     def _artifact_from_ids(
@@ -2173,6 +3156,12 @@ class SerialCodingWorkflow:
             worktree=worktree,
             error=error,
         )
+        self._close_workflow_root_task(
+            workflow_id,
+            status=status,
+            qa_verdict=qa_verdict,
+            error=error,
+        )
         if record is not None and self.workflow_store is not None:
             self.workflow_store.mark_finished(
                 record,
@@ -2296,6 +3285,95 @@ class SerialCodingWorkflow:
                 return self._phase_result_from_dict(item)
         return None
 
+    @staticmethod
+    def _phase_result_is_trusted(
+        record: WorkflowRunRecord,
+        phase_key: str,
+        result: WorkflowPhaseResult,
+    ) -> bool:
+        checkpoint = record.checkpoints.get(phase_key)
+        return bool(
+            result.status == "completed"
+            and checkpoint is not None
+            and checkpoint.status == "completed"
+            and result.data.get("agent_status") == "completed"
+            and checkpoint.data.get("agent_status") == "completed"
+        )
+
+    @staticmethod
+    def _expected_phase_keys(record: WorkflowRunRecord) -> list[str]:
+        keys = ["pm_plan", "engineer_implement", "qa_verify"]
+        for cycle in range(1, record.fix_cycles + 1):
+            keys.extend([f"engineer_fix_{cycle}", f"qa_regression_{cycle}"])
+        keys.append("pm_acceptance")
+        return keys
+
+    def _completed_record_is_trusted(self, record: WorkflowRunRecord) -> bool:
+        if record.status != "completed":
+            return False
+        results = {
+            str(item.get("phase_key") or ""): self._phase_result_from_dict(item)
+            for item in record.phases
+        }
+        return all(
+            phase_key in results
+            and self._phase_result_is_trusted(
+                record,
+                phase_key,
+                results[phase_key],
+            )
+            for phase_key in self._expected_phase_keys(record)
+        )
+
+    def _invalidate_untrusted_phase_suffix(
+        self,
+        record: WorkflowRunRecord,
+    ) -> None:
+        phase_items = list(record.phases)
+        bad_index: int | None = None
+        bad_key: str | None = None
+        for index, item in enumerate(phase_items):
+            phase_key = str(item.get("phase_key") or "")
+            result = self._phase_result_from_dict(item)
+            if not self._phase_result_is_trusted(record, phase_key, result):
+                bad_index = index
+                bad_key = phase_key
+                break
+
+        if bad_index is None:
+            present = {
+                str(item.get("phase_key") or "") for item in phase_items
+            }
+            for phase_key in self._expected_phase_keys(record):
+                if phase_key not in present:
+                    bad_index = len(phase_items)
+                    bad_key = phase_key
+                    break
+
+        if bad_index is None:
+            return
+        removed_keys = {
+            str(item.get("phase_key") or "")
+            for item in phase_items[bad_index:]
+        }
+        record.phases = phase_items[:bad_index]
+        for phase_key in removed_keys:
+            if phase_key != bad_key:
+                record.checkpoints.pop(phase_key, None)
+        checkpoint = record.checkpoints.get(bad_key or "")
+        if checkpoint is not None:
+            checkpoint.status = "running"
+            checkpoint.completed_at = None
+            checkpoint.error = (
+                "Persisted phase completion was invalid because agent_status was "
+                "not completed. Continue from its checkpoint."
+            )
+        record.status = "interrupted"
+        record.current_phase_key = bad_key
+        record.current_phase = checkpoint.phase if checkpoint is not None else None
+        record.error = checkpoint.error if checkpoint is not None else None
+        self._save_record(record)
+
     def _record_phase_results(
         self,
         record: WorkflowRunRecord,
@@ -2386,6 +3464,12 @@ class SerialCodingWorkflow:
                 issue,
                 handoff,
             )
+            checkpoint = handoff.get("checkpoint")
+            checkpoint_context = (
+                json.dumps(checkpoint, ensure_ascii=False, indent=2)
+                if isinstance(checkpoint, dict)
+                else "{}"
+            )
             handoff_context = (
                 "\n\n<working_state>\n"
                 f"{working_state}\n"
@@ -2394,7 +3478,10 @@ class SerialCodingWorkflow:
                 "This bounded checkpoint describes the previous attempt. The "
                 "current workspace and fresh tool evidence remain authoritative.\n"
                 f"{json.dumps(handoff, ensure_ascii=False, indent=2)}\n"
-                "</attempt_handoff>"
+                "</attempt_handoff>\n\n"
+                "<attempt_checkpoint>\n"
+                f"{checkpoint_context}\n"
+                "</attempt_checkpoint>"
             )
         return (
             f"The {phase} phase did not satisfy its completion evidence gate.\n"
@@ -2409,6 +3496,15 @@ class SerialCodingWorkflow:
 
     @staticmethod
     def _handoff_changed_files(handoff: dict[str, Any]) -> list[str]:
+        checkpoint = handoff.get("checkpoint")
+        if isinstance(checkpoint, dict):
+            changed_files = [
+                str(path)
+                for path in checkpoint.get("changed_files") or []
+                if str(path).strip()
+            ]
+            if changed_files:
+                return changed_files
         worktree = handoff.get("worktree")
         if not isinstance(worktree, dict):
             return []
@@ -2433,6 +3529,22 @@ class SerialCodingWorkflow:
             "Existing Worktree changes: "
             + (", ".join(changed_files) if changed_files else "none"),
         ]
+        checkpoint = handoff.get("checkpoint")
+        if isinstance(checkpoint, dict):
+            for label, key in (
+                ("Completed work", "completed"),
+                ("Remaining work", "remaining"),
+                ("Next actions", "next_actions"),
+                ("Decisions", "decisions"),
+                ("Blockers", "blockers"),
+            ):
+                values = [
+                    str(value).strip()
+                    for value in checkpoint.get(key) or []
+                    if str(value).strip()
+                ]
+                if values:
+                    lines.append(f"{label}: " + "; ".join(values))
 
         failed_checks = []
         for check in handoff.get("verification") or []:
@@ -2501,6 +3613,21 @@ class SerialCodingWorkflow:
         {request}
 
         Required actions:
+        - Call task_list first and find the in_progress orchestrator root task whose
+          metadata.task_key is "workflow_root". Never guess a task id from another
+          workflow.
+        - Under that root, create exactly three pending session tasks for
+          engineer_implement, qa_verify, and pm_acceptance. Give them owners
+          "engineer", "qa", and "pm-acceptance" respectively. Every child must
+          have metadata.workflow_id="{workflow_id}", metadata.task_key equal to its
+          phase key, and metadata.role equal to "engineer", "qa", or
+          "pm_acceptance".
+        - Give every child an actionable description: required deliverables,
+          relevant scope or files when known, completion criteria, verification,
+          and any dependency or backend-contract constraints. Tasks are the live
+          execution state, not title-only placeholders.
+        - Set qa_verify blocked_by=[engineer task id] and pm_acceptance
+          blocked_by=[qa task id]. Do not claim or complete role tasks for them.
         - Create the required PRD and TaskSpec before optional repository
           exploration. The user request is the primary planning input.
         - Create one artifact with kind="prd" and status="ready".
@@ -2508,8 +3635,11 @@ class SerialCodingWorkflow:
         - Include metadata.workflow_id="{workflow_id}" and metadata.role="pm".
         - On TaskSpec, set metadata.change_required to true when tracked project
           files must change, or false only for verify-only/no-code work.
-        - You may create project tasks if useful, but the artifact gate requires the PRD
-        and TaskSpec artifacts.
+        - On TaskSpec, set metadata.task_ids to an object mapping
+          engineer_implement, qa_verify, and pm_acceptance to the exact Task ids
+          created above.
+        - If a retry finds an existing valid child, reuse it and update TaskSpec;
+          never create a duplicate metadata.task_key.
         - After both required artifacts are created successfully, stop calling tools
           and return a concise status summary.
         - Do not modify source files.
@@ -2562,6 +3692,9 @@ Required actions:
   manifests and lockfiles, or use a virtual environment inside the Worktree.
 - Keep dependency manifests and lockfiles consistent. For a uv project, use uv add
   or uv lock inside the Worktree instead of editing only pyproject.toml.
+- After the final source/configuration mutation, run focused verification against
+  that exact final diff. Create or update the implementation_report only after the
+  final verification so the Orchestrator can bind both to one Worktree hash.
 - Create or update one artifact with kind="implementation_report".
 - Include metadata.workflow_id="{workflow_id}" and metadata.role="engineer".
 - Set metadata.outcome exactly to "changed", "no_change", or "blocked".
@@ -2598,6 +3731,8 @@ Required actions:
 - Do not modify source files.
 - Run focused verification using run_tests and/or run_lint. Treat their structured
   outcomes as authoritative over prose reports or assumptions.
+- Create or update the test_report only after the last verification call; the
+  Orchestrator binds the report and checks to the exact tested Worktree hash.
 - Set verdict="pass" only when this attempt has at least one passed/clean check,
   every verification call completed successfully, and QA did not change source files.
 - Set verdict="fail" for failed tests, lint issues, timeouts, or execution errors.
@@ -2642,7 +3777,8 @@ Required actions:
 - If metadata.verdict is "pass", create the report with status="accepted" and
   state the supporting evidence.
 - If metadata.verdict is "fail", do not use status="accepted"; state that the
-  workflow is rejected or blocked and list the concrete blockers.
+  workflow is rejected or blocked, create it with status="ready", and list the
+  concrete blockers.
 - Do not modify source files.
 """.strip()
 

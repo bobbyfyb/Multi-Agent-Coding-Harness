@@ -19,6 +19,7 @@ class ArtifactContextHook:
     max_content_chars: int = 3_000
     task_list_id: str = "default"
     task_workdir: Path | str | None = None
+    workflow_id: str | None = None
 
     def __call__(self, context: HookContext) -> HookResult | None:
         artifacts = self._select_artifacts(context)
@@ -38,6 +39,13 @@ class ArtifactContextHook:
     def _select_artifacts(self, context: HookContext) -> list[Artifact]:
         open_task_ids = self._open_task_ids(context)
         artifacts = self.manager.list_artifacts(include_archived=False)
+        if self.workflow_id is not None:
+            artifacts = [
+                artifact
+                for artifact in artifacts
+                if artifact.metadata.get("workflow_id") is None
+                or str(artifact.metadata.get("workflow_id")) == self.workflow_id
+            ]
         ranked = sorted(
             artifacts,
             key=lambda artifact: (

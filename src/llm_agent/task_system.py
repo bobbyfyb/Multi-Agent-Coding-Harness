@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import re
 from typing import Any, Literal
 
 
@@ -19,6 +20,30 @@ TASK_STATUSES: set[str] = {
 }
 TASK_SCOPES: set[str] = {"session", "project"}
 OPEN_TASK_STATUSES = {"pending", "in_progress", "blocked"}
+TASK_SUMMARY_FIELD_CHARS = 240
+TASK_SUMMARY_MAX_CHARS = 4_000
+TASK_SUMMARY_SECRET_PATTERNS = (
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"),
+    re.compile(
+        r"(?i)\b(api[_-]?key|access[_-]?token|password|secret)"
+        r"\s*[:=]\s*[^\s,;]+"
+    ),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*-----"),
+)
+
+_ALLOWED_UPDATE_TRANSITIONS: dict[str, set[str]] = {
+    "pending": {"pending", "in_progress", "blocked", "cancelled"},
+    "in_progress": {
+        "pending",
+        "in_progress",
+        "completed",
+        "blocked",
+        "cancelled",
+    },
+    "blocked": {"pending", "in_progress", "blocked", "cancelled"},
+    "completed": {"completed"},
+    "cancelled": {"cancelled"},
+}
 
 
 class TaskSystemError(RuntimeError):
@@ -80,6 +105,7 @@ class TaskStore:
 
     def __post_init__(self) -> None:
         self.tasks_dir = Path(self.tasks_dir).resolve()
+        _validate_task_list_id(self.task_list_id)
         self.list_dir.mkdir(parents=True, exist_ok=True)
 
     @classmethod
@@ -230,9 +256,19 @@ class TaskManager:
             task.description = description.strip()
         if status is not None:
             resolved_status = _validate_status(status)
+            if resolved_status not in _ALLOWED_UPDATE_TRANSITIONS[task.status]:
+                raise TaskSystemError(
+                    f"Cannot change task {task.id} status from {task.status} "
+                    f"to {resolved_status}."
+                )
             if resolved_status == "in_progress" and not self.can_start(task.id):
                 raise TaskSystemError(
                     f"Task {task.id} is blocked by unfinished dependencies."
+                )
+            completion_evidence = evidence if evidence is not None else task.evidence
+            if resolved_status == "completed" and not _has_text(completion_evidence):
+                raise TaskSystemError(
+                    f"Task {task.id} requires evidence before it can be completed."
                 )
             task.status = resolved_status
         if scope is not None:
@@ -246,6 +282,10 @@ class TaskManager:
         if priority is not None:
             task.priority = priority
         if evidence is not None:
+            if task.status == "completed" and not _has_text(evidence):
+                raise TaskSystemError(
+                    f"Task {task.id} requires evidence while completed."
+                )
             task.evidence = evidence
         if notes is not None:
             task.notes = notes
@@ -284,6 +324,12 @@ class TaskManager:
                 f"Task {task_id} is {task.status}, only in_progress tasks can be completed."
             )
 
+        completion_evidence = evidence if evidence is not None else task.evidence
+        if not _has_text(completion_evidence):
+            raise TaskSystemError(
+                f"Task {task.id} requires evidence before it can be completed."
+            )
+
         task.status = "completed"
         if evidence is not None:
             task.evidence = evidence
@@ -316,21 +362,31 @@ class TaskManager:
         scope: TaskScope | None = None,
         include_completed: bool = False,
         limit: int = 12,
+        max_field_chars: int = TASK_SUMMARY_FIELD_CHARS,
+        max_chars: int = TASK_SUMMARY_MAX_CHARS,
     ) -> str:
         tasks = self.list_tasks(scope=scope, include_completed=include_completed)
         if not tasks:
             return "No tasks."
 
-        lines = []
+        lines: list[str] = []
         for task in tasks[:limit]:
             owner = f" owner={task.owner}" if task.owner else ""
             deps = f" blocked_by={','.join(task.blocked_by)}" if task.blocked_by else ""
             lines.append(
                 f"- {task.id} [{task.status}/{task.scope}]{owner}{deps}: {task.title}"
             )
+            for label, value in (
+                ("description", task.description),
+                ("notes", task.notes),
+                ("evidence", task.evidence),
+            ):
+                preview = _task_summary_preview(value, limit=max_field_chars)
+                if preview:
+                    lines.append(f"  {label}: {preview}")
         if len(tasks) > limit:
             lines.append(f"... ({len(tasks) - limit} more tasks)")
-        return "\n".join(lines)
+        return _truncate_summary("\n".join(lines), limit=max_chars)
 
 
 def format_task(task: Task) -> str:
@@ -373,6 +429,16 @@ def _validate_scope(scope: Any) -> TaskScope:
     return scope
 
 
+def _validate_task_list_id(task_list_id: str) -> None:
+    if (
+        not task_list_id
+        or task_list_id in {".", ".."}
+        or "/" in task_list_id
+        or "\\" in task_list_id
+    ):
+        raise TaskSystemError(f"Invalid task list id: {task_list_id!r}")
+
+
 def _normalize_string_list(value: Any, field_name: str) -> list[str]:
     if not isinstance(value, list):
         raise TaskSystemError(f"{field_name} must be a list.")
@@ -389,6 +455,35 @@ def _optional_str(value: Any) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _has_text(value: str | None) -> bool:
+    return bool(value and value.strip())
+
+
+def _task_summary_preview(value: str | None, *, limit: int) -> str:
+    if not value or limit <= 0:
+        return ""
+    sanitized = value
+    for pattern in TASK_SUMMARY_SECRET_PATTERNS:
+        sanitized = pattern.sub("[REDACTED]", sanitized)
+    compact = re.sub(r"\s+", " ", sanitized).strip()
+    if len(compact) <= limit:
+        return compact
+    if limit <= 3:
+        return "." * limit
+    return compact[: limit - 3].rstrip() + "..."
+
+
+def _truncate_summary(value: str, *, limit: int) -> str:
+    if limit <= 0:
+        return ""
+    if len(value) <= limit:
+        return value
+    suffix = "\n... (task summary truncated)"
+    if limit <= len(suffix):
+        return suffix[-limit:]
+    return value[: limit - len(suffix)].rstrip() + suffix
 
 
 __all__ = [

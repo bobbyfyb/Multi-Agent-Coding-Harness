@@ -2,12 +2,14 @@ from pathlib import Path
 from typing import Any
 
 from llm_agent.agent import Agent, AgentEvent
+from llm_agent.artifact_system import ArtifactManager
 from llm_agent.hooks import (
     HookContext,
     HookManager,
     HookResult,
     build_default_hook_manager,
 )
+from llm_agent.hooks.artifact_hooks import ArtifactContextHook
 from llm_agent.hooks.permission_hooks import AutoApprovalProvider, PermissionHook
 from llm_agent.hooks.task_hooks import TaskPlanningHook
 from llm_agent.llm_client import LLMResponse, LLMToolCall
@@ -464,6 +466,23 @@ def test_default_hook_manager_builds_llm_intent_classifier(tmp_path: Path) -> No
     assert isinstance(planning_hook, TaskPlanningHook)
     assert isinstance(planning_hook.intent_classifier, TaskIntentClassifier)
     assert planning_hook.intent_classifier.llm is llm
+
+
+def test_default_hook_manager_uses_requested_task_list(tmp_path: Path) -> None:
+    manager = build_default_hook_manager(
+        workdir=tmp_path,
+        task_list_id="run-isolated",
+        workflow_id="run-isolated",
+        artifact_manager=ArtifactManager.for_workdir(tmp_path),
+    )
+
+    planning_hook, artifact_hook = manager.hooks["BeforeLLM"][:2]
+
+    assert isinstance(planning_hook, TaskPlanningHook)
+    assert planning_hook.task_list_id == "run-isolated"
+    assert isinstance(artifact_hook, ArtifactContextHook)
+    assert artifact_hook.task_list_id == "run-isolated"
+    assert artifact_hook.workflow_id == "run-isolated"
 
 
 def test_task_planning_hook_reinjects_task_state_after_compaction(

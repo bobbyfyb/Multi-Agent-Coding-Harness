@@ -702,22 +702,53 @@ roles:
 .llm_agent/workflows/<workflow_id>/run.json
 ```
 
+每个 Workflow 同时使用独立 Task list：
+
+```text
+.llm_agent/tasks/<workflow_id>/
+```
+
+Orchestrator 会幂等创建并认领一个 `workflow_root` task。PM 必须在该 root 下创建
+`engineer_implement`、`qa_verify` 和 `pm_acceptance` 三个 pending 子任务，在
+TaskSpec 的 `metadata.task_ids` 中记录真实 ID，并建立 Engineer -> QA -> Acceptance
+依赖。Planning gate 会校验 task ID、owner、parent、role metadata、初始状态和依赖，
+因此 TaskSpec Artifact 不能再代替真实 Task。Fix cycle 的 Engineer / QA Regression
+task 由 Orchestrator 按同一规则补建，并把 Acceptance 依赖重定向到最新 QA task。
+
+每个角色开始 phase 时会收到唯一 phase task contract：pending task 必须先
+`task_claim`，phase 完成前必须通过 `task_complete` 写入非空 evidence。Artifact gate
+也会检查对应 task 已由正确 owner 完成且存在证据；不能用 `task_update` 从 pending
+直接跳到 completed。成功 Workflow 会带最终 Workflow/QA 状态 evidence 完成 root
+task，失败 Workflow 则把 root 标记为 blocked。PM、Engineer、QA 和 PM Acceptance
+都能访问同一 workflow-scoped Task list，但 PM Planning 只创建下游任务，不替下游
+角色 claim 或 complete。
+
 Workflow 恢复采用 checkpoint 策略，而不是完整 message replay。系统保存每个
-phase 开始前的 artifact versions、Worktree Diff 基线和验证工具结果；如果进程
-中断后 completion gate 已经满足，resume 会补写该 phase completed 并继续后续
-阶段。否则会从该 phase 重新运行。
+phase 开始前的 artifact versions、Worktree Diff 基线和验证工具结果。只有 phase
+result、phase checkpoint 和 `data.agent_status` 都明确为 `completed` 的完成记录才会
+被 Resume 信任；`max_steps`、`incomplete`、`interrupted` 或缺失状态不能仅凭 Artifact
+gate 被恢复为完成，已有错误完成记录还会失效其后续 phase 并从当前 Worktree 继续。
 Run Record 同时保存 `worktree_id` 和 `worktree_base_commit`；Resume 会复用原
 Worktree，若隔离目录已经丢失则明确失败，不会静默创建新目录并丢弃中间修改。
 
 近期动作会滚动写入 checkpoint 的 `current_attempt_state`；attempt 正常结束或失败
-时再固化为有界的 `data.attempt_handoffs`，记录最后状态摘要、门禁失败原因、工具
-计数、近期动作与失败、结构化验证结果及 Worktree changed files。下一次 Retry
-或 `/workflow-resume` 会先将这些事实整理为精简的 `working_state`，再连同最新
-handoff 注入角色 prompt，并要求从现有工作区继续；Trace 会记录
-`workflow.working_context.injected`，CLI 也会显示恢复的 attempt 和 changed-file 数量；
-进程被强制中断时也会先把滚动状态恢复成 interrupted handoff。该机制不会回放
-完整历史，也不会把临时进展混入长期 Memory。每个 Workflow 角色额外保留最近
-8 个完整工具结果，更早的结构化结果压缩后仍保留 outcome、路径、摘要或短预览。
+时再固化为有界 `AttemptCheckpoint` 和 `data.attempt_handoffs`。Checkpoint 限额保存
+`objective / completed / remaining / next_actions / decisions / blockers`、open tasks、
+artifact IDs、工具计数、近期动作与失败、结构化验证、changed files 和 Diff SHA；
+即使角色没有产出理想总结，Orchestrator 也会从确定性运行状态构造可继续的语义字段。
+
+同 phase 的 gate retry 或 `/workflow-resume` 会注入最新 attempt checkpoint；新一轮
+Engineer Fix 会继承最近 Engineer phase 的 checkpoint，QA Regression 会继承最近 QA
+phase 的 checkpoint。两种 continuity 都复用现有 Task、Artifact 和 Worktree，并要求
+避免重新做宽泛仓库探索。Trace 的 `workflow.working_context.injected` 会记录来源
+phase/run/attempt 与 context kind。该机制不会回放完整历史，也不会把临时进展混入
+长期 Memory。每个 Workflow 角色额外保留最近 8 个完整工具结果，更早的结构化结果
+压缩后仍保留 outcome、路径、摘要或短预览。
+
+任何 `agent_status != completed` 的 attempt 都不能完成 phase；即使 Artifact gate
+已通过，有剩余 retry 预算时也必须 continuation，预算耗尽则 phase 明确失败。只有
+后续 attempt 正常结束且所有 Task、Artifact、Diff 和验证门禁同时通过，Workflow
+Store 才接受 completed phase。
 
 ## Workflow Evidence Gates
 
@@ -726,36 +757,47 @@ handoff 注入角色 prompt，并要求从现有工作区继续；Trace 会记�
 `run_lint` 的结构化结果是验证事实。
 
 - PM 的 TaskSpec 必须设置布尔值 `metadata.change_required`。
+- PM 的 TaskSpec 必须通过 `metadata.task_ids` 引用当前 Workflow Task list 中三个
+  真实的角色子任务；对应 phase task 必须由正确角色 claim，并在完成时写入 evidence。
 - Engineer 的 ImplementationReport 必须设置 `metadata.outcome`；
   `outcome=changed` 要求该阶段的 Diff 哈希确实变化。`metadata.changed_files`
   会与 Worktree 事实对账，不一致时由 Orchestrator 自动校正并记录 warning，避免
   机器已经掌握的文件清单抄写错误直接报废整个阶段。
+- 每次 `run_tests / run_lint` 和 ImplementationReport/TestReport 写入都会绑定当时的
+  Worktree Diff SHA。`outcome=changed` 必须有针对最终 Diff 的成功验证，报告写入快照
+  也必须对应同一最终 Diff；报告版本或 Diff SHA 过期会要求继续当前 phase，而不会
+  接受陈旧成功声明。
 - `outcome=no_change` 只允许用于 `change_required=false`，并要求提供
   `metadata.no_change_reason`。
 - QA 的 `metadata.verdict=pass` 至少需要一次当前尝试中成功的 `run_tests` 或
-  `run_lint`，且不能同时存在失败、超时或工具错误，也不能在 QA 阶段改变 Patch。
+  `run_lint`，成功验证与 TestReport 必须绑定最终 tested Diff，且不能同时存在失败、
+  超时或工具错误，也不能在 QA 阶段改变 Patch。
 - 如果 QA 报告声称 `pass`，但测试、Lint、超时或执行错误等机器证据表明失败，
-  编排器会把有效 verdict 降级为 `fail` 并进入 Engineer Fix；报告值和有效值都会
-  保存在 checkpoint。未声明依赖和过期 lockfile 属于 Engineer 可修复证据；纯
+  编排器会把有效 verdict 降级为 `fail` 并进入 Engineer Fix，同时把 TestReport
+  规范化为 `reported_verdict=pass`、`verdict=effective_verdict=fail`、
+  `verdict_overridden=true` 和 `tested_diff_sha256`。后续角色读取 Artifact 时看到的是
+  权威有效结论，而原始自报值仍可审计。未声明依赖和过期 lockfile 属于 Engineer
+  可修复证据；纯
   权限、工具调用或项目环境同步错误留在 QA 重试，避免误导 Engineer。
 - 编排器把最终证据摘要注入 PM Acceptance。AcceptanceReport 必须设置与权威
   QA 结论一致的 `metadata.verdict`；只有 `verdict=pass` 可以使用
-  `status=accepted`，冲突时该阶段会携带纠错上下文重试。
+  `status=accepted`，`verdict=fail` 必须使用 `status=ready`；冲突时该阶段会携带
+  纠错上下文重试。
 
 示例 Artifact metadata：
 
 ```json
-{"change_required": true}
-{"outcome": "changed", "changed_files": ["src/app.py", "tests/test_app.py"]}
-{"verdict": "pass"}
+{"change_required": true, "task_ids": {"engineer_implement": "task_0002", "qa_verify": "task_0003", "pm_acceptance": "task_0004"}}
+{"outcome": "changed", "changed_files": ["src/app.py", "tests/test_app.py"], "worktree_diff_sha256": "..."}
+{"reported_verdict": "pass", "verdict": "fail", "effective_verdict": "fail", "verdict_overridden": true, "tested_diff_sha256": "..."}
 ```
 
-最后一行同时适用于 TestReport 和 AcceptanceReport；AcceptanceReport verdict
-为 `pass` 时，Artifact 自身的 `status` 还必须为 `accepted`。
+AcceptanceReport 使用 `metadata.verdict`；`pass` 时 Artifact status 必须为
+`accepted`，`fail` 时必须为 `ready`。
 
 Diff 快照和验证结果会立即写入 phase checkpoint，因此中断恢复不依赖 Trace 或
-模型记忆。`shared` 模式没有独立 Diff 事实源，只保留原有 Artifact/verdict 门禁，
-主要用于非 Git 目录兼容；需要完整证据链时应使用默认 `worktree` 模式。
+模型记忆。`shared` 模式没有独立 Diff 事实源，只保留 Task、Artifact 和 verdict
+门禁，主要用于非 Git 目录兼容；需要完整证据链时应使用默认 `worktree` 模式。
 
 CLI 命令：
 

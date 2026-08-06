@@ -175,6 +175,8 @@ def build_default_hook_manager(
     *,
     workdir: Path | str | None = None,
     task_workdir: Path | str | None = None,
+    task_list_id: str = "default",
+    workflow_id: str | None = None,
     approval_provider: Any | None = None,
     llm: Any | None = None,
     memory_manager: "MemoryManager | None" = None,
@@ -197,6 +199,7 @@ def build_default_hook_manager(
         "BeforeLLM",
         TaskPlanningHook(
             workdir=workdir if task_workdir is None else task_workdir,
+            task_list_id=task_list_id,
             intent_classifier=intent_classifier,
         ),
     )
@@ -208,6 +211,8 @@ def build_default_hook_manager(
                 task_workdir=(
                     workdir if task_workdir is None else task_workdir
                 ),
+                task_list_id=task_list_id,
+                workflow_id=workflow_id,
             ),
         )
     if memory_manager is not None:

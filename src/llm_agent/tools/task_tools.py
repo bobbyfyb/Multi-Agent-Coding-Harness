@@ -266,7 +266,7 @@ def task_tool_definitions(
                     "evidence": {"type": "string"},
                     "notes": {"type": "string"},
                 },
-                "required": ["task_id"],
+                "required": ["task_id", "evidence"],
             },
             func=tools.task_complete,
         ),

@@ -147,6 +147,10 @@ OAuth、并行 Agent Team、复杂 Web UI、向量数据库记忆和完整 MCP �
 - [x] 实现 `task_complete`
 - [x] 实现基于状态的 `TaskPlanningHook`
 - [x] 在 `BeforeLLM` 阶段注入当前 task summary / planning reminder
+- [x] Task list 可由调用方指定 `task_list_id`，Workflow 按 `workflow_id` 隔离任务
+- [x] 收紧 Task 状态转换，禁止 pending 直接 completed 和 completed 任务重新打开
+- [x] `task_complete` 与 completed 状态强制要求非空验证 evidence
+- [x] Task summary 有界注入 description / notes / evidence，并对疑似密钥脱敏
 
 ### 2.7 测试与文档
 
@@ -424,24 +428,44 @@ Web UI 可以继续复用同一个 Agent、Hook 和 Event 边界。
 - [x] Artifact gate 检查每个阶段是否新建或更新了必需 artifact
 - [x] QA gate 要求 `metadata.verdict` 明确为 `pass` 或 `fail`
 - [x] TaskSpec 要求声明布尔值 `metadata.change_required`
+- [x] 每个 Workflow 使用 `.llm_agent/tasks/<workflow_id>/` 独立 Task list
+- [x] Orchestrator 幂等创建并认领 `workflow_root` task，成功时完成、失败时 blocked
+- [x] PM 必须创建 Engineer / QA / PM Acceptance 三个 pending 子任务，并在
+  TaskSpec `metadata.task_ids` 中记录真实 ID
+- [x] Planning gate 校验 PM 子任务的 owner、parent、role metadata、pending 状态和依赖
+- [x] 每个执行 phase 注入唯一 task contract，角色必须 claim 后再以非空 evidence 完成
+- [x] Fix cycle 由 Orchestrator 创建 Engineer Fix / QA Regression task，并把 Acceptance
+  依赖重定向到最新 QA task
 - [x] Worktree phase 记录前后 Diff SHA、changed files，并持久化到 checkpoint
 - [x] ImplementationReport 的 `outcome / changed_files` 与真实 Worktree Diff 对账；
   `outcome` 与阶段 Diff 是硬门禁，文件清单不一致时按 Worktree 事实自动校正
+- [x] 验证工具结果绑定执行时 Diff SHA，changed 实现必须存在针对最终 Diff 的成功验证
+- [x] ImplementationReport / TestReport 写入时捕获 Artifact version 与 Diff SHA，拒绝
+  与最终 Worktree Diff 不一致的陈旧报告
 - [x] QA 验证工具结果在调用完成后立即持久化，不依赖 Trace 回放
 - [x] QA pass 要求真实成功的 `run_tests/run_lint`，且无失败证据和 QA 代码修改
+- [x] QA Artifact 规范化 `reported_verdict / effective_verdict / verdict_overridden`，
+  后续角色始终读取权威有效 verdict
 - [x] 环境同步失败在 QA 内重试；缺少依赖和过期 lockfile 路由给 Engineer
 - [x] Acceptance prompt 注入由 Orchestrator 汇总的实现与验证证据
+- [x] Acceptance fail 统一要求 `status=ready`，pass 统一要求 `status=accepted`
 - [x] 阶段 completion evidence gate 失败时自动给同一 worker 一次纠正机会
+- [x] `agent_status != completed` 永远不能完成 phase；Artifact gate 已通过也必须 continuation
+- [x] Workflow Store 拒绝持久化 `agent_status != completed` 的 completed phase，Resume
+  会失效不可信 phase 及其后续结果
 - [x] QA verdict 为 `fail` 时触发一次 Engineer fix cycle 和 QA regression
 - [x] Workflow 生命周期和 phase 事件写入 Trace
 - [x] CLI 支持显式 `/workflow <request>` 入口
 - [x] Workflow run record 持久化到 `.llm_agent/workflows/<workflow_id>/run.json`
 - [x] 支持 `/workflow-list`、`/workflow-show <id>`、`/workflow-resume <id>`
 - [x] Resume 基于 phase checkpoint 和 completion gate，不做完整 message replay
-- [x] 每次 attempt 持久化有界 handoff，记录动作、失败、验证和 Worktree 事实
+- [x] 每次 attempt 持久化有界语义 `AttemptCheckpoint`，记录 objective、completed、
+  remaining、next actions、decisions、blockers、open tasks、验证和 Worktree 事实
 - [x] attempt 内滚动保存近期状态，强制中断后恢复为 interrupted handoff
 - [x] Gate retry 与进程重启后的 Resume 都注入最新 handoff 和精简 working state，
   并续用 attempt 编号、记录 `workflow.working_context.injected`
+- [x] Engineer Fix 继承最近 Engineer phase checkpoint，QA Regression 继承最近 QA
+  phase checkpoint，避免跨 phase 重复宽泛仓库探索
 - [x] Workflow worker 保留最近 8 个完整工具结果，更早结果执行结构化微压缩
 - [x] Workflow 角色共享长期 Memory，完成且 QA pass 后触发证据约束反思
 - [x] 覆盖成功、no-change、虚假实现声明、无验证 QA pass、gate retry 和 fix cycle
@@ -449,12 +473,13 @@ Web UI 可以继续复用同一个 Agent、Hook 和 Event 边界。
 当前边界：
 
 - 目前是同步串行 Orchestrator-Worker，不支持并行 Agent Team。
-- Workflow 已支持 checkpoint + attempt handoff resume，但暂不支持跨机器锁、并发
-  resume 或单个 tool call 级精确断点。
+- Workflow 已支持同 phase retry/resume 与同角色跨 phase 的语义 checkpoint continuity，
+  但暂不支持跨机器锁、并发 resume 或单个 tool call 级精确断点。
 - Role 目前使用 `RoleSpec` 配置，没有单独抽象 `PMAgent / EngineerAgent / QAAgent` 类。
 - Artifact metadata 仍是轻量字典校验，尚未为各类 Artifact 引入独立强 schema。
 - Workflow 已默认使用 Git Worktree；非 Git 场景可配置 `isolation=shared`。
-- Evidence Gate 已校验 ImplementationReport、Worktree Diff 与验证工具结果；
+- Evidence Gate 已校验 phase Task、ImplementationReport/TestReport 写入快照、最终
+  Worktree Diff 与绑定该 Diff 的验证工具结果；
   `shared` 兼容模式没有独立 Diff 事实源，因此只执行较弱的 Artifact gate。
 
 ## 3. Harness 能力状态与可选扩展

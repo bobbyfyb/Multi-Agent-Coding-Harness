@@ -71,6 +71,7 @@ def register_default_tools(
     *,
     workdir: Path | str | None = None,
     task_workdir: Path | str | None = None,
+    task_list_id: str = "default",
     subagent_runner: "SubagentRunner | None" = None,
     skill_registry: "SkillRegistry | None" = None,
     memory_manager: "MemoryManager | None" = None,
@@ -94,6 +95,7 @@ def register_default_tools(
     register_task_tools(
         registry,
         workdir=workdir if task_workdir is None else task_workdir,
+        task_list_id=task_list_id,
     )
     register_artifact_tools(
         registry,
@@ -117,6 +119,7 @@ def build_default_registry(
     workdir: Path | str | None = None,
     *,
     task_workdir: Path | str | None = None,
+    task_list_id: str = "default",
     subagent_runner: "SubagentRunner | None" = None,
     skill_registry: "SkillRegistry | None" = None,
     memory_manager: "MemoryManager | None" = None,
@@ -131,6 +134,7 @@ def build_default_registry(
         registry,
         workdir=workdir,
         task_workdir=task_workdir,
+        task_list_id=task_list_id,
         subagent_runner=subagent_runner,
         skill_registry=skill_registry,
         memory_manager=memory_manager,

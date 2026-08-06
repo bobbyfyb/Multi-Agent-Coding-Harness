@@ -297,6 +297,22 @@ class WorkflowStore:
         artifact_ids: list[str],
         data: dict[str, Any] | None = None,
     ) -> None:
+        resolved_data = dict(data or {})
+        if resolved_data.get("agent_status") != "completed":
+            raise WorkflowStoreError(
+                "Cannot persist a completed workflow phase unless "
+                "data.agent_status is 'completed'."
+            )
+        phase_result_data = phase_result.get("data")
+        if (
+            phase_result.get("status") != "completed"
+            or not isinstance(phase_result_data, dict)
+            or phase_result_data.get("agent_status") != "completed"
+        ):
+            raise WorkflowStoreError(
+                "Completed phase_result must also declare status='completed' and "
+                "data.agent_status='completed'."
+            )
         checkpoint = record.checkpoints.get(phase_key)
         if checkpoint is not None:
             checkpoint.status = "completed"
@@ -305,7 +321,7 @@ class WorkflowStore:
             checkpoint.run_ids = list(run_ids)
             checkpoint.artifact_ids = list(artifact_ids)
             checkpoint.error = None
-            checkpoint.data = dict(checkpoint.data if data is None else data)
+            checkpoint.data = resolved_data
         _upsert_phase_result(record, phase_key, phase_result)
         record.current_phase = None
         record.current_phase_key = None
@@ -361,7 +377,12 @@ class WorkflowStore:
 
 
 def _validate_workflow_id(workflow_id: str) -> None:
-    if not workflow_id or "/" in workflow_id or "\\" in workflow_id:
+    if (
+        not workflow_id
+        or workflow_id in {".", ".."}
+        or "/" in workflow_id
+        or "\\" in workflow_id
+    ):
         raise WorkflowStoreError(f"Invalid workflow id: {workflow_id!r}")
 
 

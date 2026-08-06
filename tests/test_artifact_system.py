@@ -130,6 +130,32 @@ def test_artifact_context_hook_prioritizes_open_task_artifacts(
     assert "Linked work evidence" in message
 
 
+def test_artifact_context_hook_filters_other_workflows(tmp_path: Path) -> None:
+    manager = ArtifactManager.for_workdir(tmp_path)
+    current = manager.create_artifact(
+        kind="task_spec",
+        title="Current workflow",
+        content="Use this contract.",
+        status="ready",
+        metadata={"workflow_id": "wf-current"},
+    )
+    manager.create_artifact(
+        kind="test_report",
+        title="Other workflow",
+        content="Do not inject this verdict.",
+        status="ready",
+        metadata={"workflow_id": "wf-other", "verdict": "pass"},
+    )
+    hook = ArtifactContextHook(manager, workflow_id="wf-current")
+
+    result = hook(HookContext(messages=[], workdir=tmp_path))
+
+    assert result is not None
+    assert result.data["artifact_ids"] == [current.id]
+    assert "Use this contract." in result.data["messages"][0]
+    assert "Do not inject this verdict." not in result.data["messages"][0]
+
+
 def test_artifact_context_truncates_large_content(tmp_path: Path) -> None:
     manager = ArtifactManager.for_workdir(tmp_path)
     artifact = manager.create_artifact(

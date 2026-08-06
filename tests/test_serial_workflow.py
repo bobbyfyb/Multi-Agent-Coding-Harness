@@ -14,6 +14,7 @@ from llm_agent.serial_workflow import (
     parse_workflow_command,
 )
 from llm_agent.skill_system import SkillRegistry
+from llm_agent.task_system import TaskManager
 from llm_agent.trace_system import TraceRecorder
 from llm_agent.worktree import WorktreeManager
 
@@ -95,36 +96,22 @@ def test_serial_workflow_runs_pm_engineer_qa_acceptance(
 ) -> None:
     llm = FakeLLM(
         [
-            _response(
-                _create_call(
-                    "call-prd",
-                    kind="prd",
-                    title="PRD",
-                    content="Build the requested feature.",
-                    status="ready",
-                    metadata={"workflow_id": "wf-pass", "role": "pm"},
-                ),
-                _create_call(
-                    "call-task",
-                    kind="task_spec",
-                    title="Task Spec",
-                    content="Implementation scope.",
-                    status="ready",
-                    metadata={"workflow_id": "wf-pass", "role": "pm"},
-                ),
-            ),
+            _response(*_planning_calls("wf-pass")),
             LLMResponse(content="planning done", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "engineer_implement",
                 _create_call(
                     "call-impl",
                     kind="implementation_report",
                     title="Implementation Report",
                     content="No code changes needed.",
                     metadata={"workflow_id": "wf-pass", "role": "engineer"},
-                )
+                ),
+                evidence="Implementation report artifact_0003 records the outcome.",
             ),
             LLMResponse(content="implementation done", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "qa_verify",
                 _create_call(
                     "call-test",
                     kind="test_report",
@@ -135,10 +122,12 @@ def test_serial_workflow_runs_pm_engineer_qa_acceptance(
                         "role": "qa",
                         "verdict": "pass",
                     },
-                )
+                ),
+                evidence="Test report artifact_0004 records the QA pass.",
             ),
             LLMResponse(content="qa pass", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "pm_acceptance",
                 _create_call(
                     "call-accept",
                     kind="acceptance_report",
@@ -150,7 +139,8 @@ def test_serial_workflow_runs_pm_engineer_qa_acceptance(
                         "role": "pm",
                         "verdict": "pass",
                     },
-                )
+                ),
+                evidence="Acceptance report artifact_0005 records approval.",
             ),
             LLMResponse(content="accepted", tool_calls=[], raw={}),
         ]
@@ -169,6 +159,16 @@ def test_serial_workflow_runs_pm_engineer_qa_acceptance(
         "qa_verify",
         "pm_acceptance",
     ]
+    task_tools = {
+        "task_create",
+        "task_get",
+        "task_list",
+        "task_update",
+        "task_claim",
+        "task_complete",
+    }
+    for role_turn in (0, 2, 4, 6):
+        assert task_tools <= {tool["name"] for tool in llm.tools[role_turn]}
     artifacts = sorted(
         ArtifactManager.for_workdir(tmp_path).list_artifacts(include_archived=True),
         key=lambda artifact: artifact.id,
@@ -204,6 +204,69 @@ def test_serial_workflow_runs_pm_engineer_qa_acceptance(
         "qa_verify",
         "pm_acceptance",
     ]
+    tasks = TaskManager.for_workdir(
+        tmp_path,
+        task_list_id="wf-pass",
+    ).list_tasks()
+    assert sorted(task.id for task in tasks) == [
+        "task_0001",
+        "task_0002",
+        "task_0003",
+        "task_0004",
+    ]
+    assert [task.metadata.get("task_key") for task in tasks[1:]] == [
+        "engineer_implement",
+        "qa_verify",
+        "pm_acceptance",
+    ]
+    assert all(task.parent_id == "task_0001" for task in tasks[1:])
+    assert all(task.status == "completed" for task in tasks)
+    assert TaskManager.for_workdir(tmp_path).list_tasks() == []
+
+
+def test_serial_workflow_task_lists_are_isolated_by_workflow_id(
+    tmp_path: Path,
+) -> None:
+    first_id = "wf-task-list-one"
+    second_id = "wf-task-list-two"
+
+    first = _workflow(tmp_path, FakeLLM(_successful_outputs(first_id))).run(
+        "Build the first feature.",
+        run_id=first_id,
+    )
+    second = _workflow(tmp_path, FakeLLM(_successful_outputs(second_id))).run(
+        "Build the second feature.",
+        run_id=second_id,
+    )
+
+    assert first.status == "completed"
+    assert second.status == "completed"
+    first_tasks = TaskManager.for_workdir(
+        tmp_path,
+        task_list_id=first_id,
+    ).list_tasks()
+    second_tasks = TaskManager.for_workdir(
+        tmp_path,
+        task_list_id=second_id,
+    ).list_tasks()
+    assert [task.id for task in first_tasks] == [
+        "task_0001",
+        "task_0002",
+        "task_0003",
+        "task_0004",
+    ]
+    assert [task.id for task in second_tasks] == [
+        "task_0001",
+        "task_0002",
+        "task_0003",
+        "task_0004",
+    ]
+    assert {
+        task.metadata.get("workflow_id") for task in first_tasks
+    } == {first_id}
+    assert {
+        task.metadata.get("workflow_id") for task in second_tasks
+    } == {second_id}
 
 
 def test_serial_workflow_retries_acceptance_that_conflicts_with_qa(
@@ -212,43 +275,37 @@ def test_serial_workflow_retries_acceptance_that_conflicts_with_qa(
     workflow_id = "wf-rejected"
     llm = FakeLLM(
         [
-            _response(
-                _create_call(
-                    "call-prd",
-                    kind="prd",
-                    title="PRD",
-                    content="Build the requested feature.",
-                    status="ready",
-                ),
-                _create_call(
-                    "call-task",
-                    kind="task_spec",
-                    title="Task Spec",
-                    content="Implementation scope.",
-                    status="ready",
-                ),
-            ),
+            _response(*_planning_calls(workflow_id)),
             LLMResponse(content="planning done", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "engineer_implement",
                 _create_call(
                     "call-impl",
                     kind="implementation_report",
                     title="Implementation Report",
                     content="Implementation attempted.",
-                )
+                ),
+                evidence="Implementation report records the attempted change.",
             ),
             LLMResponse(content="implementation done", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "qa_verify",
                 _create_call(
                     "call-test",
                     kind="test_report",
                     title="Test Report",
                     content="Verification failed.",
                     metadata={"verdict": "fail"},
-                )
+                ),
+                evidence="Test report records the authoritative QA failure.",
             ),
             LLMResponse(content="qa failed", tool_calls=[], raw={}),
             _response(
+                _task_claim_call(
+                    "claim-pm-acceptance",
+                    task_id="task_0004",
+                    owner="pm-acceptance",
+                ),
                 _create_call(
                     "call-wrong-accept",
                     kind="acceptance_report",
@@ -267,7 +324,12 @@ def test_serial_workflow_retries_acceptance_that_conflicts_with_qa(
                     content="Rejected because QA failed.",
                     status="ready",
                     metadata={"verdict": "fail"},
-                )
+                ),
+                _task_complete_call(
+                    "complete-pm-acceptance",
+                    task_id="task_0004",
+                    evidence="Acceptance report correctly records QA rejection.",
+                ),
             ),
             LLMResponse(content="rejected", tool_calls=[], raw={}),
         ]
@@ -306,30 +368,23 @@ def test_serial_workflow_runs_code_phases_in_one_worktree(
     llm = FakeLLM(
         [
             _response(
-                _create_call(
-                    "call-prd",
-                    kind="prd",
-                    title="PRD",
-                    content="Change the application value.",
-                    status="ready",
-                ),
-                _create_call(
-                    "call-task",
-                    kind="task_spec",
-                    title="Task Spec",
-                    content="Update app.py and verify it.",
-                    status="ready",
-                    metadata={"change_required": True},
-                ),
+                *_planning_calls(
+                    "wf-worktree",
+                    prd_content="Change the application value.",
+                    task_content="Update app.py and verify it.",
+                    change_required=True,
+                )
             ),
             LLMResponse(content="planning done", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "engineer_implement",
                 _edit_call(
                     "call-edit",
                     path="app.py",
                     old_text="value = 'original'",
                     new_text="value = 'workflow'",
                 ),
+                _run_lint_call("call-engineer-lint"),
                 _create_call(
                     "call-impl",
                     kind="implementation_report",
@@ -340,9 +395,11 @@ def test_serial_workflow_runs_code_phases_in_one_worktree(
                         "changed_files": ["incomplete-report.py"],
                     },
                 ),
+                evidence="Lint passed after changing app.py; report records the diff.",
             ),
             LLMResponse(content="implementation done", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "qa_verify",
                 _run_lint_call("call-lint"),
                 _create_call(
                     "call-test",
@@ -351,9 +408,11 @@ def test_serial_workflow_runs_code_phases_in_one_worktree(
                     content="Verified the isolated implementation.",
                     metadata={"verdict": "pass"},
                 ),
+                evidence="QA lint passed for the current worktree diff.",
             ),
             LLMResponse(content="qa pass", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "pm_acceptance",
                 _create_call(
                     "call-accept",
                     kind="acceptance_report",
@@ -361,7 +420,8 @@ def test_serial_workflow_runs_code_phases_in_one_worktree(
                     content="Accepted and ready to apply.",
                     status="accepted",
                     metadata={"verdict": "pass"},
-                )
+                ),
+                evidence="Acceptance report approves the verified worktree diff.",
             ),
             LLMResponse(content="accepted", tool_calls=[], raw={}),
         ]
@@ -404,9 +464,30 @@ def test_serial_workflow_runs_code_phases_in_one_worktree(
         if artifact.kind == "implementation_report"
     )
     assert implementation_report.metadata["changed_files"] == ["app.py"]
+    assert (
+        implementation_report.metadata["worktree_diff_sha256"]
+        == result.worktree["diff_sha256"]
+    )
+    assert (
+        engineer_evidence["report_snapshot"]["diff_sha256"]
+        == result.worktree["diff_sha256"]
+    )
     qa_evidence = record.checkpoints["qa_verify"].data["qa_evidence"]
     assert qa_evidence["successful_checks"] == 1
     assert qa_evidence["verification"][0]["outcome"] == "clean"
+    test_report = next(
+        artifact
+        for artifact in ArtifactManager.for_workdir(workdir).list_artifacts()
+        if artifact.kind == "test_report"
+    )
+    assert (
+        test_report.metadata["tested_diff_sha256"]
+        == result.worktree["diff_sha256"]
+    )
+    assert (
+        qa_evidence["report_snapshot"]["diff_sha256"]
+        == result.worktree["diff_sha256"]
+    )
     assert info.path in llm.messages[2][0]["content"]
     assert info.path in llm.messages[4][0]["content"]
     assert info.path in llm.messages[6][0]["content"]
@@ -428,7 +509,12 @@ def test_serial_workflow_resume_reuses_persisted_worktree(
 ) -> None:
     workdir = _repository(tmp_path)
     manager = WorktreeManager.for_workdir(workdir)
-    llm = FakeLLM(_worktree_no_change_outputs("wf-reuse"))
+    llm = FakeLLM(
+        [
+            LLMResponse(content="recovered planning confirmed", tool_calls=[], raw={}),
+            *_worktree_no_change_outputs("wf-reuse"),
+        ]
+    )
     workflow = SerialCodingWorkflow(
         llm=llm,  # type: ignore[arg-type]
         workdir=workdir,
@@ -462,8 +548,14 @@ def test_serial_workflow_resume_reuses_persisted_worktree(
         title="Task Spec",
         content="Recovered task.",
         status="ready",
-        metadata={"change_required": False},
+        metadata={
+            "change_required": False,
+            "workflow_id": "wf-reuse",
+            "role": "pm",
+            "task_ids": dict(_ROLE_TASK_IDS),
+        },
     )
+    _seed_workflow_task_graph(workdir, "wf-reuse")
     info = manager.create(agent_id="workflow", run_id="wf-reuse")
     record.worktree_id = info.id
     record.worktree_base_commit = info.base_commit
@@ -487,7 +579,15 @@ def test_serial_workflow_resume_fails_when_worktree_is_missing(
     workdir = _repository(tmp_path)
     manager = WorktreeManager.for_workdir(workdir)
     workflow = SerialCodingWorkflow(
-        llm=FakeLLM([]),  # type: ignore[arg-type]
+        llm=FakeLLM(
+            [
+                LLMResponse(
+                    content="recovered planning confirmed",
+                    tool_calls=[],
+                    raw={},
+                )
+            ]
+        ),  # type: ignore[arg-type]
         workdir=workdir,
         artifact_manager=ArtifactManager.for_workdir(workdir),
         approval_provider=AutoApprovalProvider(approved=True),
@@ -519,8 +619,14 @@ def test_serial_workflow_resume_fails_when_worktree_is_missing(
         title="Task Spec",
         content="Recovered task.",
         status="ready",
-        metadata={"change_required": True},
+        metadata={
+            "change_required": True,
+            "workflow_id": "wf-missing",
+            "role": "pm",
+            "task_ids": dict(_ROLE_TASK_IDS),
+        },
     )
+    _seed_workflow_task_graph(workdir, "wf-missing")
     info = manager.create(agent_id="workflow", run_id="wf-missing")
     record.worktree_id = info.id
     record.worktree_base_commit = info.base_commit
@@ -544,24 +650,16 @@ def test_worktree_evidence_gate_rejects_report_without_code_change(
     llm = FakeLLM(
         [
             _response(
-                _create_call(
-                    "call-prd",
-                    kind="prd",
-                    title="PRD",
-                    content="Change app.py.",
-                    status="ready",
-                ),
-                _create_call(
-                    "call-task",
-                    kind="task_spec",
-                    title="Task Spec",
-                    content="Change app.py.",
-                    status="ready",
-                    metadata={"change_required": True},
-                ),
+                *_planning_calls(
+                    "wf-no-diff",
+                    prd_content="Change app.py.",
+                    task_content="Change app.py.",
+                    change_required=True,
+                )
             ),
             LLMResponse(content="planning done", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "engineer_implement",
                 _create_call(
                     "call-impl",
                     kind="implementation_report",
@@ -571,7 +669,8 @@ def test_worktree_evidence_gate_rejects_report_without_code_change(
                         "outcome": "changed",
                         "changed_files": ["app.py"],
                     },
-                )
+                ),
+                evidence="Implementation report claims app.py changed.",
             ),
             LLMResponse(content="implementation done", tool_calls=[], raw={}),
         ]
@@ -604,30 +703,23 @@ def test_worktree_evidence_gate_rejects_qa_pass_without_verification(
     llm = FakeLLM(
         [
             _response(
-                _create_call(
-                    "call-prd",
-                    kind="prd",
-                    title="PRD",
-                    content="Change app.py.",
-                    status="ready",
-                ),
-                _create_call(
-                    "call-task",
-                    kind="task_spec",
-                    title="Task Spec",
-                    content="Change app.py.",
-                    status="ready",
-                    metadata={"change_required": True},
-                ),
+                *_planning_calls(
+                    "wf-no-check",
+                    prd_content="Change app.py.",
+                    task_content="Change app.py.",
+                    change_required=True,
+                )
             ),
             LLMResponse(content="planning done", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "engineer_implement",
                 _edit_call(
                     "call-edit",
                     path="app.py",
                     old_text="value = 'original'",
                     new_text="value = 'workflow'",
                 ),
+                _run_lint_call("call-engineer-lint"),
                 _create_call(
                     "call-impl",
                     kind="implementation_report",
@@ -638,16 +730,19 @@ def test_worktree_evidence_gate_rejects_qa_pass_without_verification(
                         "changed_files": ["app.py"],
                     },
                 ),
+                evidence="Engineer lint passed after changing app.py.",
             ),
             LLMResponse(content="implementation done", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "qa_verify",
                 _create_call(
                     "call-test",
                     kind="test_report",
                     title="Test Report",
                     content="Claimed pass without running checks.",
                     metadata={"verdict": "pass"},
-                )
+                ),
+                evidence="QA report claims pass without machine verification.",
             ),
             LLMResponse(content="qa pass", tool_calls=[], raw={}),
         ]
@@ -666,8 +761,158 @@ def test_worktree_evidence_gate_rejects_qa_pass_without_verification(
 
     assert result.status == "failed"
     assert result.error is not None
-    assert "no successful run_tests or run_lint" in result.error
+    assert "no structured run_tests/run_lint evidence" in result.error
     assert result.phases[-1].phase == "qa_verify"
+    assert result.worktree is not None
+    manager.remove(result.worktree["worktree"]["id"], discard_changes=True)
+
+
+def test_worktree_evidence_gate_rejects_verification_before_last_mutation(
+    tmp_path: Path,
+) -> None:
+    workdir = _repository(tmp_path)
+    manager = WorktreeManager.for_workdir(workdir)
+    workflow_id = "wf-stale-engineer-check"
+    llm = FakeLLM(
+        [
+            _response(
+                *_planning_calls(
+                    workflow_id,
+                    prd_content="Change app.py.",
+                    task_content="Change app.py and verify the final diff.",
+                    change_required=True,
+                )
+            ),
+            LLMResponse(content="planning done", tool_calls=[], raw={}),
+            _role_task_response(
+                "engineer_implement",
+                _edit_call(
+                    "call-edit-before-check",
+                    path="app.py",
+                    old_text="value = 'original'",
+                    new_text="value = 'first'",
+                ),
+                _run_lint_call("call-stale-lint"),
+                _edit_call(
+                    "call-edit-after-check",
+                    path="app.py",
+                    old_text="value = 'first'",
+                    new_text="value = 'final'",
+                ),
+                _create_call(
+                    "call-stale-impl-report",
+                    kind="implementation_report",
+                    title="Implementation Report",
+                    content="Changed app.py after the last lint run.",
+                    metadata={
+                        "outcome": "changed",
+                        "changed_files": ["app.py"],
+                    },
+                ),
+                evidence="A lint command ran before the final app.py mutation.",
+            ),
+            LLMResponse(content="implementation done", tool_calls=[], raw={}),
+        ]
+    )
+    workflow = SerialCodingWorkflow(
+        llm=llm,  # type: ignore[arg-type]
+        workdir=workdir,
+        artifact_manager=ArtifactManager.for_workdir(workdir),
+        approval_provider=AutoApprovalProvider(approved=True),
+        worktree_manager=manager,
+        isolation="worktree",
+        max_phase_retries=0,
+    )
+
+    result = workflow.run("Change app.py.", run_id=workflow_id)
+
+    assert result.status == "failed"
+    assert result.error is not None
+    assert "bound to the final Worktree Diff" in result.error
+    assert "Verify after the last mutation" in result.error
+    engineer = result.phases[-1]
+    verification = engineer.data["implementation_evidence"]["verification"]
+    assert len(verification) == 1
+    assert (
+        verification[0]["diff_sha256"]
+        != engineer.data["implementation_evidence"]["worktree_after"]["diff_sha256"]
+    )
+    assert result.worktree is not None
+    manager.remove(result.worktree["worktree"]["id"], discard_changes=True)
+
+
+def test_worktree_evidence_gate_rejects_report_written_before_final_diff(
+    tmp_path: Path,
+) -> None:
+    workdir = _repository(tmp_path)
+    manager = WorktreeManager.for_workdir(workdir)
+    workflow_id = "wf-stale-engineer-report"
+    llm = FakeLLM(
+        [
+            _response(
+                *_planning_calls(
+                    workflow_id,
+                    prd_content="Change app.py.",
+                    task_content="Bind the report and verification to the final diff.",
+                    change_required=True,
+                )
+            ),
+            LLMResponse(content="planning done", tool_calls=[], raw={}),
+            _role_task_response(
+                "engineer_implement",
+                _edit_call(
+                    "call-first-edit",
+                    path="app.py",
+                    old_text="value = 'original'",
+                    new_text="value = 'first'",
+                ),
+                _run_lint_call("call-first-lint"),
+                _create_call(
+                    "call-early-impl-report",
+                    kind="implementation_report",
+                    title="Implementation Report",
+                    content="This report was written before the final edit.",
+                    metadata={
+                        "outcome": "changed",
+                        "changed_files": ["app.py"],
+                    },
+                ),
+                _edit_call(
+                    "call-final-edit",
+                    path="app.py",
+                    old_text="value = 'first'",
+                    new_text="value = 'final'",
+                ),
+                _run_lint_call("call-final-lint"),
+                evidence="Final lint passed, but the report predates the final diff.",
+            ),
+            LLMResponse(content="implementation done", tool_calls=[], raw={}),
+        ]
+    )
+    workflow = SerialCodingWorkflow(
+        llm=llm,  # type: ignore[arg-type]
+        workdir=workdir,
+        artifact_manager=ArtifactManager.for_workdir(workdir),
+        approval_provider=AutoApprovalProvider(approved=True),
+        worktree_manager=manager,
+        isolation="worktree",
+        max_phase_retries=0,
+    )
+
+    result = workflow.run("Change app.py.", run_id=workflow_id)
+
+    assert result.status == "failed"
+    assert result.error is not None
+    assert "implementation_report was written for an older Worktree Diff" in (
+        result.error
+    )
+    engineer = result.phases[-1]
+    evidence = engineer.data["implementation_evidence"]
+    assert evidence["fresh_successful_checks"] == 1
+    assert (
+        evidence["report_snapshot"]["diff_sha256"]
+        != evidence["worktree_after"]["diff_sha256"]
+    )
     assert result.worktree is not None
     manager.remove(result.worktree["worktree"]["id"], discard_changes=True)
 
@@ -686,30 +931,23 @@ def test_worktree_evidence_gate_downgrades_false_pass_and_runs_fix_cycle(
     llm = FakeLLM(
         [
             _response(
-                _create_call(
-                    "call-prd",
-                    kind="prd",
-                    title="PRD",
-                    content="Change app.py.",
-                    status="ready",
-                ),
-                _create_call(
-                    "call-task",
-                    kind="task_spec",
-                    title="Task Spec",
-                    content="Change app.py and verify it.",
-                    status="ready",
-                    metadata={"change_required": True},
-                ),
+                *_planning_calls(
+                    "wf-false-pass",
+                    prd_content="Change app.py.",
+                    task_content="Change app.py and verify it.",
+                    change_required=True,
+                )
             ),
             LLMResponse(content="planning done", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "engineer_implement",
                 _edit_call(
                     "call-edit-initial",
                     path="app.py",
                     old_text="value = 'original'",
                     new_text="value = 'initial'",
                 ),
+                _run_lint_call("call-engineer-lint-initial"),
                 _create_call(
                     "call-impl-initial",
                     kind="implementation_report",
@@ -720,9 +958,11 @@ def test_worktree_evidence_gate_downgrades_false_pass_and_runs_fix_cycle(
                         "changed_files": ["app.py"],
                     },
                 ),
+                evidence="Lint passed after the initial app.py change.",
             ),
             LLMResponse(content="implementation done", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "qa_verify",
                 _run_tests_call("call-tests-failed", targets=["test_app.py"]),
                 _create_call(
                     "call-false-pass",
@@ -731,15 +971,19 @@ def test_worktree_evidence_gate_downgrades_false_pass_and_runs_fix_cycle(
                     content="Incorrectly claimed that tests passed.",
                     metadata={"verdict": "pass"},
                 ),
+                evidence="The focused test failed; the report records QA evidence.",
             ),
             LLMResponse(content="qa pass", tool_calls=[], raw={}),
-            _response(
+            _task_response(
+                "task_0005",
+                "engineer",
                 _edit_call(
                     "call-edit-fix",
                     path="app.py",
                     old_text="value = 'initial'",
                     new_text="value = 'fixed'",
                 ),
+                _run_lint_call("call-engineer-lint-fix"),
                 _create_call(
                     "call-impl-fix",
                     kind="implementation_report",
@@ -750,9 +994,12 @@ def test_worktree_evidence_gate_downgrades_false_pass_and_runs_fix_cycle(
                         "changed_files": ["app.py"],
                     },
                 ),
+                evidence="Lint passed after fixing app.py for the QA failure.",
             ),
             LLMResponse(content="fix done", tool_calls=[], raw={}),
-            _response(
+            _task_response(
+                "task_0006",
+                "qa",
                 _run_tests_call("call-tests-passed", targets=["test_app.py"]),
                 _create_call(
                     "call-regression-pass",
@@ -761,9 +1008,11 @@ def test_worktree_evidence_gate_downgrades_false_pass_and_runs_fix_cycle(
                     content="Regression test passed.",
                     metadata={"verdict": "pass"},
                 ),
+                evidence="The regression test passed against the fixed diff.",
             ),
             LLMResponse(content="regression pass", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "pm_acceptance",
                 _create_call(
                     "call-accept",
                     kind="acceptance_report",
@@ -771,7 +1020,8 @@ def test_worktree_evidence_gate_downgrades_false_pass_and_runs_fix_cycle(
                     content="Accepted after the evidence-driven fix.",
                     status="accepted",
                     metadata={"verdict": "pass"},
-                )
+                ),
+                evidence="Acceptance report approves the regression-tested fix.",
             ),
             LLMResponse(content="accepted", tool_calls=[], raw={}),
         ]
@@ -797,10 +1047,32 @@ def test_worktree_evidence_gate_downgrades_false_pass_and_runs_fix_cycle(
     assert evidence["effective_verdict"] == "fail"
     assert evidence["verdict_overridden"] is True
     assert evidence["actionable_failed_checks"] == 1
+    report = ArtifactManager.for_workdir(workdir).get_artifact("artifact_0004")
+    assert report.metadata["reported_verdict"] == "pass"
+    assert report.metadata["verdict"] == "fail"
+    assert report.metadata["effective_verdict"] == "fail"
+    assert report.metadata["verdict_overridden"] is True
     assert "run_tests=failed" in str(llm.messages[6][-1]["content"])
     assert "test_value" in str(llm.messages[6][-1]["content"])
     assert "new phase-local" in str(llm.messages[6][-1]["content"])
     assert "keyword match" in str(llm.messages[4][-1]["content"])
+    assert "<prior_role_checkpoint>" in str(llm.messages[6])
+    assert '"source_phase_key": "engineer_implement"' in str(llm.messages[6])
+    assert "<prior_role_checkpoint>" in str(llm.messages[8])
+    assert '"source_phase_key": "qa_verify"' in str(llm.messages[8])
+    tasks = TaskManager.for_workdir(
+        workdir,
+        task_list_id="wf-false-pass",
+    ).list_tasks()
+    assert sorted(task.id for task in tasks) == [
+        "task_0001",
+        "task_0002",
+        "task_0003",
+        "task_0004",
+        "task_0005",
+        "task_0006",
+    ]
+    assert all(task.status == "completed" for task in tasks)
     assert result.worktree is not None
     manager.remove(result.worktree["worktree"]["id"], discard_changes=True)
 
@@ -823,30 +1095,23 @@ def test_worktree_evidence_gate_retries_qa_after_permission_tool_error(
     llm = FakeLLM(
         [
             _response(
-                _create_call(
-                    "call-prd",
-                    kind="prd",
-                    title="PRD",
-                    content="Change app.py.",
-                    status="ready",
-                ),
-                _create_call(
-                    "call-task",
-                    kind="task_spec",
-                    title="Task Spec",
-                    content="Change app.py and verify it.",
-                    status="ready",
-                    metadata={"change_required": True},
-                ),
+                *_planning_calls(
+                    "wf-qa-tool-error",
+                    prd_content="Change app.py.",
+                    task_content="Change app.py and verify it.",
+                    change_required=True,
+                )
             ),
             LLMResponse(content="planning done", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "engineer_implement",
                 _edit_call(
                     "call-edit",
                     path="app.py",
                     old_text="value = 'original'",
                     new_text="value = 'workflow'",
                 ),
+                _run_tests_call("call-engineer-tests", targets=["test_app.py"]),
                 _create_call(
                     "call-impl",
                     kind="implementation_report",
@@ -857,9 +1122,12 @@ def test_worktree_evidence_gate_retries_qa_after_permission_tool_error(
                         "changed_files": ["app.py"],
                     },
                 ),
+                evidence="Focused Engineer test passed after changing app.py.",
             ),
             LLMResponse(content="implementation done", tool_calls=[], raw={}),
-            _response(
+            _task_response(
+                "task_0003",
+                "qa",
                 _run_lint_call("call-lint-denied"),
                 _create_call(
                     "call-first-report",
@@ -868,9 +1136,12 @@ def test_worktree_evidence_gate_retries_qa_after_permission_tool_error(
                     content="Lint was denied but pass was claimed.",
                     metadata={"verdict": "pass"},
                 ),
+                complete=False,
             ),
             LLMResponse(content="qa pass", tool_calls=[], raw={}),
-            _response(
+            _task_response(
+                "task_0003",
+                "qa",
                 _run_tests_call("call-tests-passed", targets=["test_app.py"]),
                 _create_call(
                     "call-second-report",
@@ -879,9 +1150,12 @@ def test_worktree_evidence_gate_retries_qa_after_permission_tool_error(
                     content="Focused test passed.",
                     metadata={"verdict": "pass"},
                 ),
+                evidence="Focused QA test passed on retry.",
+                claim=False,
             ),
             LLMResponse(content="qa retry pass", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "pm_acceptance",
                 _create_call(
                     "call-accept",
                     kind="acceptance_report",
@@ -889,7 +1163,8 @@ def test_worktree_evidence_gate_retries_qa_after_permission_tool_error(
                     content="Accepted after QA retry.",
                     status="accepted",
                     metadata={"verdict": "pass"},
-                )
+                ),
+                evidence="Acceptance report approves the QA-retried diff.",
             ),
             LLMResponse(content="accepted", tool_calls=[], raw={}),
         ]
@@ -960,30 +1235,23 @@ def test_worktree_evidence_gate_retries_qa_after_environment_setup_error(
     llm = FakeLLM(
         [
             _response(
-                _create_call(
-                    "call-prd",
-                    kind="prd",
-                    title="PRD",
-                    content="Change app.py.",
-                    status="ready",
-                ),
-                _create_call(
-                    "call-task",
-                    kind="task_spec",
-                    title="Task Spec",
-                    content="Change app.py and verify it.",
-                    status="ready",
-                    metadata={"change_required": True},
-                ),
+                *_planning_calls(
+                    "wf-environment-blocked",
+                    prd_content="Change app.py.",
+                    task_content="Change app.py and verify it.",
+                    change_required=True,
+                )
             ),
             LLMResponse(content="planning done", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "engineer_implement",
                 _edit_call(
                     "call-edit",
                     path="app.py",
                     old_text="value = 'original'",
                     new_text="value = 'workflow'",
                 ),
+                _run_lint_call("call-engineer-lint"),
                 _create_call(
                     "call-impl",
                     kind="implementation_report",
@@ -994,9 +1262,12 @@ def test_worktree_evidence_gate_retries_qa_after_environment_setup_error(
                         "changed_files": ["app.py"],
                     },
                 ),
+                evidence="Engineer lint passed after changing app.py.",
             ),
             LLMResponse(content="implementation done", tool_calls=[], raw={}),
-            _response(
+            _task_response(
+                "task_0003",
+                "qa",
                 _run_tests_call("call-tests-blocked", targets=["app.py"]),
                 _create_call(
                     "call-first-report",
@@ -1005,9 +1276,12 @@ def test_worktree_evidence_gate_retries_qa_after_environment_setup_error(
                     content="The environment setup failed.",
                     metadata={"verdict": "fail"},
                 ),
+                complete=False,
             ),
             LLMResponse(content="qa blocked", tool_calls=[], raw={}),
-            _response(
+            _task_response(
+                "task_0003",
+                "qa",
                 _run_lint_call("call-lint-passed"),
                 _create_call(
                     "call-second-report",
@@ -1016,9 +1290,12 @@ def test_worktree_evidence_gate_retries_qa_after_environment_setup_error(
                     content="Lint passed after the transient blocker cleared.",
                     metadata={"verdict": "pass"},
                 ),
+                evidence="QA lint passed after the transient environment blocker.",
+                claim=False,
             ),
             LLMResponse(content="qa retry pass", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "pm_acceptance",
                 _create_call(
                     "call-accept",
                     kind="acceptance_report",
@@ -1026,7 +1303,8 @@ def test_worktree_evidence_gate_retries_qa_after_environment_setup_error(
                     content="Accepted after QA retry.",
                     status="accepted",
                     metadata={"verdict": "pass"},
-                )
+                ),
+                evidence="Acceptance report approves the QA-retried diff.",
             ),
             LLMResponse(content="accepted", tool_calls=[], raw={}),
         ]
@@ -1065,30 +1343,23 @@ def test_worktree_fix_cycle_requires_a_new_diff_and_regression_evidence(
     llm = FakeLLM(
         [
             _response(
-                _create_call(
-                    "call-prd",
-                    kind="prd",
-                    title="PRD",
-                    content="Change app.py and fix defects.",
-                    status="ready",
-                ),
-                _create_call(
-                    "call-task",
-                    kind="task_spec",
-                    title="Task Spec",
-                    content="Change app.py and verify it.",
-                    status="ready",
-                    metadata={"change_required": True},
-                ),
+                *_planning_calls(
+                    "wf-fix-evidence",
+                    prd_content="Change app.py and fix defects.",
+                    task_content="Change app.py and verify it.",
+                    change_required=True,
+                )
             ),
             LLMResponse(content="planning done", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "engineer_implement",
                 _edit_call(
                     "call-edit-initial",
                     path="app.py",
                     old_text="value = 'original'",
                     new_text="value = 'initial'",
                 ),
+                _run_lint_call("call-initial-lint"),
                 _create_call(
                     "call-impl-initial",
                     kind="implementation_report",
@@ -1099,25 +1370,32 @@ def test_worktree_fix_cycle_requires_a_new_diff_and_regression_evidence(
                         "changed_files": ["app.py"],
                     },
                 ),
+                evidence="Lint passed after the initial app.py change.",
             ),
             LLMResponse(content="implementation done", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "qa_verify",
+                _run_lint_call("call-initial-qa-lint"),
                 _create_call(
                     "call-test-fail",
                     kind="test_report",
                     title="Test Report",
                     content="A defect remains.",
                     metadata={"verdict": "fail"},
-                )
+                ),
+                evidence="QA report records the defect that requires a fix.",
             ),
             LLMResponse(content="qa fail", tool_calls=[], raw={}),
-            _response(
+            _task_response(
+                "task_0005",
+                "engineer",
                 _edit_call(
                     "call-edit-fix",
                     path="app.py",
                     old_text="value = 'initial'",
                     new_text="value = 'fixed'",
                 ),
+                _run_lint_call("call-fix-lint"),
                 _create_call(
                     "call-impl-fix",
                     kind="implementation_report",
@@ -1128,9 +1406,12 @@ def test_worktree_fix_cycle_requires_a_new_diff_and_regression_evidence(
                         "changed_files": ["app.py"],
                     },
                 ),
+                evidence="Lint passed after the new fix diff was created.",
             ),
             LLMResponse(content="fix done", tool_calls=[], raw={}),
-            _response(
+            _task_response(
+                "task_0006",
+                "qa",
                 _run_lint_call("call-regression-lint"),
                 _create_call(
                     "call-regression",
@@ -1139,9 +1420,11 @@ def test_worktree_fix_cycle_requires_a_new_diff_and_regression_evidence(
                     content="Regression lint passes.",
                     metadata={"verdict": "pass"},
                 ),
+                evidence="Regression lint passed against the fixed diff.",
             ),
             LLMResponse(content="regression pass", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "pm_acceptance",
                 _create_call(
                     "call-accept",
                     kind="acceptance_report",
@@ -1149,7 +1432,8 @@ def test_worktree_fix_cycle_requires_a_new_diff_and_regression_evidence(
                     content="Accepted after the verified fix.",
                     status="accepted",
                     metadata={"verdict": "pass"},
-                )
+                ),
+                evidence="Acceptance report approves the verified fix.",
             ),
             LLMResponse(content="accepted", tool_calls=[], raw={}),
         ]
@@ -1232,10 +1516,15 @@ def test_serial_workflow_persists_role_agent_failure(tmp_path: Path) -> None:
     assert resumed.phases[0].run_ids == ["wf-provider-failure-pm_plan-2"]
 
 
-def test_serial_workflow_resume_recovers_running_phase_when_gate_is_satisfied(
+def test_serial_workflow_resume_reruns_running_phase_even_when_gate_is_satisfied(
     tmp_path: Path,
 ) -> None:
-    llm = FakeLLM(_successful_outputs("wf-recover", include_pm=False))
+    llm = FakeLLM(
+        [
+            LLMResponse(content="planning rerun completed", tool_calls=[], raw={}),
+            *_successful_outputs("wf-recover", include_pm=False),
+        ]
+    )
     workflow = _workflow(tmp_path, llm)
     assert workflow.workflow_store is not None
     record = workflow.workflow_store.create_run(
@@ -1263,15 +1552,21 @@ def test_serial_workflow_resume_recovers_running_phase_when_gate_is_satisfied(
         title="Task Spec",
         content="Recovered task.",
         status="ready",
-        metadata={"workflow_id": "wf-recover", "role": "pm"},
+        metadata={
+            "workflow_id": "wf-recover",
+            "role": "pm",
+            "task_ids": dict(_ROLE_TASK_IDS),
+        },
     )
+    _seed_workflow_task_graph(tmp_path, "wf-recover")
 
     result = workflow.resume("wf-recover")
 
     assert result.status == "completed"
     assert result.phases[0].phase == "pm_plan"
-    assert result.phases[0].summary.startswith("Recovered completed phase")
-    assert len(llm.messages) == 6
+    assert result.phases[0].summary == "planning rerun completed"
+    assert result.phases[0].attempts == 1
+    assert len(llm.messages) == 7
 
 
 def test_serial_workflow_resume_reruns_running_phase_when_gate_is_missing(
@@ -1347,30 +1642,20 @@ def test_serial_workflow_resume_uses_rolling_interrupted_attempt_state(
     assert "README.md" in first_request
 
 
-def test_serial_workflow_accepts_max_steps_when_evidence_gate_passes(
+def test_serial_workflow_retries_max_steps_even_when_artifact_gate_passes(
     tmp_path: Path,
 ) -> None:
     workflow_id = "wf-max-steps-evidence"
     llm = FakeLLM(
         [
             _response(
-                _create_call(
-                    "call-prd",
-                    kind="prd",
-                    title="PRD",
-                    content="Plan.",
-                    status="ready",
-                    metadata={"workflow_id": workflow_id, "role": "pm"},
-                ),
-                _create_call(
-                    "call-task",
-                    kind="task_spec",
-                    title="Task Spec",
-                    content="Task.",
-                    status="ready",
-                    metadata={"workflow_id": workflow_id, "role": "pm"},
-                ),
+                *_planning_calls(
+                    workflow_id,
+                    prd_content="Plan.",
+                    task_content="Task.",
+                )
             ),
+            LLMResponse(content="planning resumed and completed", tool_calls=[], raw={}),
             *_successful_outputs(workflow_id, include_pm=False),
         ]
     )
@@ -1389,8 +1674,31 @@ def test_serial_workflow_accepts_max_steps_when_evidence_gate_passes(
 
     assert result.status == "completed"
     assert result.phases[0].status == "completed"
-    assert result.phases[0].attempts == 1
-    assert result.phases[0].data["agent_status"] == "max_steps"
+    assert result.phases[0].attempts == 2
+    assert result.phases[0].data["agent_status"] == "completed"
+    assert "continuation_reason" not in result.phases[0].data
+    assert "artifact_gate_ok" not in result.phases[0].data
+    handoffs = result.phases[0].data["attempt_handoffs"]
+    assert handoffs[0]["agent_status"] == "max_steps"
+    checkpoint = handoffs[0]["checkpoint"]
+    assert checkpoint["agent_status"] == "max_steps"
+    assert checkpoint["continuation_reason"] == "max_steps"
+    assert checkpoint["objective"]
+    assert checkpoint["remaining"]
+    assert checkpoint["next_actions"]
+    assert handoffs[1]["agent_status"] == "completed"
+    assert result.phases[0].data["continuation_checkpoint"] == handoffs[1][
+        "checkpoint"
+    ]
+    assert result.phases[0].run_ids == [
+        f"{workflow_id}-pm_plan-1",
+        f"{workflow_id}-pm_plan-2",
+    ]
+    retry_request = str(llm.messages[1])
+    assert "<attempt_checkpoint>" in retry_request
+    assert '"agent_status": "max_steps"' in retry_request
+    assert '"remaining"' in retry_request
+    assert '"next_actions"' in retry_request
 
 
 def test_serial_workflow_ignores_artifacts_owned_by_another_workflow(
@@ -1456,36 +1764,46 @@ def test_serial_workflow_retries_missing_artifact_gate(
             ),
             LLMResponse(content="forgot task spec", tool_calls=[], raw={}),
             _response(
+                *_workflow_child_task_calls("wf-retry"),
                 _create_call(
                     "call-task",
                     kind="task_spec",
                     title="Task Spec",
                     content="Corrective task spec.",
                     status="ready",
-                    metadata={"workflow_id": "wf-retry", "role": "pm"},
+                    metadata={
+                        "workflow_id": "wf-retry",
+                        "role": "pm",
+                        "task_ids": dict(_ROLE_TASK_IDS),
+                    },
                 )
             ),
             LLMResponse(content="planning fixed", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "engineer_implement",
                 _create_call(
                     "call-impl",
                     kind="implementation_report",
                     title="Implementation Report",
                     content="Implemented.",
-                )
+                ),
+                evidence="Implementation report records completion.",
             ),
             LLMResponse(content="implementation done", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "qa_verify",
                 _create_call(
                     "call-test",
                     kind="test_report",
                     title="Test Report",
                     content="Pass.",
                     metadata={"verdict": "pass"},
-                )
+                ),
+                evidence="Test report records a QA pass.",
             ),
             LLMResponse(content="qa pass", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "pm_acceptance",
                 _create_call(
                     "call-accept",
                     kind="acceptance_report",
@@ -1493,7 +1811,8 @@ def test_serial_workflow_retries_missing_artifact_gate(
                     content="Accepted.",
                     status="accepted",
                     metadata={"verdict": "pass"},
-                )
+                ),
+                evidence="Acceptance report records approval.",
             ),
             LLMResponse(content="accepted", tool_calls=[], raw={}),
         ]
@@ -1529,9 +1848,10 @@ def test_serial_workflow_retries_missing_artifact_gate(
     assert "task_spec" in handoffs[0]["gate_issue"]
 
 
-def test_serial_workflow_runs_fix_cycle_after_qa_fail(
+def test_serial_workflow_retries_planning_until_pm_creates_task_graph(
     tmp_path: Path,
 ) -> None:
+    workflow_id = "wf-task-graph-retry"
     llm = FakeLLM(
         [
             _response(
@@ -1539,58 +1859,119 @@ def test_serial_workflow_runs_fix_cycle_after_qa_fail(
                     "call-prd",
                     kind="prd",
                     title="PRD",
-                    content="Need fix.",
+                    content="Plan the requested feature.",
                     status="ready",
+                    metadata={"workflow_id": workflow_id, "role": "pm"},
                 ),
                 _create_call(
-                    "call-task",
+                    "call-task-spec",
                     kind="task_spec",
                     title="Task Spec",
-                    content="Implement and verify.",
+                    content="Implement, verify, and accept the feature.",
                     status="ready",
+                    metadata={"workflow_id": workflow_id, "role": "pm"},
                 ),
             ),
-            LLMResponse(content="planning done", tool_calls=[], raw={}),
+            LLMResponse(content="planning artifacts done", tool_calls=[], raw={}),
             _response(
+                *_workflow_child_task_calls(workflow_id),
+                _artifact_metadata_update_call(
+                    "update-task-spec-task-ids",
+                    artifact_id="artifact_0002",
+                    metadata={
+                        "workflow_id": workflow_id,
+                        "role": "pm",
+                        "task_ids": dict(_ROLE_TASK_IDS),
+                    },
+                    expected_version=1,
+                    change_summary="Linked the required Workflow task graph.",
+                ),
+            ),
+            LLMResponse(content="task graph completed", tool_calls=[], raw={}),
+            *_successful_outputs(workflow_id, include_pm=False),
+        ]
+    )
+    workflow = _workflow(tmp_path, llm)
+
+    result = workflow.run("Build a task-backed feature.", run_id=workflow_id)
+
+    assert result.status == "completed"
+    planning = result.phases[0]
+    assert planning.attempts == 2
+    assert "task" in planning.data["attempt_handoffs"][0]["gate_issue"].lower()
+    task_spec = ArtifactManager.for_workdir(tmp_path).get_artifact("artifact_0002")
+    assert task_spec.metadata["task_ids"] == _ROLE_TASK_IDS
+    tasks = TaskManager.for_workdir(
+        tmp_path,
+        task_list_id=workflow_id,
+    ).list_tasks()
+    assert [task.status for task in tasks] == ["completed"] * 4
+
+
+def test_serial_workflow_runs_fix_cycle_after_qa_fail(
+    tmp_path: Path,
+) -> None:
+    llm = FakeLLM(
+        [
+            _response(
+                *_planning_calls(
+                    "wf-fix",
+                    prd_content="Need fix.",
+                    task_content="Implement and verify.",
+                )
+            ),
+            LLMResponse(content="planning done", tool_calls=[], raw={}),
+            _role_task_response(
+                "engineer_implement",
                 _create_call(
                     "call-impl",
                     kind="implementation_report",
                     title="Implementation Report",
                     content="Initial implementation.",
-                )
+                ),
+                evidence="Initial implementation report was created.",
             ),
             LLMResponse(content="implementation done", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "qa_verify",
                 _create_call(
                     "call-test-fail",
                     kind="test_report",
                     title="Test Report",
                     content="Failure found.",
                     metadata={"verdict": "fail"},
-                )
+                ),
+                evidence="QA report records the initial failure.",
             ),
             LLMResponse(content="qa fail", tool_calls=[], raw={}),
-            _response(
+            _task_response(
+                "task_0005",
+                "engineer",
                 _update_call(
                     "call-fix",
                     artifact_id="artifact_0003",
                     content="Fixed implementation.",
                     expected_version=1,
                     change_summary="Addressed QA failure.",
-                )
+                ),
+                evidence="Implementation report was updated for the QA failure.",
             ),
             LLMResponse(content="fix done", tool_calls=[], raw={}),
-            _response(
+            _task_response(
+                "task_0006",
+                "qa",
                 _create_call(
                     "call-test-pass",
                     kind="test_report",
                     title="Regression Test Report",
                     content="Regression passes.",
                     metadata={"verdict": "pass"},
-                )
+                ),
+                evidence="Regression report records a pass.",
             ),
             LLMResponse(content="qa pass", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "pm_acceptance",
                 _create_call(
                     "call-accept",
                     kind="acceptance_report",
@@ -1598,7 +1979,8 @@ def test_serial_workflow_runs_fix_cycle_after_qa_fail(
                     content="Accepted after fix.",
                     status="accepted",
                     metadata={"verdict": "pass"},
-                )
+                ),
+                evidence="Acceptance report approves the fixed result.",
             ),
             LLMResponse(content="accepted", tool_calls=[], raw={}),
         ]
@@ -1683,43 +2065,33 @@ Map each requirement to evidence.
     )
     llm = FakeLLM(
         [
-            _response(
-                _create_call(
-                    "call-prd",
-                    kind="prd",
-                    title="PRD",
-                    content="Build the requested feature.",
-                    status="ready",
-                ),
-                _create_call(
-                    "call-task",
-                    kind="task_spec",
-                    title="Task Spec",
-                    content="Implementation scope.",
-                    status="ready",
-                ),
-            ),
+            _response(*_planning_calls("wf-skills")),
             LLMResponse(content="planning done", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "engineer_implement",
                 _create_call(
                     "call-impl",
                     kind="implementation_report",
                     title="Implementation Report",
                     content="Implemented.",
-                )
+                ),
+                evidence="Implementation report records completion.",
             ),
             LLMResponse(content="implementation done", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "qa_verify",
                 _create_call(
                     "call-test",
                     kind="test_report",
                     title="Test Report",
                     content="Pass.",
                     metadata={"verdict": "pass"},
-                )
+                ),
+                evidence="Test report records a QA pass.",
             ),
             LLMResponse(content="qa pass", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "pm_acceptance",
                 _create_call(
                     "call-accept",
                     kind="acceptance_report",
@@ -1727,7 +2099,8 @@ Map each requirement to evidence.
                     content="Accepted.",
                     status="accepted",
                     metadata={"verdict": "pass"},
-                )
+                ),
+                evidence="Acceptance report records approval.",
             ),
             LLMResponse(content="accepted", tool_calls=[], raw={}),
         ]
@@ -1848,6 +2221,65 @@ def _workflow(tmp_path: Path, llm: FakeLLM) -> SerialCodingWorkflow:
     )
 
 
+def _seed_workflow_task_graph(workdir: Path, workflow_id: str) -> None:
+    manager = TaskManager.for_workdir(workdir, task_list_id=workflow_id)
+    root = manager.create_task(
+        title="Complete the workflow",
+        description="Coordinate implementation, verification, and acceptance.",
+        scope="project",
+        metadata={
+            "workflow_id": workflow_id,
+            "task_key": "workflow_root",
+            "role": "workflow",
+        },
+    )
+    assert root.id == "task_0001"
+    manager.claim_task(root.id, owner="workflow-orchestrator")
+    engineer = manager.create_task(
+        title="Implement the requested change",
+        description="Implement the Task Spec and record evidence.",
+        scope="project",
+        owner="engineer",
+        parent_id=root.id,
+        metadata={
+            "workflow_id": workflow_id,
+            "task_key": "engineer_implement",
+            "role": "engineer",
+        },
+    )
+    qa = manager.create_task(
+        title="Verify the implementation",
+        description="Verify the implementation and record the effective verdict.",
+        scope="project",
+        owner="qa",
+        parent_id=root.id,
+        blocked_by=[engineer.id],
+        metadata={
+            "workflow_id": workflow_id,
+            "task_key": "qa_verify",
+            "role": "qa",
+        },
+    )
+    acceptance = manager.create_task(
+        title="Accept the verified result",
+        description="Compare the result with the authoritative QA verdict.",
+        scope="project",
+        owner="pm-acceptance",
+        parent_id=root.id,
+        blocked_by=[qa.id],
+        metadata={
+            "workflow_id": workflow_id,
+            "task_key": "pm_acceptance",
+            "role": "pm_acceptance",
+        },
+    )
+    assert [engineer.id, qa.id, acceptance.id] == [
+        "task_0002",
+        "task_0003",
+        "task_0004",
+    ]
+
+
 def _git(workdir: Path, *args: str) -> str:
     result = subprocess.run(
         ["git", *args],
@@ -1882,40 +2314,26 @@ def _successful_outputs(
     if include_pm:
         outputs.extend(
             [
-                _response(
-                    _create_call(
-                        f"{workflow_id}-prd",
-                        kind="prd",
-                        title="PRD",
-                        content="Build the requested feature.",
-                        status="ready",
-                        metadata={"workflow_id": workflow_id, "role": "pm"},
-                    ),
-                    _create_call(
-                        f"{workflow_id}-task",
-                        kind="task_spec",
-                        title="Task Spec",
-                        content="Implementation scope.",
-                        status="ready",
-                        metadata={"workflow_id": workflow_id, "role": "pm"},
-                    ),
-                ),
+                _response(*_planning_calls(workflow_id)),
                 LLMResponse(content="planning done", tool_calls=[], raw={}),
             ]
         )
     outputs.extend(
         [
-            _response(
+            _role_task_response(
+                "engineer_implement",
                 _create_call(
                     f"{workflow_id}-impl",
                     kind="implementation_report",
                     title="Implementation Report",
                     content="No code changes needed.",
                     metadata={"workflow_id": workflow_id, "role": "engineer"},
-                )
+                ),
+                evidence="Implementation report records that no changes were needed.",
             ),
             LLMResponse(content="implementation done", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "qa_verify",
                 _create_call(
                     f"{workflow_id}-test",
                     kind="test_report",
@@ -1926,10 +2344,12 @@ def _successful_outputs(
                         "role": "qa",
                         "verdict": "pass",
                     },
-                )
+                ),
+                evidence="Test report records the QA pass.",
             ),
             LLMResponse(content="qa pass", tool_calls=[], raw={}),
-            _response(
+            _role_task_response(
+                "pm_acceptance",
                 _create_call(
                     f"{workflow_id}-accept",
                     kind="acceptance_report",
@@ -1941,7 +2361,8 @@ def _successful_outputs(
                         "role": "pm",
                         "verdict": "pass",
                     },
-                )
+                ),
+                evidence="Acceptance report records approval.",
             ),
             LLMResponse(content="accepted", tool_calls=[], raw={}),
         ]
@@ -1951,7 +2372,8 @@ def _successful_outputs(
 
 def _worktree_no_change_outputs(workflow_id: str) -> list[LLMResponse]:
     return [
-        _response(
+        _role_task_response(
+            "engineer_implement",
             _create_call(
                 f"{workflow_id}-impl",
                 kind="implementation_report",
@@ -1964,10 +2386,12 @@ def _worktree_no_change_outputs(workflow_id: str) -> list[LLMResponse]:
                     "changed_files": [],
                     "no_change_reason": "The recovered task is verify-only.",
                 },
-            )
+            ),
+            evidence="Implementation report explains the verified no-change outcome.",
         ),
         LLMResponse(content="implementation done", tool_calls=[], raw={}),
-        _response(
+        _role_task_response(
+            "qa_verify",
             _run_lint_call(f"{workflow_id}-lint"),
             _create_call(
                 f"{workflow_id}-test",
@@ -1980,9 +2404,11 @@ def _worktree_no_change_outputs(workflow_id: str) -> list[LLMResponse]:
                     "verdict": "pass",
                 },
             ),
+            evidence="Lint passed for the current project state.",
         ),
         LLMResponse(content="qa pass", tool_calls=[], raw={}),
-        _response(
+        _role_task_response(
+            "pm_acceptance",
             _create_call(
                 f"{workflow_id}-accept",
                 kind="acceptance_report",
@@ -1994,7 +2420,8 @@ def _worktree_no_change_outputs(workflow_id: str) -> list[LLMResponse]:
                     "role": "pm",
                     "verdict": "pass",
                 },
-            )
+            ),
+            evidence="Acceptance report records approval.",
         ),
         LLMResponse(content="accepted", tool_calls=[], raw={}),
     ]
@@ -2008,6 +2435,195 @@ def _write_skill(tmp_path: Path, directory: str, manifest: str) -> None:
 
 def _response(*tool_calls: LLMToolCall) -> LLMResponse:
     return LLMResponse(content="", tool_calls=list(tool_calls), raw={})
+
+
+_ROLE_TASK_IDS = {
+    "engineer_implement": "task_0002",
+    "qa_verify": "task_0003",
+    "pm_acceptance": "task_0004",
+}
+_ROLE_TASK_OWNERS = {
+    "engineer_implement": "engineer",
+    "qa_verify": "qa",
+    "pm_acceptance": "pm-acceptance",
+}
+
+
+def _planning_calls(
+    workflow_id: str,
+    *,
+    prd_content: str = "Build the requested feature.",
+    task_content: str = "Implementation scope.",
+    change_required: bool | None = None,
+) -> list[LLMToolCall]:
+    task_ids = dict(_ROLE_TASK_IDS)
+    task_spec_metadata: dict[str, Any] = {
+        "workflow_id": workflow_id,
+        "role": "pm",
+        "task_ids": task_ids,
+    }
+    if change_required is not None:
+        task_spec_metadata["change_required"] = change_required
+    return [
+        _create_call(
+            f"{workflow_id}-prd",
+            kind="prd",
+            title="PRD",
+            content=prd_content,
+            status="ready",
+            metadata={"workflow_id": workflow_id, "role": "pm"},
+        ),
+        *_workflow_child_task_calls(workflow_id),
+        _create_call(
+            f"{workflow_id}-task-spec",
+            kind="task_spec",
+            title="Task Spec",
+            content=task_content,
+            status="ready",
+            metadata=task_spec_metadata,
+        ),
+    ]
+
+
+def _workflow_child_task_calls(workflow_id: str) -> list[LLMToolCall]:
+    return [
+        _task_create_call(
+            f"{workflow_id}-engineer-task",
+            title="Implement the requested change",
+            description="Implement the Task Spec and record evidence.",
+            owner="engineer",
+            parent_id="task_0001",
+            metadata={
+                "workflow_id": workflow_id,
+                "task_key": "engineer_implement",
+                "role": "engineer",
+            },
+        ),
+        _task_create_call(
+            f"{workflow_id}-qa-task",
+            title="Verify the implementation",
+            description="Verify the implementation and record the effective verdict.",
+            owner="qa",
+            parent_id="task_0001",
+            blocked_by=["task_0002"],
+            metadata={
+                "workflow_id": workflow_id,
+                "task_key": "qa_verify",
+                "role": "qa",
+            },
+        ),
+        _task_create_call(
+            f"{workflow_id}-acceptance-task",
+            title="Accept the verified result",
+            description="Compare the result with the authoritative QA verdict.",
+            owner="pm-acceptance",
+            parent_id="task_0001",
+            blocked_by=["task_0003"],
+            metadata={
+                "workflow_id": workflow_id,
+                "task_key": "pm_acceptance",
+                "role": "pm_acceptance",
+            },
+        ),
+    ]
+
+
+def _role_task_response(
+    task_key: str,
+    *tool_calls: LLMToolCall,
+    evidence: str,
+) -> LLMResponse:
+    task_id = _ROLE_TASK_IDS[task_key]
+    return _task_response(
+        task_id,
+        _ROLE_TASK_OWNERS[task_key],
+        *tool_calls,
+        evidence=evidence,
+    )
+
+
+def _task_response(
+    task_id: str,
+    owner: str,
+    *tool_calls: LLMToolCall,
+    evidence: str | None = None,
+    claim: bool = True,
+    complete: bool = True,
+) -> LLMResponse:
+    calls: list[LLMToolCall] = []
+    if claim:
+        calls.append(
+            _task_claim_call(
+                f"claim-{task_id}",
+                task_id=task_id,
+                owner=owner,
+            )
+        )
+    calls.extend(tool_calls)
+    if complete:
+        if not evidence:
+            raise ValueError("Task completion evidence is required.")
+        calls.append(
+            _task_complete_call(
+                f"complete-{task_id}",
+                task_id=task_id,
+                evidence=evidence,
+            )
+        )
+    return _response(
+        *calls,
+    )
+
+
+def _task_create_call(
+    call_id: str,
+    *,
+    title: str,
+    description: str,
+    owner: str,
+    parent_id: str,
+    metadata: dict[str, Any],
+    blocked_by: list[str] | None = None,
+) -> LLMToolCall:
+    arguments: dict[str, Any] = {
+        "title": title,
+        "description": description,
+        "scope": "project",
+        "owner": owner,
+        "parent_id": parent_id,
+        "metadata": metadata,
+    }
+    if blocked_by:
+        arguments["blocked_by"] = blocked_by
+    return LLMToolCall(
+        id=call_id,
+        name="task_create",
+        arguments=arguments,
+        raw={"id": call_id, "name": "task_create"},
+    )
+
+
+def _task_claim_call(call_id: str, *, task_id: str, owner: str) -> LLMToolCall:
+    return LLMToolCall(
+        id=call_id,
+        name="task_claim",
+        arguments={"task_id": task_id, "owner": owner},
+        raw={"id": call_id, "name": "task_claim"},
+    )
+
+
+def _task_complete_call(
+    call_id: str,
+    *,
+    task_id: str,
+    evidence: str,
+) -> LLMToolCall:
+    return LLMToolCall(
+        id=call_id,
+        name="task_complete",
+        arguments={"task_id": task_id, "evidence": evidence},
+        raw={"id": call_id, "name": "task_complete"},
+    )
 
 
 def _create_call(
@@ -2093,6 +2709,27 @@ def _update_call(
         arguments={
             "artifact_id": artifact_id,
             "content": content,
+            "expected_version": expected_version,
+            "change_summary": change_summary,
+        },
+        raw={"id": call_id, "name": "artifact_update"},
+    )
+
+
+def _artifact_metadata_update_call(
+    call_id: str,
+    *,
+    artifact_id: str,
+    metadata: dict[str, Any],
+    expected_version: int,
+    change_summary: str,
+) -> LLMToolCall:
+    return LLMToolCall(
+        id=call_id,
+        name="artifact_update",
+        arguments={
+            "artifact_id": artifact_id,
+            "metadata": metadata,
             "expected_version": expected_version,
             "change_summary": change_summary,
         },
