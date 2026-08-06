@@ -144,7 +144,12 @@ def test_serial_workflow_runs_pm_engineer_qa_acceptance(
                     kind="acceptance_report",
                     title="Acceptance Report",
                     content="Accepted.",
-                    metadata={"workflow_id": "wf-pass", "role": "pm"},
+                    status="accepted",
+                    metadata={
+                        "workflow_id": "wf-pass",
+                        "role": "pm",
+                        "verdict": "pass",
+                    },
                 )
             ),
             LLMResponse(content="accepted", tool_calls=[], raw={}),
@@ -201,6 +206,98 @@ def test_serial_workflow_runs_pm_engineer_qa_acceptance(
     ]
 
 
+def test_serial_workflow_retries_acceptance_that_conflicts_with_qa(
+    tmp_path: Path,
+) -> None:
+    workflow_id = "wf-rejected"
+    llm = FakeLLM(
+        [
+            _response(
+                _create_call(
+                    "call-prd",
+                    kind="prd",
+                    title="PRD",
+                    content="Build the requested feature.",
+                    status="ready",
+                ),
+                _create_call(
+                    "call-task",
+                    kind="task_spec",
+                    title="Task Spec",
+                    content="Implementation scope.",
+                    status="ready",
+                ),
+            ),
+            LLMResponse(content="planning done", tool_calls=[], raw={}),
+            _response(
+                _create_call(
+                    "call-impl",
+                    kind="implementation_report",
+                    title="Implementation Report",
+                    content="Implementation attempted.",
+                )
+            ),
+            LLMResponse(content="implementation done", tool_calls=[], raw={}),
+            _response(
+                _create_call(
+                    "call-test",
+                    kind="test_report",
+                    title="Test Report",
+                    content="Verification failed.",
+                    metadata={"verdict": "fail"},
+                )
+            ),
+            LLMResponse(content="qa failed", tool_calls=[], raw={}),
+            _response(
+                _create_call(
+                    "call-wrong-accept",
+                    kind="acceptance_report",
+                    title="Acceptance Report",
+                    content="Incorrectly accepted.",
+                    status="accepted",
+                    metadata={"verdict": "pass"},
+                )
+            ),
+            LLMResponse(content="accepted", tool_calls=[], raw={}),
+            _response(
+                _create_call(
+                    "call-reject",
+                    kind="acceptance_report",
+                    title="Rejection Report",
+                    content="Rejected because QA failed.",
+                    status="ready",
+                    metadata={"verdict": "fail"},
+                )
+            ),
+            LLMResponse(content="rejected", tool_calls=[], raw={}),
+        ]
+    )
+    workflow = SerialCodingWorkflow(
+        llm=llm,  # type: ignore[arg-type]
+        workdir=tmp_path,
+        artifact_manager=ArtifactManager.for_workdir(tmp_path),
+        approval_provider=AutoApprovalProvider(approved=True),
+        isolation="shared",
+        max_fix_cycles=0,
+    )
+
+    result = workflow.run("Build a feature.", run_id=workflow_id)
+
+    assert result.status == "failed"
+    assert result.qa_verdict == "fail"
+    acceptance = next(
+        phase for phase in result.phases if phase.phase == "pm_acceptance"
+    )
+    assert acceptance.status == "completed"
+    assert acceptance.attempts == 2
+    assert acceptance.data["acceptance_verdict"] == "fail"
+    assert acceptance.data["agent_status"] == "completed"
+    assert any(
+        "must match the authoritative QA verdict" in str(messages)
+        for messages in llm.messages
+    )
+
+
 def test_serial_workflow_runs_code_phases_in_one_worktree(
     tmp_path: Path,
 ) -> None:
@@ -240,7 +337,7 @@ def test_serial_workflow_runs_code_phases_in_one_worktree(
                     content="Updated app.py in the isolated workspace.",
                     metadata={
                         "outcome": "changed",
-                        "changed_files": ["app.py"],
+                        "changed_files": ["incomplete-report.py"],
                     },
                 ),
             ),
@@ -262,6 +359,8 @@ def test_serial_workflow_runs_code_phases_in_one_worktree(
                     kind="acceptance_report",
                     title="Acceptance Report",
                     content="Accepted and ready to apply.",
+                    status="accepted",
+                    metadata={"verdict": "pass"},
                 )
             ),
             LLMResponse(content="accepted", tool_calls=[], raw={}),
@@ -295,7 +394,16 @@ def test_serial_workflow_runs_code_phases_in_one_worktree(
         "implementation_evidence"
     ]
     assert engineer_evidence["changed_this_phase"] is True
+    assert engineer_evidence["declared_changed_files"] == ["incomplete-report.py"]
     assert engineer_evidence["actual_changed_files"] == ["app.py"]
+    assert engineer_evidence["effective_changed_files"] == ["app.py"]
+    assert engineer_evidence["metadata_reconciled"] is True
+    implementation_report = next(
+        artifact
+        for artifact in ArtifactManager.for_workdir(workdir).list_artifacts()
+        if artifact.kind == "implementation_report"
+    )
+    assert implementation_report.metadata["changed_files"] == ["app.py"]
     qa_evidence = record.checkpoints["qa_verify"].data["qa_evidence"]
     assert qa_evidence["successful_checks"] == 1
     assert qa_evidence["verification"][0]["outcome"] == "clean"
@@ -661,6 +769,8 @@ def test_worktree_evidence_gate_downgrades_false_pass_and_runs_fix_cycle(
                     kind="acceptance_report",
                     title="Acceptance Report",
                     content="Accepted after the evidence-driven fix.",
+                    status="accepted",
+                    metadata={"verdict": "pass"},
                 )
             ),
             LLMResponse(content="accepted", tool_calls=[], raw={}),
@@ -777,6 +887,8 @@ def test_worktree_evidence_gate_retries_qa_after_permission_tool_error(
                     kind="acceptance_report",
                     title="Acceptance Report",
                     content="Accepted after QA retry.",
+                    status="accepted",
+                    metadata={"verdict": "pass"},
                 )
             ),
             LLMResponse(content="accepted", tool_calls=[], raw={}),
@@ -802,6 +914,144 @@ def test_worktree_evidence_gate_retries_qa_after_permission_tool_error(
     assert handoffs[0]["verification"][0]["outcome"] == "tool_error"
     assert "must be retried" in handoffs[0]["gate_issue"]
     assert handoffs[1]["verification"][0]["outcome"] == "passed"
+    assert not any(phase.phase == "engineer_fix" for phase in result.phases)
+    assert result.worktree is not None
+    manager.remove(result.worktree["worktree"]["id"], discard_changes=True)
+
+
+def test_worktree_evidence_gate_retries_qa_after_environment_setup_error(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    def environment_error(*_: Any, **__: Any) -> dict[str, Any]:
+        return {
+            "outcome": "error",
+            "runner": "pytest",
+            "execution_environment": "uv_project",
+            "status": "failed",
+            "command": "uv run --locked python -m pytest",
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": "error: Failed to download package",
+            "stdout_path": "/tmp/stdout.log",
+            "stderr_path": "/tmp/stderr.log",
+            "duration_ms": 1.0,
+            "timed_out": False,
+            "truncated": False,
+            "error_kind": "environment_setup_failed",
+            "diagnostic": "error: Failed to download package",
+            "summary": {
+                "passed": 0,
+                "failed": 0,
+                "errors": 0,
+                "skipped": 0,
+                "total": 0,
+            },
+            "failures": [],
+            "report_path": None,
+        }
+
+    monkeypatch.setattr(
+        "llm_agent.tools.verification_tools.VerificationTools.run_tests",
+        environment_error,
+    )
+    workdir = _repository(tmp_path)
+    manager = WorktreeManager.for_workdir(workdir)
+    llm = FakeLLM(
+        [
+            _response(
+                _create_call(
+                    "call-prd",
+                    kind="prd",
+                    title="PRD",
+                    content="Change app.py.",
+                    status="ready",
+                ),
+                _create_call(
+                    "call-task",
+                    kind="task_spec",
+                    title="Task Spec",
+                    content="Change app.py and verify it.",
+                    status="ready",
+                    metadata={"change_required": True},
+                ),
+            ),
+            LLMResponse(content="planning done", tool_calls=[], raw={}),
+            _response(
+                _edit_call(
+                    "call-edit",
+                    path="app.py",
+                    old_text="value = 'original'",
+                    new_text="value = 'workflow'",
+                ),
+                _create_call(
+                    "call-impl",
+                    kind="implementation_report",
+                    title="Implementation Report",
+                    content="Changed app.py.",
+                    metadata={
+                        "outcome": "changed",
+                        "changed_files": ["app.py"],
+                    },
+                ),
+            ),
+            LLMResponse(content="implementation done", tool_calls=[], raw={}),
+            _response(
+                _run_tests_call("call-tests-blocked", targets=["app.py"]),
+                _create_call(
+                    "call-first-report",
+                    kind="test_report",
+                    title="Test Report",
+                    content="The environment setup failed.",
+                    metadata={"verdict": "fail"},
+                ),
+            ),
+            LLMResponse(content="qa blocked", tool_calls=[], raw={}),
+            _response(
+                _run_lint_call("call-lint-passed"),
+                _create_call(
+                    "call-second-report",
+                    kind="test_report",
+                    title="Retry Test Report",
+                    content="Lint passed after the transient blocker cleared.",
+                    metadata={"verdict": "pass"},
+                ),
+            ),
+            LLMResponse(content="qa retry pass", tool_calls=[], raw={}),
+            _response(
+                _create_call(
+                    "call-accept",
+                    kind="acceptance_report",
+                    title="Acceptance Report",
+                    content="Accepted after QA retry.",
+                    status="accepted",
+                    metadata={"verdict": "pass"},
+                )
+            ),
+            LLMResponse(content="accepted", tool_calls=[], raw={}),
+        ]
+    )
+    workflow = SerialCodingWorkflow(
+        llm=llm,  # type: ignore[arg-type]
+        workdir=workdir,
+        artifact_manager=ArtifactManager.for_workdir(workdir),
+        approval_provider=AutoApprovalProvider(approved=True),
+        worktree_manager=manager,
+        isolation="worktree",
+    )
+
+    result = workflow.run("Change app.py.", run_id="wf-environment-blocked")
+
+    assert result.status == "completed"
+    assert result.fix_cycles == 0
+    qa = next(phase for phase in result.phases if phase.phase == "qa_verify")
+    assert qa.attempts == 2
+    first_check = qa.data["attempt_handoffs"][0]["verification"][0]
+    assert first_check["error_kind"] == "environment_setup_failed"
+    assert "project-environment setup error" in str(
+        qa.data["attempt_handoffs"][0]["gate_issue"]
+    )
+    assert "Failed to download package" in str(llm.messages[6])
     assert not any(phase.phase == "engineer_fix" for phase in result.phases)
     assert result.worktree is not None
     manager.remove(result.worktree["worktree"]["id"], discard_changes=True)
@@ -897,6 +1147,8 @@ def test_worktree_fix_cycle_requires_a_new_diff_and_regression_evidence(
                     kind="acceptance_report",
                     title="Acceptance Report",
                     content="Accepted after the verified fix.",
+                    status="accepted",
+                    metadata={"verdict": "pass"},
                 )
             ),
             LLMResponse(content="accepted", tool_calls=[], raw={}),
@@ -916,6 +1168,7 @@ def test_worktree_fix_cycle_requires_a_new_diff_and_regression_evidence(
     assert result.status == "completed"
     assert result.fix_cycles == 1
     fix_phase = next(phase for phase in result.phases if phase.phase == "engineer_fix")
+    assert fix_phase.run_ids == ["wf-fix-evidence-engineer_fix_1-1"]
     fix_evidence = fix_phase.data["implementation_evidence"]
     assert fix_evidence["changed_this_phase"] is True
     assert (
@@ -925,6 +1178,7 @@ def test_worktree_fix_cycle_requires_a_new_diff_and_regression_evidence(
     regression = next(
         phase for phase in result.phases if phase.phase == "qa_regression"
     )
+    assert regression.run_ids == ["wf-fix-evidence-qa_regression_1-1"]
     assert regression.data["qa_evidence"]["successful_checks"] == 1
     assert result.worktree is not None
     isolated = Path(result.worktree["worktree"]["path"])
@@ -1237,6 +1491,8 @@ def test_serial_workflow_retries_missing_artifact_gate(
                     kind="acceptance_report",
                     title="Acceptance Report",
                     content="Accepted.",
+                    status="accepted",
+                    metadata={"verdict": "pass"},
                 )
             ),
             LLMResponse(content="accepted", tool_calls=[], raw={}),
@@ -1249,6 +1505,7 @@ def test_serial_workflow_retries_missing_artifact_gate(
     assert result.status == "completed"
     assert result.phases[0].phase == "pm_plan"
     assert result.phases[0].attempts == 2
+    assert result.phases[0].data["agent_status"] == "completed"
     assert any(
         "did not satisfy its completion evidence gate"
         in str(message.get("content", ""))
@@ -1257,6 +1514,8 @@ def test_serial_workflow_retries_missing_artifact_gate(
     )
     retry_messages = llm.messages[2]
     assert "forgot task spec" in str(retry_messages)
+    assert "<working_state>" in str(retry_messages)
+    assert "persisted short-term working state" in str(retry_messages)
     assert "<attempt_handoff>" in str(retry_messages)
     assert "Create the planning handoff artifacts" in str(retry_messages)
     run_data = json.loads(
@@ -1337,6 +1596,8 @@ def test_serial_workflow_runs_fix_cycle_after_qa_fail(
                     kind="acceptance_report",
                     title="Acceptance Report",
                     content="Accepted after fix.",
+                    status="accepted",
+                    metadata={"verdict": "pass"},
                 )
             ),
             LLMResponse(content="accepted", tool_calls=[], raw={}),
@@ -1464,6 +1725,8 @@ Map each requirement to evidence.
                     kind="acceptance_report",
                     title="Acceptance Report",
                     content="Accepted.",
+                    status="accepted",
+                    metadata={"verdict": "pass"},
                 )
             ),
             LLMResponse(content="accepted", tool_calls=[], raw={}),
@@ -1672,7 +1935,12 @@ def _successful_outputs(
                     kind="acceptance_report",
                     title="Acceptance Report",
                     content="Accepted.",
-                    metadata={"workflow_id": workflow_id, "role": "pm"},
+                    status="accepted",
+                    metadata={
+                        "workflow_id": workflow_id,
+                        "role": "pm",
+                        "verdict": "pass",
+                    },
                 )
             ),
             LLMResponse(content="accepted", tool_calls=[], raw={}),
@@ -1720,7 +1988,12 @@ def _worktree_no_change_outputs(workflow_id: str) -> list[LLMResponse]:
                 kind="acceptance_report",
                 title="Acceptance Report",
                 content="Accepted.",
-                metadata={"workflow_id": workflow_id, "role": "pm"},
+                status="accepted",
+                metadata={
+                    "workflow_id": workflow_id,
+                    "role": "pm",
+                    "verdict": "pass",
+                },
             )
         ),
         LLMResponse(content="accepted", tool_calls=[], raw={}),

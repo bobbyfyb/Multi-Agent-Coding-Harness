@@ -7,7 +7,7 @@ import shlex
 import signal
 import subprocess
 from time import perf_counter
-from typing import Any, Sequence
+from typing import Any, Iterable, Sequence
 from uuid import uuid4
 
 from llm_agent.security import safe_subprocess_env, validate_shell_command
@@ -39,6 +39,7 @@ def run_command(
     preview_chars: int = 50_000,
     shell: bool = False,
     terminate_grace_seconds: float = 1.0,
+    unset_env: Iterable[str] = (),
 ) -> dict[str, Any]:
     if timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be greater than zero.")
@@ -53,6 +54,9 @@ def run_command(
     stdout_path = artifact_dir / "stdout.log"
     stderr_path = artifact_dir / "stderr.log"
     started_at = perf_counter()
+    environment = safe_subprocess_env(cwd)
+    for key in unset_env:
+        environment.pop(key, None)
 
     try:
         with (
@@ -63,7 +67,7 @@ def run_command(
                 command,
                 shell=shell,
                 cwd=cwd,
-                env=safe_subprocess_env(cwd),
+                env=environment,
                 stdin=subprocess.DEVNULL,
                 stdout=stdout_file,
                 stderr=stderr_file,

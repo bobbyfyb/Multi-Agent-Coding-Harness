@@ -181,9 +181,13 @@ run_tests  -> pytest + JUnit XML
 run_lint   -> Ruff JSON diagnostics
 ```
 
-两者当前同步执行，使用固定参数数组而不是模型拼接的 Shell 命令。测试失败或
-发现 Lint 问题会返回 `outcome=failed/issues_found`，不会触发工具异常，也不会
-自动修改文件。长时间完整测试仍可使用后台 Bash。
+两者当前同步执行，使用固定参数数组而不是模型拼接的 Shell 命令。存在
+`pyproject.toml + uv.lock` 时通过 `uv run --locked --no-env-file` 使用目标项目的
+锁定环境，不继承 Harness 的 `VIRTUAL_ENV`；其他目录沿用 Harness 解释器。
+测试失败或发现 Lint 问题会返回 `outcome=failed/issues_found`，不会触发工具异常。
+依赖导入、锁文件和环境同步错误分别返回 `missing_dependency`、`lock_outdated` 和
+`environment_setup_failed`；完整输出仍落盘，checkpoint 只保存有界诊断。长时间
+完整测试仍可使用后台 Bash。
 
 ## Worktree Isolation
 
@@ -708,7 +712,9 @@ Worktree，若隔离目录已经丢失则明确失败，不会静默创建新目
 近期动作会滚动写入 checkpoint 的 `current_attempt_state`；attempt 正常结束或失败
 时再固化为有界的 `data.attempt_handoffs`，记录最后状态摘要、门禁失败原因、工具
 计数、近期动作与失败、结构化验证结果及 Worktree changed files。下一次 Retry
-或 `/workflow-resume` 会将最新 handoff 注入角色 prompt，并要求从现有工作区继续；
+或 `/workflow-resume` 会先将这些事实整理为精简的 `working_state`，再连同最新
+handoff 注入角色 prompt，并要求从现有工作区继续；Trace 会记录
+`workflow.working_context.injected`，CLI 也会显示恢复的 attempt 和 changed-file 数量；
 进程被强制中断时也会先把滚动状态恢复成 interrupted handoff。该机制不会回放
 完整历史，也不会把临时进展混入长期 Memory。每个 Workflow 角色额外保留最近
 8 个完整工具结果，更早的结构化结果压缩后仍保留 outcome、路径、摘要或短预览。
@@ -720,17 +726,21 @@ Worktree，若隔离目录已经丢失则明确失败，不会静默创建新目
 `run_lint` 的结构化结果是验证事实。
 
 - PM 的 TaskSpec 必须设置布尔值 `metadata.change_required`。
-- Engineer 的 ImplementationReport 必须设置 `metadata.outcome` 和
-  `metadata.changed_files`；`outcome=changed` 要求该阶段的 Diff 哈希确实变化，
-  且声明文件与当前 Worktree changed files 完全一致。
+- Engineer 的 ImplementationReport 必须设置 `metadata.outcome`；
+  `outcome=changed` 要求该阶段的 Diff 哈希确实变化。`metadata.changed_files`
+  会与 Worktree 事实对账，不一致时由 Orchestrator 自动校正并记录 warning，避免
+  机器已经掌握的文件清单抄写错误直接报废整个阶段。
 - `outcome=no_change` 只允许用于 `change_required=false`，并要求提供
   `metadata.no_change_reason`。
 - QA 的 `metadata.verdict=pass` 至少需要一次当前尝试中成功的 `run_tests` 或
   `run_lint`，且不能同时存在失败、超时或工具错误，也不能在 QA 阶段改变 Patch。
 - 如果 QA 报告声称 `pass`，但测试、Lint、超时或执行错误等机器证据表明失败，
   编排器会把有效 verdict 降级为 `fail` 并进入 Engineer Fix；报告值和有效值都会
-  保存在 checkpoint。纯权限/工具调用错误仍留在 QA 重试，避免误导 Engineer。
-- 编排器把最终证据摘要注入 PM Acceptance，报告声明和运行事实冲突时以后者为准。
+  保存在 checkpoint。未声明依赖和过期 lockfile 属于 Engineer 可修复证据；纯
+  权限、工具调用或项目环境同步错误留在 QA 重试，避免误导 Engineer。
+- 编排器把最终证据摘要注入 PM Acceptance。AcceptanceReport 必须设置与权威
+  QA 结论一致的 `metadata.verdict`；只有 `verdict=pass` 可以使用
+  `status=accepted`，冲突时该阶段会携带纠错上下文重试。
 
 示例 Artifact metadata：
 
@@ -739,6 +749,9 @@ Worktree，若隔离目录已经丢失则明确失败，不会静默创建新目
 {"outcome": "changed", "changed_files": ["src/app.py", "tests/test_app.py"]}
 {"verdict": "pass"}
 ```
+
+最后一行同时适用于 TestReport 和 AcceptanceReport；AcceptanceReport verdict
+为 `pass` 时，Artifact 自身的 `status` 还必须为 `accepted`。
 
 Diff 快照和验证结果会立即写入 phase checkpoint，因此中断恢复不依赖 Trace 或
 模型记忆。`shared` 模式没有独立 Diff 事实源，只保留原有 Artifact/verdict 门禁，

@@ -16,8 +16,14 @@ PATH_ARGUMENT_TOOLS = {
 }
 MUTATING_FILE_TOOLS = {"write_file", "edit_file"}
 EXECUTION_TOOL_REASONS = {
-    "run_tests": "run_tests executes project test code",
-    "run_lint": "run_lint executes project lint tooling",
+    "run_tests": (
+        "run_tests may synchronize locked project dependencies and executes "
+        "project test code"
+    ),
+    "run_lint": (
+        "run_lint may synchronize locked project dependencies and executes "
+        "project lint tooling"
+    ),
 }
 
 

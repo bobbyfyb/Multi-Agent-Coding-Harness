@@ -554,11 +554,11 @@ class SerialCodingWorkflow:
                 qa_verdict=qa_verdict,
                 evidence_summary=self._format_evidence_summary(record),
             ),
-            gate=lambda before, _: self._gate_required_artifacts(
+            gate=lambda before, _: self._gate_acceptance_report(
                 workflow_id,
                 initial_artifact_ids,
                 before,
-                required={"acceptance_report": None},
+                qa_verdict=qa_verdict,
             ),
             execution_workdir=execution_workdir,
             on_event=on_event,
@@ -780,7 +780,7 @@ class SerialCodingWorkflow:
                 )
             messages.append({"role": "user", "content": attempt_prompt})
 
-            phase_run_id = f"{workflow_id}-{phase}-{attempt}"
+            phase_run_id = f"{workflow_id}-{phase_key}-{attempt}"
             run_ids.append(phase_run_id)
             self._update_phase_checkpoint_data(
                 record,
@@ -812,6 +812,41 @@ class SerialCodingWorkflow:
                 )
                 if on_event is not None:
                     on_event(event)
+
+            if retry_issue is not None and latest_handoff is not None:
+                restored_files = self._handoff_changed_files(latest_handoff)
+                self._record_workflow_trace(
+                    "workflow.working_context.injected",
+                    phase="event",
+                    data={
+                        "workflow_id": workflow_id,
+                        "phase_key": phase_key,
+                        "phase": phase,
+                        "attempt": attempt,
+                        "source_attempt": latest_handoff.get("attempt"),
+                        "changed_files": restored_files,
+                        "gate_issue": retry_issue,
+                    },
+                )
+                if on_event is not None:
+                    on_event(
+                        AgentEvent(
+                            type="progress",
+                            step=0,
+                            data={
+                                "content": (
+                                    "Restored working context from attempt "
+                                    f"{latest_handoff.get('attempt', '?')}: "
+                                    f"{len(restored_files)} changed file(s). "
+                                    "Continuing from the existing Worktree."
+                                )
+                            },
+                            agent_id=role.agent_id,
+                            run_id=phase_run_id,
+                            parent_run_id=workflow_id,
+                            depth=1,
+                        )
+                    )
 
             try:
                 result = agent.run(
@@ -850,7 +885,11 @@ class SerialCodingWorkflow:
                     artifact_ids=gate_result.artifact_ids,
                     data={**gate_result.data, "agent_status": result.status},
                 )
-            phase_data = {**phase_data, **gate_result.data}
+            phase_data = {
+                **phase_data,
+                **gate_result.data,
+                "agent_status": result.status,
+            }
             handoff = self._build_attempt_handoff(
                 record=record,
                 phase=phase,
@@ -1092,9 +1131,18 @@ class SerialCodingWorkflow:
             "timed_out",
             "duration_ms",
             "report_path",
+            "execution_environment",
+            "error_kind",
+            "diagnostic",
         ):
             if payload.get(key) is not None:
-                evidence[key] = payload[key]
+                value = payload[key]
+                evidence[key] = value[:2_000] if isinstance(value, str) else value
+        missing_modules = payload.get("missing_modules")
+        if isinstance(missing_modules, list):
+            evidence["missing_modules"] = [
+                str(module)[:200] for module in missing_modules[:20]
+            ]
         if payload.get("summary") is not None:
             evidence["summary"] = str(payload["summary"])[:1_000]
         failures = payload.get("failures")
@@ -1592,6 +1640,8 @@ class SerialCodingWorkflow:
             "outcome": outcome or None,
             "changed_this_phase": changed_this_phase,
             "declared_changed_files": declared_files,
+            "effective_changed_files": actual_files,
+            "metadata_reconciled": False,
             "actual_changed_files": actual_files,
             "worktree_before": before,
             "worktree_after": after,
@@ -1610,11 +1660,6 @@ class SerialCodingWorkflow:
                 "implementation_report metadata.outcome must be 'changed', "
                 "'no_change', or 'blocked'."
             )
-        if declared_files is None:
-            return failed(
-                "implementation_report metadata.changed_files must be a list "
-                "of relative file paths."
-            )
         if outcome == "blocked":
             return failed("Engineer reported outcome=blocked.")
         if outcome == "no_change":
@@ -1631,11 +1676,6 @@ class SerialCodingWorkflow:
                 )
             if not reason:
                 return failed("outcome=no_change requires metadata.no_change_reason.")
-            if declared_files != actual_files:
-                return failed(
-                    "ImplementationReport changed_files does not match the "
-                    "current Worktree Diff."
-                )
         else:
             if not changed_this_phase:
                 return failed(
@@ -1647,17 +1687,31 @@ class SerialCodingWorkflow:
                     "ImplementationReport declares outcome=changed, but the "
                     "Worktree contains no project file changes."
                 )
-            if declared_files != actual_files:
-                return failed(
-                    "ImplementationReport changed_files does not match the "
-                    "actual Worktree changed files."
-                )
+
+        warning: str | None = None
+        if declared_files != actual_files:
+            self.artifact_manager.update_artifact(
+                report.id,
+                metadata={"changed_files": actual_files},
+                expected_version=report.version,
+                change_summary=(
+                    "Reconciled changed_files with authoritative Worktree evidence."
+                ),
+            )
+            warning = (
+                "ImplementationReport changed_files differed from the Worktree; "
+                "the metadata was reconciled to the authoritative changed-file list."
+            )
+            evidence["metadata_reconciled"] = True
 
         return _GateResult(
             ok=True,
-            message="ok",
+            message=warning or "ok",
             artifact_ids=gate.artifact_ids,
-            data={"implementation_evidence": evidence},
+            data={
+                "implementation_evidence": evidence,
+                **({"gate_warning": warning} if warning else {}),
+            },
         )
 
     def _gate_required_artifacts(
@@ -1762,9 +1816,13 @@ class SerialCodingWorkflow:
             if item.get("outcome")
             in {"failed", "issues_found", "error", "timed_out", "tool_error"}
         ]
-        actionable_failed = [
-            item for item in failed if item.get("outcome") != "tool_error"
+        blocked_failed = [
+            item
+            for item in failed
+            if item.get("outcome") == "tool_error"
+            or item.get("error_kind") == "environment_setup_failed"
         ]
+        actionable_failed = [item for item in failed if item not in blocked_failed]
         worktree_changed = isinstance(before, dict) and before.get(
             "diff_sha256"
         ) != after.get("diff_sha256")
@@ -1778,6 +1836,7 @@ class SerialCodingWorkflow:
             "successful_checks": len(successful),
             "failed_checks": len(failed),
             "actionable_failed_checks": len(actionable_failed),
+            "blocked_checks": len(blocked_failed),
             "worktree_changed_during_qa": worktree_changed,
             "worktree_before": before,
             "worktree_after": after,
@@ -1796,8 +1855,9 @@ class SerialCodingWorkflow:
             return _GateResult(
                 ok=False,
                 message=(
-                    "QA verification was blocked by a tool execution or permission "
-                    "error and must be retried before routing work to Engineer."
+                    "QA verification was blocked by a tool execution, permission, "
+                    "or project-environment setup error and must be retried before "
+                    "routing work to Engineer."
                 ),
                 artifact_ids=[artifact.id],
                 data={"qa_verdict": verdict, "qa_evidence": evidence},
@@ -1839,6 +1899,63 @@ class SerialCodingWorkflow:
             message="ok",
             artifact_ids=[artifact.id],
             data={"qa_verdict": verdict, "qa_evidence": evidence},
+        )
+
+    def _gate_acceptance_report(
+        self,
+        workflow_id: str,
+        initial_artifact_ids: set[str],
+        before_versions: dict[str, int],
+        *,
+        qa_verdict: str | None,
+    ) -> _GateResult:
+        gate = self._gate_required_artifacts(
+            workflow_id,
+            initial_artifact_ids,
+            before_versions,
+            required={"acceptance_report": None},
+        )
+        if not gate.ok:
+            return gate
+
+        artifact = self.artifact_manager.get_artifact(gate.artifact_ids[0])
+        verdict = str(artifact.metadata.get("verdict", "")).strip().lower()
+        if verdict not in {"pass", "fail"}:
+            return _GateResult(
+                ok=False,
+                message=(
+                    "acceptance_report must set metadata.verdict to 'pass' or 'fail'."
+                ),
+                artifact_ids=[artifact.id],
+            )
+
+        expected = "pass" if qa_verdict == "pass" else "fail"
+        if verdict != expected:
+            return _GateResult(
+                ok=False,
+                message=(
+                    "acceptance_report metadata.verdict must match the authoritative "
+                    f"QA verdict: expected {expected!r}, got {verdict!r}."
+                ),
+                artifact_ids=[artifact.id],
+            )
+
+        accepted = artifact.status == "accepted"
+        if accepted != (verdict == "pass"):
+            required_status = "accepted" if verdict == "pass" else "not accepted"
+            return _GateResult(
+                ok=False,
+                message=(
+                    "acceptance_report status conflicts with metadata.verdict; "
+                    f"verdict={verdict!r} requires status {required_status}."
+                ),
+                artifact_ids=[artifact.id],
+            )
+        return _GateResult(
+            ok=True,
+            message="ok",
+            artifact_ids=[artifact.id],
+            data={"acceptance_verdict": verdict},
         )
 
     def _artifact_from_ids(
@@ -1913,6 +2030,18 @@ class SerialCodingWorkflow:
                         summary = str(item.get("summary") or "").strip()
                         if summary:
                             check += f" summary={summary[:300]}"
+                        error_kind = str(item.get("error_kind") or "").strip()
+                        if error_kind:
+                            check += f" error_kind={error_kind}"
+                        missing_modules = [
+                            str(module).strip()
+                            for module in item.get("missing_modules") or []
+                            if str(module).strip()
+                        ]
+                        if missing_modules:
+                            check += " missing_modules=" + ", ".join(
+                                missing_modules[:20]
+                            )
                         failed_tests = [
                             str(failure.get("test") or "").strip()
                             for failure in item.get("failures") or []
@@ -1924,6 +2053,9 @@ class SerialCodingWorkflow:
                         error = str(item.get("error") or "").strip()
                         if error:
                             check += f" error={error[:300]}"
+                        diagnostic = str(item.get("diagnostic") or "").strip()
+                        if diagnostic:
+                            check += f" diagnostic={diagnostic[:500]}"
                         checks.append(check)
                 rendered_checks = ", ".join(checks) or "none"
                 reported_verdict = (
@@ -2249,8 +2381,16 @@ class SerialCodingWorkflow:
     ) -> str:
         handoff_context = ""
         if handoff is not None:
+            working_state = SerialCodingWorkflow._format_working_state(
+                phase,
+                issue,
+                handoff,
+            )
             handoff_context = (
-                "\n\n<attempt_handoff>\n"
+                "\n\n<working_state>\n"
+                f"{working_state}\n"
+                "</working_state>\n\n"
+                "<attempt_handoff>\n"
                 "This bounded checkpoint describes the previous attempt. The "
                 "current workspace and fresh tool evidence remain authoritative.\n"
                 f"{json.dumps(handoff, ensure_ascii=False, indent=2)}\n"
@@ -2266,6 +2406,90 @@ class SerialCodingWorkflow:
             "the existing workspace state and verify assumptions when needed."
             f"{handoff_context}"
         )
+
+    @staticmethod
+    def _handoff_changed_files(handoff: dict[str, Any]) -> list[str]:
+        worktree = handoff.get("worktree")
+        if not isinstance(worktree, dict):
+            return []
+        return [
+            str(path)
+            for path in worktree.get("changed_files") or []
+            if str(path).strip()
+        ]
+
+    @staticmethod
+    def _format_working_state(
+        phase: WorkflowPhase,
+        issue: str,
+        handoff: dict[str, Any],
+    ) -> str:
+        changed_files = SerialCodingWorkflow._handoff_changed_files(handoff)
+        lines = [
+            "This is persisted short-term working state, not a request to restart.",
+            f"Previous attempt: {handoff.get('attempt', 'unknown')} "
+            f"({handoff.get('agent_status', 'unknown')}).",
+            f"Unresolved completion issue: {issue}",
+            "Existing Worktree changes: "
+            + (", ".join(changed_files) if changed_files else "none"),
+        ]
+
+        failed_checks = []
+        for check in handoff.get("verification") or []:
+            if not isinstance(check, dict) or check.get("outcome") in {
+                "passed",
+                "clean",
+            }:
+                continue
+            rendered = (
+                f"{check.get('tool', 'unknown')}={check.get('outcome', 'unknown')}"
+            )
+            error_kind = str(check.get("error_kind") or "").strip()
+            if error_kind:
+                rendered += f" [{error_kind}]"
+            missing_modules = [
+                str(module).strip()
+                for module in check.get("missing_modules") or []
+                if str(module).strip()
+            ]
+            if missing_modules:
+                rendered += f" missing={', '.join(missing_modules[:10])}"
+            tests = [
+                str(failure.get("test") or "").strip()
+                for failure in check.get("failures") or []
+                if isinstance(failure, dict) and str(failure.get("test") or "").strip()
+            ]
+            if tests:
+                rendered += f" ({', '.join(tests[:10])})"
+            diagnostic = str(check.get("diagnostic") or "").strip()
+            if diagnostic:
+                rendered += f": {diagnostic[:500]}"
+            failed_checks.append(rendered)
+        if failed_checks:
+            lines.append("Failed verification: " + "; ".join(failed_checks))
+
+        recent_failures = [
+            f"{item.get('tool', 'unknown')}: {item.get('error', 'failed')}"
+            for item in handoff.get("recent_failures") or []
+            if isinstance(item, dict)
+        ]
+        if recent_failures:
+            lines.append("Recent tool failures: " + "; ".join(recent_failures[-4:]))
+
+        lines.extend(
+            [
+                "Continue from the existing Worktree. Do not repeat broad repository "
+                "discovery or recreate files already listed above.",
+                "Inspect the current diff and only the files needed to resolve the "
+                "issue, run focused verification, then update the required artifact.",
+            ]
+        )
+        if phase in {"engineer_implement", "engineer_fix"}:
+            lines.append(
+                "Before finishing, report every current Worktree changed file and "
+                "reserve enough turns for the implementation_report."
+            )
+        return "\n".join(f"- {line}" for line in lines)
 
     @staticmethod
     def _pm_prompt(workflow_id: str, request: str) -> str:
@@ -2336,6 +2560,8 @@ Required actions:
   selection is not proof that the requested behavior was tested.
 - Do not install packages into a shared interpreter. Record dependencies in project
   manifests and lockfiles, or use a virtual environment inside the Worktree.
+- Keep dependency manifests and lockfiles consistent. For a uv project, use uv add
+  or uv lock inside the Worktree instead of editing only pyproject.toml.
 - Create or update one artifact with kind="implementation_report".
 - Include metadata.workflow_id="{workflow_id}" and metadata.role="engineer".
 - Set metadata.outcome exactly to "changed", "no_change", or "blocked".
@@ -2377,6 +2603,8 @@ Required actions:
 - Set verdict="fail" for failed tests, lint issues, timeouts, or execution errors.
   If a tool cannot run because permission was denied, report that blocker and never
   claim the check passed.
+- Preserve structured error_kind, missing_modules, and diagnostic fields in failure
+  reports so Engineer can distinguish project defects from environment blockers.
 - Judge coverage from the selected test paths and collected test IDs. A keyword match
   count alone is not evidence that the requested feature was tested.
 - Create one artifact with kind="test_report".
@@ -2409,8 +2637,12 @@ Required actions:
 - Read the relevant PRD, TaskSpec, ImplementationReport, and TestReport artifacts.
 - Create one artifact with kind="acceptance_report".
 - Include metadata.workflow_id="{workflow_id}" and metadata.role="pm".
-- If QA verdict is pass, state accepted status and evidence.
-- If QA verdict is fail or unknown, state rejected/blocked status and blockers.
+- Set metadata.verdict="pass" only when the QA verdict is pass; otherwise set it
+  to "fail".
+- If metadata.verdict is "pass", create the report with status="accepted" and
+  state the supporting evidence.
+- If metadata.verdict is "fail", do not use status="accepted"; state that the
+  workflow is rejected or blocked and list the concrete blockers.
 - Do not modify source files.
 """.strip()
 

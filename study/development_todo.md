@@ -89,6 +89,7 @@ OAuth、并行 Agent Team、复杂 Web UI、向量数据库记忆和完整 MCP �
 - [x] 命令完整输出持久化到 `.llm_agent/tool-results/`
 - [x] 实现基于 Pytest JUnit XML 的 `run_tests`
 - [x] 实现基于 Ruff JSON 的 `run_lint`
+- [x] uv 项目验证使用 Worktree 锁定环境，并结构化区分依赖、lockfile 与环境错误
 - [x] `read_file` 支持行范围和 SHA256
 - [x] `edit_file` 支持唯一匹配、版本校验和原子写入
 
@@ -424,9 +425,11 @@ Web UI 可以继续复用同一个 Agent、Hook 和 Event 边界。
 - [x] QA gate 要求 `metadata.verdict` 明确为 `pass` 或 `fail`
 - [x] TaskSpec 要求声明布尔值 `metadata.change_required`
 - [x] Worktree phase 记录前后 Diff SHA、changed files，并持久化到 checkpoint
-- [x] ImplementationReport 的 `outcome / changed_files` 与真实 Worktree Diff 对账
+- [x] ImplementationReport 的 `outcome / changed_files` 与真实 Worktree Diff 对账；
+  `outcome` 与阶段 Diff 是硬门禁，文件清单不一致时按 Worktree 事实自动校正
 - [x] QA 验证工具结果在调用完成后立即持久化，不依赖 Trace 回放
 - [x] QA pass 要求真实成功的 `run_tests/run_lint`，且无失败证据和 QA 代码修改
+- [x] 环境同步失败在 QA 内重试；缺少依赖和过期 lockfile 路由给 Engineer
 - [x] Acceptance prompt 注入由 Orchestrator 汇总的实现与验证证据
 - [x] 阶段 completion evidence gate 失败时自动给同一 worker 一次纠正机会
 - [x] QA verdict 为 `fail` 时触发一次 Engineer fix cycle 和 QA regression
@@ -437,7 +440,8 @@ Web UI 可以继续复用同一个 Agent、Hook 和 Event 边界。
 - [x] Resume 基于 phase checkpoint 和 completion gate，不做完整 message replay
 - [x] 每次 attempt 持久化有界 handoff，记录动作、失败、验证和 Worktree 事实
 - [x] attempt 内滚动保存近期状态，强制中断后恢复为 interrupted handoff
-- [x] Gate retry 与进程重启后的 Resume 都注入最新 handoff，并续用 attempt 编号
+- [x] Gate retry 与进程重启后的 Resume 都注入最新 handoff 和精简 working state，
+  并续用 attempt 编号、记录 `workflow.working_context.injected`
 - [x] Workflow worker 保留最近 8 个完整工具结果，更早结果执行结构化微压缩
 - [x] Workflow 角色共享长期 Memory，完成且 QA pass 后触发证据约束反思
 - [x] 覆盖成功、no-change、虚假实现声明、无验证 QA pass、gate retry 和 fix cycle

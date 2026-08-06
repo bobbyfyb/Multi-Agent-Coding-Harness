@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import re
 import sys
 from typing import Any
 import xml.etree.ElementTree as ET
@@ -10,6 +11,36 @@ import xml.etree.ElementTree as ET
 from llm_agent.command_runner import command_artifact_dir, run_command
 from llm_agent.security import resolve_workspace_path
 from llm_agent.tool_registry import ToolDefinition, ToolRegistry
+
+
+_MISSING_MODULE_RE = re.compile(
+    r"(?:ModuleNotFoundError|ImportError): No module named ['\"]([^'\"]+)['\"]"
+)
+_LOCK_FAILURE_MARKERS = (
+    "needs to be updated",
+    "is out of date",
+    "does not satisfy",
+)
+_ENVIRONMENT_FAILURE_MARKERS = (
+    "failed to create virtual environment",
+    "failed to download",
+    "failed to fetch",
+    "failed to install",
+    "failed to prepare distributions",
+    "failed to build",
+    "failed to inspect python interpreter",
+    "no solution found when resolving dependencies",
+    "unable to find a compatible python",
+)
+_DIAGNOSTIC_MARKERS = (
+    "error",
+    "failed",
+    "lockfile",
+    "lock file",
+    "download",
+    "fetch",
+    "virtual environment",
+)
 
 
 @dataclass(frozen=True)
@@ -38,13 +69,16 @@ class VerificationTools:
             tool_name="run_tests",
         )
         report_path = artifact_dir / "junit.xml"
-        command = [
-            sys.executable,
-            "-m",
+        command, execution_environment = _module_command(
+            self.workdir,
             "pytest",
-            "-q",
-            *resolved_targets,
-        ]
+        )
+        command.extend(
+            [
+                "-q",
+                *resolved_targets,
+            ]
+        )
         if keyword:
             command.extend(["-k", keyword])
         command.append(f"--junitxml={report_path}")
@@ -55,11 +89,21 @@ class VerificationTools:
             artifact_dir=artifact_dir,
             timeout_seconds=timeout_seconds,
             preview_chars=self.output_limit,
+            unset_env=_unset_env(execution_environment),
         )
         summary, failures = _parse_junit(report_path)
         exit_code = process_result["exit_code"]
+        error_details = _classify_process_error(
+            process_result,
+            execution_environment=execution_environment,
+        )
         if process_result["timed_out"]:
             outcome = "timed_out"
+        elif error_details.get("error_kind") in {
+            "environment_setup_failed",
+            "lock_outdated",
+        }:
+            outcome = "error"
         elif exit_code == 0:
             outcome = "passed"
         elif exit_code == 1:
@@ -72,7 +116,9 @@ class VerificationTools:
         return {
             "outcome": outcome,
             "runner": "pytest",
+            "execution_environment": execution_environment,
             **process_result,
+            **error_details,
             "summary": summary,
             "failures": failures,
             "report_path": str(report_path) if report_path.exists() else None,
@@ -94,25 +140,38 @@ class VerificationTools:
             context=context,
             tool_name="run_lint",
         )
-        command = [
-            sys.executable,
-            "-m",
+        command, execution_environment = _module_command(
+            self.workdir,
             "ruff",
-            "check",
-            "--output-format",
-            "json",
-            *resolved_paths,
-        ]
+        )
+        command.extend(
+            [
+                "check",
+                "--output-format",
+                "json",
+                *resolved_paths,
+            ]
+        )
         process_result = run_command(
             command,
             cwd=self.workdir,
             artifact_dir=artifact_dir,
             timeout_seconds=timeout_seconds,
             preview_chars=self.output_limit,
+            unset_env=_unset_env(execution_environment),
         )
         exit_code = process_result["exit_code"]
+        error_details = _classify_process_error(
+            process_result,
+            execution_environment=execution_environment,
+        )
         if process_result["timed_out"]:
             outcome = "timed_out"
+        elif error_details.get("error_kind") in {
+            "environment_setup_failed",
+            "lock_outdated",
+        }:
+            outcome = "error"
         elif exit_code == 0:
             outcome = "clean"
         elif exit_code == 1:
@@ -131,7 +190,9 @@ class VerificationTools:
         return {
             "outcome": outcome,
             "runner": "ruff",
+            "execution_environment": execution_environment,
             **process_result,
+            **error_details,
             "stdout": "",
             "issue_count": len(diagnostics),
             "diagnostics": diagnostics[:200],
@@ -154,7 +215,8 @@ def verification_tool_definitions(
             name="run_tests",
             description=(
                 "Run pytest with bounded output and return a structured test "
-                "summary. A failed test run is a valid tool result."
+                "summary. For uv projects, synchronize and use the locked project "
+                "environment. A failed test run is a valid tool result."
             ),
             parameters={
                 "type": "object",
@@ -179,7 +241,8 @@ def verification_tool_definitions(
         ToolDefinition(
             name="run_lint",
             description=(
-                "Run Ruff without modifying files and return structured diagnostics."
+                "Run Ruff without modifying files and return structured diagnostics. "
+                "For uv projects, use the locked project environment."
             ),
             parameters={
                 "type": "object",
@@ -204,6 +267,78 @@ def register_tools(
     workdir: Path | str | None = None,
 ) -> None:
     registry.register_many(verification_tool_definitions(workdir))
+
+
+def _module_command(workdir: Path, module: str) -> tuple[list[str], str]:
+    if (workdir / "pyproject.toml").is_file() and (workdir / "uv.lock").is_file():
+        return (
+            [
+                "uv",
+                "run",
+                "--locked",
+                "--no-env-file",
+                "python",
+                "-m",
+                module,
+            ],
+            "uv_project",
+        )
+    return [sys.executable, "-m", module], "harness"
+
+
+def _unset_env(execution_environment: str) -> tuple[str, ...]:
+    return ("VIRTUAL_ENV",) if execution_environment == "uv_project" else ()
+
+
+def _classify_process_error(
+    process_result: dict[str, Any],
+    *,
+    execution_environment: str,
+) -> dict[str, Any]:
+    output = "\n".join(
+        str(process_result.get(key) or "") for key in ("stdout", "stderr")
+    )
+    missing_modules = sorted(set(_MISSING_MODULE_RE.findall(output)))
+    if missing_modules:
+        return {
+            "error_kind": "missing_dependency",
+            "missing_modules": missing_modules,
+            "diagnostic": ", ".join(
+                f"No module named {module!r}" for module in missing_modules
+            ),
+        }
+
+    normalized = output.casefold()
+    if _lock_is_outdated(normalized):
+        return {
+            "error_kind": "lock_outdated",
+            "diagnostic": _diagnostic_excerpt(output),
+        }
+    if execution_environment == "uv_project" and any(
+        marker in normalized for marker in _ENVIRONMENT_FAILURE_MARKERS
+    ):
+        return {
+            "error_kind": "environment_setup_failed",
+            "diagnostic": _diagnostic_excerpt(output),
+        }
+    return {}
+
+
+def _lock_is_outdated(output: str) -> bool:
+    return ("lockfile" in output or "lock file" in output) and any(
+        marker in output for marker in _LOCK_FAILURE_MARKERS
+    )
+
+
+def _diagnostic_excerpt(output: str, limit: int = 2_000) -> str:
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    relevant = [
+        line
+        for line in lines
+        if any(marker in line.casefold() for marker in _DIAGNOSTIC_MARKERS)
+    ]
+    selected = relevant[-8:] if relevant else lines[-8:]
+    return "\n".join(selected)[:limit]
 
 
 def _validate_timeout(timeout_seconds: float) -> None:

@@ -1,5 +1,8 @@
 from pathlib import Path
 import sys
+from typing import Any
+
+import pytest
 
 from llm_agent.agent import ToolExecutionContext
 from llm_agent.command_runner import run_command
@@ -58,6 +61,107 @@ def test_fails():
     assert verification["failures"][0]["test"] == "test_fails"
     assert Path(verification["report_path"]).exists()
     assert Path(verification["stdout_path"]).exists()
+
+
+def test_run_tests_reports_missing_dependency(tmp_path: Path) -> None:
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_missing.py").write_text(
+        "import dependency_that_does_not_exist\n",
+        encoding="utf-8",
+    )
+    registry = ToolRegistry()
+    register_tools(registry, workdir=tmp_path)
+
+    result = registry.call(
+        "run_tests",
+        {"targets": ["tests/test_missing.py"]},
+        context=_context(tmp_path, "call-missing-dependency"),
+    )
+
+    assert result["ok"] is True
+    verification = result["result"]
+    assert verification["outcome"] == "error"
+    assert verification["error_kind"] == "missing_dependency"
+    assert verification["missing_modules"] == ["dependency_that_does_not_exist"]
+    assert "dependency_that_does_not_exist" in verification["diagnostic"]
+    assert verification["execution_environment"] == "harness"
+
+
+@pytest.mark.parametrize(
+    ("stderr", "error_kind"),
+    [
+        (
+            "The lockfile at uv.lock needs to be updated, but --locked was provided.",
+            "lock_outdated",
+        ),
+        (
+            "error: Failed to download package\nCaused by: network unavailable",
+            "environment_setup_failed",
+        ),
+    ],
+)
+def test_uv_test_runner_classifies_project_setup_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stderr: str,
+    error_kind: str,
+) -> None:
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='sample'\n")
+    (tmp_path / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+    (tmp_path / "test_sample.py").write_text("def test_ok(): assert True\n")
+    captured: dict[str, Any] = {}
+
+    def fake_run_command(command: list[str], **kwargs: Any) -> dict[str, Any]:
+        captured["command"] = command
+        captured["unset_env"] = kwargs.get("unset_env")
+        artifact_dir = Path(kwargs["artifact_dir"])
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        stdout_path = artifact_dir / "stdout.log"
+        stderr_path = artifact_dir / "stderr.log"
+        stdout_path.write_text("", encoding="utf-8")
+        stderr_path.write_text(stderr, encoding="utf-8")
+        return {
+            "status": "failed",
+            "command": " ".join(command),
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": stderr,
+            "stdout_path": str(stdout_path),
+            "stderr_path": str(stderr_path),
+            "duration_ms": 1.0,
+            "timed_out": False,
+            "truncated": False,
+        }
+
+    monkeypatch.setattr(
+        "llm_agent.tools.verification_tools.run_command",
+        fake_run_command,
+    )
+    registry = ToolRegistry()
+    register_tools(registry, workdir=tmp_path)
+
+    result = registry.call(
+        "run_tests",
+        {"targets": ["test_sample.py"]},
+        context=_context(tmp_path, "call-project-setup"),
+    )
+
+    assert result["ok"] is True
+    verification = result["result"]
+    assert verification["outcome"] == "error"
+    assert verification["error_kind"] == error_kind
+    assert verification["execution_environment"] == "uv_project"
+    assert captured["command"][:7] == [
+        "uv",
+        "run",
+        "--locked",
+        "--no-env-file",
+        "python",
+        "-m",
+        "pytest",
+    ]
+    assert captured["unset_env"] == ("VIRTUAL_ENV",)
 
 
 def test_run_lint_returns_structured_ruff_diagnostics(
