@@ -1,13 +1,12 @@
 [project]
 name = "llm-server"
 version = "0.1.0"
-description = "Local vLLM server environment for Qwen3.6-27B."
-requires-python = ">=3.12,<3.15"
+description = "Local vLLM server environment for Qwen2.5-Coder."
+requires-python = ">=3.12"
 dependencies = [
-    "torch==2.11.0",
-    "torchaudio==2.11.0",
-    "torchvision==0.26.0",
-    "vllm==0.24.0",
+    "tokenizers==0.21.4",
+    "transformers==4.55.2",
+    "vllm==0.10.2",
 ]
 
 [tool.uv.sources]
