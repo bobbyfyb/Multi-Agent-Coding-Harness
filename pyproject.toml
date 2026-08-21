@@ -27,6 +27,11 @@ where = ["src"]
 pythonpath = ["src"]
 testpaths = ["tests"]
 
+[tool.uv.workspace]
+members = [
+    "llm_server",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",
