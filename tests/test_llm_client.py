@@ -356,3 +356,28 @@ def test_llm_client_accepts_model_id_env_alias(monkeypatch) -> None:
     client = LLMClient(provider="anthropic")
 
     assert client.model == "claude-compatible-model"
+
+
+def test_llm_client_accepts_generic_llm_env_aliases(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "LLM_MODEL_ID=local-model\nLLM_API_KEY=local-key\n",
+        encoding="utf-8",
+    )
+    for name in (
+        "LLM_MODEL",
+        "OPENAI_MODEL",
+        "MODEL_ID",
+        "LLM_MODEL_ID",
+        "OPENAI_API_KEY",
+        "LLM_API_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    client = LLMClient(provider="openai", env_file=env_file)
+
+    assert client.model == "local-model"
+    assert client.api_key == "local-key"

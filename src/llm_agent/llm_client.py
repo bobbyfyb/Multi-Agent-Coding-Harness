@@ -143,9 +143,14 @@ class LLMClient:
         env_prefix = "OPENAI" if self.provider == "openai" else "ANTHROPIC"
 
         if self.model is None:
-            self.model = _first_env("LLM_MODEL", f"{env_prefix}_MODEL", "MODEL_ID")
+            self.model = _first_env(
+                "LLM_MODEL",
+                f"{env_prefix}_MODEL",
+                "MODEL_ID",
+                "LLM_MODEL_ID",
+            )
         if self.api_key is None:
-            self.api_key = os.getenv(f"{env_prefix}_API_KEY")
+            self.api_key = _first_env(f"{env_prefix}_API_KEY", "LLM_API_KEY")
         if self.base_url is None:
             self.base_url = os.getenv("LLM_BASE_URL") or os.getenv(
                 f"{env_prefix}_BASE_URL"
@@ -603,7 +608,7 @@ class LLMClient:
         if not self.model:
             raise LLMClientError(
                 "LLM model is required. Pass model=... or set LLM_MODEL, "
-                "OPENAI_MODEL, ANTHROPIC_MODEL, or MODEL_ID."
+                "OPENAI_MODEL, ANTHROPIC_MODEL, MODEL_ID, or LLM_MODEL_ID."
             )
         return self.model
 
