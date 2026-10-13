@@ -50,7 +50,7 @@ class PromptSection:
 这样做的价值：
 
 - 每类指令有明确 owner；
-- 可以按 priority 和 budget 取舍；
+- 当前可以按 priority 排序；`token_budget` 仍是预留元数据，尚未由 ContextManager 自动执行；
 - Main Agent、Subagent、PM/Engineer/QA 可以组合不同 section；
 - 后续上下文工程不需要修改 Agent Loop。
 
@@ -62,7 +62,7 @@ class PromptSection:
 - canonical messages；
 - BeforeLLM runtime messages；
 - tool schemas；
-- 预留输出 token。
+- `auto_compact_ratio` 留出的整体 headroom；当前尚未按单次请求显式扣除输出 token。
 
 `estimate_request_tokens()` 将这些部分一起估算，在请求前决定是否压缩。估算是启发式，不等于 provider tokenizer，因此保留了 context-length error 的 reactive recovery。
 
