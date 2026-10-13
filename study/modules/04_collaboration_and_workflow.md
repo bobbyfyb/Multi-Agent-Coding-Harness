@@ -79,7 +79,7 @@ Artifact: 具体接口约束、改动说明、测试证据和验收结论
 
 ### 3.3 乐观并发控制
 
-Artifact update 要先读取当前版本，并传 `expected_version`：
+Artifact policy 推荐先读取当前版本，并传 `expected_version`；当前 Manager 和工具 schema 中该参数仍是可选的：
 
 ```text
 read version=2
@@ -87,7 +87,9 @@ read version=2
   -> success, version=3
 ```
 
-若另一个角色已经更新为 version=3，旧更新失败，避免静默覆盖。当前 Workflow 串行，但该规则仍能防止模型基于旧内容修改，也为未来并行协作保留契约。
+若另一个角色已经提交 version=3，携带 expected_version=2 的旧更新失败。当前检查与保存没有锁或原子 CAS，两个并发写者仍可能同时读取旧版本，因此它只提供读时版本冲突检测。history 保存变更摘要，不保存旧正文，不能恢复历史版本。
+
+类、函数、交接与 Evidence Gate 调用链见 [`../source_walkthrough/10_artifact_system.md`](../source_walkthrough/10_artifact_system.md)。
 
 ### 3.4 ArtifactContextHook
 
@@ -182,6 +184,8 @@ Workflow 成功不等于用户自动接受代码。最终 patch 与主工作区�
 
 ## 6. SerialCodingWorkflow
 
+完整源码链路分三篇：[角色与阶段编排](../source_walkthrough/12_serial_workflow.md)、[Worktree 与 Evidence Gate](../source_walkthrough/13_workflow_evidence.md)、[配置、持久化与 Resume](../source_walkthrough/14_workflow_persistence_and_resume.md)。
+
 ### 6.1 Orchestrator-Worker
 
 `SerialCodingWorkflow` 是确定性 Orchestrator：
@@ -244,7 +248,7 @@ pm_plan
 - 当前 phase；
 - phase results；
 - Artifact ids；
-- Worktree id/path/base；
+- Worktree id/base；实际 path 从 WorktreeManager metadata 读取；
 - fix cycle；
 - phase checkpoint；
 - error 和最终状态。
@@ -253,12 +257,14 @@ pm_plan
 
 ### 7.2 Phase checkpoint
 
-每个阶段开始先保存 `started`，成功后保存 `completed`，失败则保存错误和可恢复数据。resume 时：
+每个阶段开始保存 running checkpoint，成功后保存 completed，失败则保存错误和可恢复数据。resume 时：
 
 - 已完成 phase 不重复执行；
 - started 但未完成的 phase 视为中断尝试；
 - Worktree 和 Artifact 从持久化 id 恢复；
 - 从正确 phase 继续，而不是重跑整个 Workflow。
+
+已完成结果和 checkpoint 的完成标记一致时直接复用，不重新跑 Gate；只有特定 completed checkpoint 恢复路径才运行 Gate。配置、模型和 Skill 版本尚未随 run 锁定，恢复也不提供工具副作用 exactly-once 保证。
 
 ### 7.3 Attempt handoff
 
@@ -341,7 +347,7 @@ AcceptanceReport 的 metadata verdict 与 status 必须一致，并且不能与�
 8. Workflow 保存最终 patch 和 Trace；代码仍未自动进入主工作区。
 9. 用户审查后显式 apply。
 
-任何阶段进程退出，都可以通过 `/workflow-resume <id>` 从 checkpoint 继续。
+阶段中断后可通过 `/workflow-resume <id>` 尝试从已落盘状态继续，前提是 Task、Artifact 和 Worktree 仍可用；未落盘动作和最新中断 state 仍有恢复边界。
 
 ## 10. 设计评价
 

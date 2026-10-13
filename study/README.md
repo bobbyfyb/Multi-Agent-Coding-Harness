@@ -22,6 +22,13 @@
 - [`source_walkthrough/05_hook_system.md`](source_walkthrough/05_hook_system.md)：Hook 生命周期、权限确认、运行时上下文注入、结果替换及 Trace 协作源码精读。
 - [`source_walkthrough/06_security_system.md`](source_walkthrough/06_security_system.md)：路径、Shell、环境变量、能力裁剪、Worktree 与 MCP 安全边界源码精读。
 - [`source_walkthrough/07_recovery_system.md`](source_walkthrough/07_recovery_system.md)：错误分类、传输重试、fallback、上下文/输出恢复与 Workflow 恢复边界源码精读。
+- [`source_walkthrough/08_memory_system.md`](source_walkthrough/08_memory_system.md)：三层记忆、长期存储与召回、反思、遗忘、Hook 注入及 Workflow 工作 checkpoint 源码精读。
+- [`source_walkthrough/09_task_system.md`](source_walkthrough/09_task_system.md)：Task 数据模型、状态转换、依赖、持久化、规划提醒和 Workflow 任务契约源码精读。
+- [`source_walkthrough/10_artifact_system.md`](source_walkthrough/10_artifact_system.md)：Artifact 存储、版本记录、工具与上下文、角色交接及报告证据校验源码精读。
+- [`source_walkthrough/11_skill_system.md`](source_walkthrough/11_skill_system.md)：Skill 注册、缓存、目录与资源、角色注入及上下文/权限协作源码精读。
+- [`source_walkthrough/12_serial_workflow.md`](source_walkthrough/12_serial_workflow.md)：角色装配、阶段推进、attempt 重试及缺陷修复闭环源码精读。
+- [`source_walkthrough/13_workflow_evidence.md`](source_walkthrough/13_workflow_evidence.md)：Worktree、验证/报告快照、权威 QA verdict 和阶段 Evidence Gate 源码精读。
+- [`source_walkthrough/14_workflow_persistence_and_resume.md`](source_walkthrough/14_workflow_persistence_and_resume.md)：Workflow 配置、持久化、工作 checkpoint 和 resume 源码精读。
 - [`task_system_design.md`](task_system_design.md)：Task System 的数据模型、分层和面试问题。
 - [`development_todo.md`](development_todo.md)：项目目标、阶段进度和后续收尾事项。
 

@@ -1,5 +1,7 @@
 # Task System 设计复盘与面试准备
 
+> 类、函数和完整调用链见 [`source_walkthrough/09_task_system.md`](source_walkthrough/09_task_system.md)。本文保留架构复盘和面试表达，并以当前状态约束为准。
+
 ## 1. 为什么要做 Task System
 
 当前项目后续目标是演进成 **Multi-Agent Coding Harness**。在这个方向里，agent 不应该只靠对话上下文记住“接下来要做什么”，而应该有一套由 harness 托管的结构化任务状态。
@@ -111,9 +113,11 @@ cancelled    已取消
 当前支持：
 
 ```text
-session  当前会话/当前 agent 的执行计划
+session  当前工作/当前 agent 的执行计划（同样持久化）
 project  跨会话、多 agent、项目级任务
 ```
+
+两种 scope 都写入 JSON，没有自动过期或清理。真实列表隔离由 `task_list_id` 决定；当前 Workflow root 和 required role tasks 使用 session scope，并按 workflow id 隔离。
 
 这也是本项目替代 TodoWrite 的关键：Todo 的语义由 `scope="session"` 表达，而不是实现另一套 todo 系统。
 
@@ -198,7 +202,7 @@ task_complete
 使用场景：
 
 - 用户给出复杂任务后，先创建 session task。
-- PM agent 后续创建 project task。
+- 当前 Workflow 的 PM 创建 session-scope 角色任务；其他项目级规划也可使用 project scope。
 - QA agent 创建 verification task。
 
 ### task_list
@@ -219,7 +223,7 @@ task_complete
 
 ### task_update
 
-更新任务任意字段。
+按 task id 增量更新允许的字段，并执行状态转换与 evidence 检查。metadata 使用合并语义，None 表示不修改。
 
 常见用法：
 
@@ -257,8 +261,8 @@ task_complete
 规则：
 
 - 只有 `in_progress` task 可以 complete。
-- 可以附带 `evidence` 和 `notes`。
-- 完成后会返回被解锁的下游任务。
+- 必须有非空 `evidence`，可以使用已保存的 evidence；`notes` 可选。
+- 完成后会报告依赖已满足的相关下游 open tasks，不自动修改或派发它们。
 
 ## 6. 状态机
 
@@ -323,6 +327,8 @@ This looks like a multi-step coding task. Before changing files ...
 
 4. 如果任务完成但没有 evidence，且用户继续发起 coding task，提醒补验证证据。
 
+当前 Manager 已禁止无 evidence 完成；第 4 条主要针对旧数据或绕过 Manager 的写入，而且默认复杂任务提醒可能先返回并遮住该分支。Hook 是提示，不是文件工具执行门禁。
+
 这个机制替代了 learn-claude-code s05 里的固定 “3 轮没更新 todo 就提醒”。本项目的提醒是基于状态和行为，而不是基于固定步数。
 
 ## 8. 为什么不单独实现 TodoWrite
@@ -363,7 +369,7 @@ Task System 已经作为 PM / Engineer / QA Workflow 的共享任务控制面。
 
 ```text
 PM Agent
-  -> 创建 project task
+  -> 当前 Workflow 创建 session-scope role tasks（项目级任务也可用 project scope）
   -> 拆解 blocked_by 依赖
   -> 设置 priority
 
@@ -504,7 +510,8 @@ manager.complete_task(task.id, evidence="tests passed")
 
 - 还没有文件锁，并发多 agent 同时写任务时可能竞争。
 - 还没有 DAG 环检测。
-- `task_update` 可以直接设置 `completed`，后续可收紧状态流。
+- 当前已限制转换：pending 不能直接 completed，完成要求非空 evidence，completed/cancelled 不可 reopen；但 evidence 真实性仍依赖 Workflow Gate。
+- 一次 update 同时改状态和 blocked_by 时检查的是旧依赖，且 owner 不是身份授权机制。
 - 没有 release / unclaim 机制。
 - 没有 task history，更新记录只保留最新状态。
 - task 操作会作为 Tool Call 写入 Trace，但还没有独立的 task domain event log。
@@ -540,7 +547,7 @@ manager.complete_task(task.id, evidence="tests passed")
 
 参考回答：
 
-> 它们底层都是 Task，只是 scope 不同。session task 用于当前 agent 当前会话里的执行步骤，类似 todo；project task 用于跨会话、多 agent 协作，比如 PM 拆出的需求任务、QA 验证任务。这样可以用一套工具处理不同粒度的任务。
+> 它们底层都是 Task，scope 是用途标签，两者都持久化。session 表达当前工作的执行步骤，project 表达长期项目任务；真实隔离由 task_list_id 决定。当前 Workflow 使用 workflow id 作为列表，并创建 session-scope 角色任务。
 
 ### Q4：Task System 如何保证跨会话恢复？
 
@@ -558,7 +565,7 @@ manager.complete_task(task.id, evidence="tests passed")
 
 参考回答：
 
-> owner 用来表示任务当前归属哪个 agent。单 agent 阶段可以是 `agent`，多 agent 阶段可以是 `pm`、`frontend_engineer`、`backend_engineer`、`qa`。后续 orchestrator 可以根据 owner 和任务状态分配工作，也可以避免多个 agent 同时做同一个任务。
+> owner 表示任务归属哪个 agent，供列表筛选和 Workflow 契约检查。它不是认证身份或并发锁；当前顺序 claim 可拒绝已被认领的任务，但多 Agent 并发认领还需要原子更新或 lease。
 
 ### Q7：evidence 字段为什么重要？
 
@@ -594,13 +601,13 @@ manager.complete_task(task.id, evidence="tests passed")
 
 参考回答：
 
-> 当前 MVP 没有文件锁，所以多 agent 真并发写同一个任务时可能有竞争；也还没有 DAG 环检测，模型可能创建循环依赖；此外 task_update 目前比较灵活，后续可能需要更严格状态机。这些是下一阶段要补的工程化点。
+> 当前没有文件锁或 lease，真并发写入可能竞争；也没有环检测，依赖图不保证是 DAG。状态转换和非空 evidence 已收紧，但同时改状态/依赖的一致性、owner 身份校验和真实证据核验仍有边界。并行拓展前应优先解决这些问题。
 
 ### Q13：这个 Task System 后续如何支持多 agent？
 
 参考回答：
 
-> 当前串行 Workflow 已让 PM、Engineer 和 QA 共享 Task System：PM 创建 project task，Engineer claim 并提交 evidence，QA 更新验证状态。Orchestrator 目前仍使用确定性 phase 状态机；未来并行 Agent Team 才会根据 status、owner、blocked_by 和 lease 动态分配 ready task。这样先验证协作协议，再增加并发调度复杂度。
+> 当前串行 Workflow 已让 PM、Engineer 和 QA 共享 Task System：PM 在 workflow 专属列表中创建角色任务，Engineer claim 并提交 evidence，QA 完成验证任务并提供 verdict。Orchestrator 目前仍使用确定性 phase 状态机；未来动态派发需要补齐图校验、原子 claim 和 lease。
 
 ### Q14：和 Claude Code 的 Todo/Task 设计有什么不同？
 

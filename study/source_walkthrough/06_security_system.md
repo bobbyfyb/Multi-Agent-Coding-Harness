@@ -593,6 +593,8 @@ SkillRegistry：
 - YAML 使用 `safe_load`。
 - Skill 名有长度和字符正则。
 
+这里的 root 是每个已注册 Skill 的 resolve 路径。当前没有要求它必须位于总 skills_root 内，因此指向外部目录的 Skill symlink 仍可注册；resource 读取也未套用普通 workspace 敏感路径过滤。完整边界见 [Skill System 精读](11_skill_system.md)。
+
 Skill policy 明确不能覆盖 System、用户要求、workspace 和 permission。
 
 Skill 脚本不会自动执行；模型必须调用 Bash，仍经过 capability 和审批。但 Skill 文本仍是不可信指令来源，Prompt precedence 不是形式化 Prompt Injection 防护，第三方 Skill 需要审查。

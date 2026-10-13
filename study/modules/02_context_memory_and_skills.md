@@ -250,7 +250,9 @@ Skill 是可复用的方法和领域知识，不是独立 Agent，也不是自�
 - `skill_read_resource` 读取 Skill 目录中的补充文档；
 - 对名称、路径、文件大小和总预算做限制。
 
-多层目录只要每个独立 Skill 有自己的 `SKILL.md` 就能分别发现。一个 Skill 内可以包含 `REFERENCE.md`、模板和子目录资源。
+当前只注册 `.llm_agent/skills` 直接子目录中的 `SKILL.md`，不会递归注册嵌套 bundle 的独立子 Skill。一个已注册 Skill 内可以包含 `REFERENCE.md`、模板和多层资源；多个独立 Skill 应分别位于根下一层。
+
+Registry 启动时已读取并缓存全部 manifest 正文；按需加载指的是模型上下文披露。详细源码见 [`../source_walkthrough/11_skill_system.md`](../source_walkthrough/11_skill_system.md)。
 
 ### 5.3 Required 与 Optional Skill
 
@@ -280,7 +282,7 @@ Permission/Security 决定这次是否允许做
 - 每步重复支付输入成本；
 - 降低模型找到当前约束的能力。
 
-因此使用 metadata discovery + lazy loading，并允许 Orchestrator 对关键角色做 required 注入。
+因此使用 metadata discovery + 模型侧按需披露，并允许 Orchestrator 对关键角色做 required 注入。
 
 ## 6. Task Intent Classifier 的位置
 

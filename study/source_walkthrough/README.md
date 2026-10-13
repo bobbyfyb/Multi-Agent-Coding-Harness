@@ -33,5 +33,12 @@
 5. [`05_hook_system.md`](05_hook_system.md)：Hook 生命周期、结果合并与短路、权限确认、运行时上下文注入及 Trace 协作。
 6. [`06_security_system.md`](06_security_system.md)：路径与敏感文件、Shell 策略、子进程环境、角色能力和 Worktree/MCP 安全边界。
 7. [`07_recovery_system.md`](07_recovery_system.md)：错误分类、传输重试、模型 fallback、上下文/输出恢复与 Workflow 恢复边界。
+8. [`08_memory_system.md`](08_memory_system.md)：三层记忆、文件存储、召回缓存、抽取与反思、遗忘及 Workflow 工作 checkpoint。
+9. [`09_task_system.md`](09_task_system.md)：Task 状态机、依赖和持久化、规划 Hook/意图分类、角色任务契约与 Workflow Gate。
+10. [`10_artifact_system.md`](10_artifact_system.md)：交付物数据模型、版本与历史、上下文预览、角色交接和机器证据 Gate。
+11. [`11_skill_system.md`](11_skill_system.md)：Skill 发现与缓存、资源读取、渐进披露、角色 required/optional 配置与权限边界。
+12. [`12_serial_workflow.md`](12_serial_workflow.md)：角色装配、确定性 Orchestrator、阶段 attempt、QA 修复循环与完整执行链。
+13. [`13_workflow_evidence.md`](13_workflow_evidence.md)：Workflow Worktree 集成、验证/报告快照、权威证据、Gate 和显式 patch 审查。
+14. [`14_workflow_persistence_and_resume.md`](14_workflow_persistence_and_resume.md)：配置、run/phase 存储、工作 checkpoint、恢复路径与一致性边界。
 
-后续文档将继续覆盖 Memory、Task/Artifact、Subagent/Skill、Workflow/Worktree 与 Evaluation。
+后续文档将继续覆盖 Subagent、Background/Trace、独立 Worktree API、MCP 与 Evaluation。
