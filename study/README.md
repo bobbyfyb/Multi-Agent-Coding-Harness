@@ -12,6 +12,7 @@
 6. [`modules/04_collaboration_and_workflow.md`](modules/04_collaboration_and_workflow.md)：Task、Artifact、Subagent、Worktree 与串行 Workflow。
 7. [`modules/05_evaluation_and_incidents.md`](modules/05_evaluation_and_incidents.md)：真实评测中暴露的问题、修复过程与剩余风险。
 8. [`modules/06_interview_question_bank.md`](modules/06_interview_question_bank.md)：按追问深度整理的面试题与回答要点。
+9. [`agent_scenario_interview.md`](agent_scenario_interview.md)：34 个场景面试题，覆盖重复调用、Skill 不遵循、可靠闭环、恢复、安全与评测。
 
 专题文档：
 

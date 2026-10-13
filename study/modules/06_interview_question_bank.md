@@ -1,5 +1,7 @@
 # 秋招面试问题库
 
+> 故障定位、方案取舍和追问练习见 [`../agent_scenario_interview.md`](../agent_scenario_interview.md)。以下基础题与场景题配合使用。
+
 ## 1. 使用方法
 
 不要背整段答案。每题按四步回答：
@@ -80,7 +82,7 @@ Background notifications -> Context prepare -> BeforeLLM runtime injection -> pr
 
 ### Q15：Hook 和 Event 为什么分离？
 
-Hook 能改变行为，Event 只通知 UI，Trace 负责持久化。分离后权限可单测、CLI 可替换、日志失败不影响流程。
+Hook 能改变行为，Event 通知观察者，Trace 负责持久化。分离后权限可单测、CLI 可替换。Trace 默认 non-strict 可降级，但 Event callback 异常当前仍可能中断流程，不能宣称所有观察失败都已隔离。
 
 ### Q16：`effective_result` 是什么？
 
@@ -130,7 +132,7 @@ LLM retry 在 Tool Call 被接受和执行前发生，不重放工具。项目�
 
 ### Q27：记忆如何召回？
 
-active filter + lexical score + pinned/type/confidence/recency 等信号，可选 LLM side-query 选 id，最后按预算注入。模型只选择已有条目，不凭空生成 memory 内容。
+active filter 后 pinned 优先，其他候选用 LLM metadata side-query 选 ID；无 LLM 或调用异常时用关键词评分，最后按预算注入。显式 search 可匹配正文；评分有 confidence 和轻量 use_count 加成，没有时间衰减/recency 排序。
 
 ### Q28：反思、遗忘、过期如何做？
 
@@ -152,11 +154,11 @@ Skill 是方法/知识，Tool 是可执行能力。Skill 不能因为包含脚�
 
 ### Q32：Required 和 Optional Skill 如何选择？
 
-Orchestrator 对关键流程使用 required 确定性注入；Agent 对可能有用的能力从 catalog 自主 `skill_load`。前者保证关键规范，后者节省 token。
+Orchestrator 对关键流程使用 required 确定性注入；Agent 对可能有用的能力从 catalog 自主 `skill_load`。前者保证正文可见，不保证遵循；optional 是提示而非 Skill allowlist。
 
 ### Q33：复杂目录 Skill 支持吗？
 
-每个独立 Skill 以自己的 `SKILL.md` 为发现单元；Skill 内可有多层 reference。资源通过受路径和大小限制的工具按需读取，不全量注入。
+只发现 skills 根的直接子目录中的 SKILL.md，不递归注册嵌套 bundle。一个已注册 Skill 内可有多层 reference，按需读取；启动缓存全部 manifest，渐进披露发生在模型上下文侧。
 
 ### Q34：MCP 如何接入现有工具系统？
 
@@ -216,7 +218,7 @@ Task 是控制面状态，Artifact 是数据面交付。一个回答谁做什么
 
 ### Q47：Artifact 为什么要 version？
 
-避免角色基于旧版本静默覆盖；history 也保留交接修订。即使当前串行，模型多次 read/update 仍可能使用过期状态。
+expected_version 可检测已提交的旧版本，但当前可省略、检查和写入非原子，不是并发 CAS。history 保留字段/说明，没有旧正文或 rollback。
 
 ### Q48：Subagent 和 Agent Team 的区别？
 
@@ -232,7 +234,7 @@ Subagent 是父 Agent 对一个子任务的隔离委派，当前同步返回；A
 
 ### Q51：Resume 怎么保证不重做？
 
-WorkflowStore 保存 completed phase、当前 checkpoint、Artifact/Worktree id 和 fix cycle。resume 跳过完成阶段，恢复同一 Worktree；中断 attempt 转为 handoff。
+WorkflowStore 保存 phase/checkpoint、Artifact/Worktree id 和 fix cycle。resume 复用一致 completed 标记与同一 Worktree，并在覆盖的中断路径注入 handoff；不保证无重复或 exactly-once，快速完成复用也不重跑全部 Gate。
 
 ### Q52：Evidence Gate 检查什么？
 
